@@ -449,4 +449,30 @@ describe.sequential("closed isolated workspace issue routes", () => {
     expect(res.status).toBe(200);
     expect(res.body.executionWorkspaceId).toBe(nextWorkspaceId);
   });
+
+  it("clears a broken archived executionWorkspaceId without attempting to reopen it", async () => {
+    // An update that itself clears executionWorkspaceId must not be blocked on
+    // rebuilding the very workspace it is detaching from. Otherwise an issue
+    // whose worktree the reaper already destroyed becomes permanently
+    // unwritable, with no self-service escape hatch.
+    mockExecutionWorkspaceService.reopenClosedIsolatedExecutionWorkspaceForIssue.mockResolvedValue({
+      ok: false,
+      code: "rebuild_failed",
+      message: "Failed to rebuild the execution workspace",
+    });
+    mockIssueService.update.mockResolvedValue({
+      ...makeIssue(),
+      executionWorkspaceId: null,
+    });
+
+    const res = await request(await createApp())
+      .patch(`/api/issues/${issueId}`)
+      .send({ executionWorkspaceId: null });
+
+    expect(
+      mockExecutionWorkspaceService.reopenClosedIsolatedExecutionWorkspaceForIssue,
+    ).not.toHaveBeenCalled();
+    expect(res.status).toBe(200);
+    expect(res.body.executionWorkspaceId).toBeNull();
+  });
 });
