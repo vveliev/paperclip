@@ -10111,7 +10111,18 @@ export function issueRoutes(
       return;
     }
     let interruptedRunId: string | null = null;
-    const closedExecutionWorkspace = await getClosedIssueExecutionWorkspace(existing);
+    // Evaluate the reopen guard against the value this request would leave in
+    // place, not the pre-update value. An update that itself clears or
+    // replaces `executionWorkspaceId` (e.g. detaching a broken archived
+    // workspace) must not be blocked on rebuilding the workspace it is trying
+    // to move away from.
+    const nextExecutionWorkspaceId =
+      updateFields.executionWorkspaceId !== undefined
+        ? (updateFields.executionWorkspaceId as string | null)
+        : existing.executionWorkspaceId;
+    const closedExecutionWorkspace = await getClosedIssueExecutionWorkspace({
+      executionWorkspaceId: nextExecutionWorkspaceId,
+    });
     const isAgentWorkUpdate =
       req.actor.type === "agent" &&
       (Object.keys(updateFields).length > 0 || reviewRequest !== undefined || hiddenAtRaw !== undefined);
