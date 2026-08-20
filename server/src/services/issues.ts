@@ -54,11 +54,13 @@ import type {
   IssueWatchdogSummary,
   LowTrustBoundary,
   SuccessfulRunHandoffState,
+  ExecutionWorkspace,
 } from "@paperclipai/shared";
 import {
   clampIssueRequestDepth,
   extractAgentMentionIds,
   extractProjectMentionIds,
+  isClosedIsolatedExecutionWorkspace,
   issueCommentAuthorTypeSchema,
   issueCommentMetadataSchema,
   issueCommentPresentationSchema,
@@ -1066,21 +1068,56 @@ async function listPendingFinalizeBlockerIssueIds(
     blockerWorkspacePairs.map((pair) => `${pair.blockerIssueId}:${pair.executionWorkspaceId}`),
   );
 
-  const rows = await dbOrTx
-    .select({
-      issueId: workspaceOperations.issueId,
-      executionWorkspaceId: workspaceOperations.executionWorkspaceId,
-      phase: workspaceOperations.phase,
-      status: workspaceOperations.status,
-      startedAt: workspaceOperations.startedAt,
-    })
-    .from(workspaceOperations)
-    .where(
-      and(
-        eq(workspaceOperations.companyId, companyId),
-        inArray(workspaceOperations.executionWorkspaceId, executionWorkspaceIds),
+  const [rows, workspaceRows] = await Promise.all([
+    dbOrTx
+      .select({
+        issueId: workspaceOperations.issueId,
+        executionWorkspaceId: workspaceOperations.executionWorkspaceId,
+        phase: workspaceOperations.phase,
+        status: workspaceOperations.status,
+        startedAt: workspaceOperations.startedAt,
+      })
+      .from(workspaceOperations)
+      .where(
+        and(
+          eq(workspaceOperations.companyId, companyId),
+          inArray(workspaceOperations.executionWorkspaceId, executionWorkspaceIds),
+        ),
       ),
-    );
+    dbOrTx
+      .select({
+        id: executionWorkspaces.id,
+        mode: executionWorkspaces.mode,
+        status: executionWorkspaces.status,
+        closedAt: executionWorkspaces.closedAt,
+      })
+      .from(executionWorkspaces)
+      .where(
+        and(
+          eq(executionWorkspaces.companyId, companyId),
+          inArray(executionWorkspaces.id, executionWorkspaceIds),
+        ),
+      ),
+  ]);
+
+  // A closed workspace will never run another workspace_finalize — the worktree
+  // behind it is already gone (see BLA-370: the reaper can remove it before
+  // finalize runs, which makes finalize itself fail with "worktree ... does not
+  // exist"). Waiting on a "future successful finalize" that can structurally
+  // never happen would wedge the dependent forever, so a terminal (non-running)
+  // finalize on an already-closed workspace counts as settled regardless of
+  // whether it succeeded or failed.
+  const closedWorkspaceIds = new Set(
+    workspaceRows
+      .filter((row) =>
+        isClosedIsolatedExecutionWorkspace({
+          ...row,
+          status: row.status as ExecutionWorkspace["status"],
+          mode: row.mode as ExecutionWorkspace["mode"],
+        }),
+      )
+      .map((row) => row.id),
+  );
 
   const latestAttributedByBlockerWorkspace = new Map<string, { phase: string; status: string; startedAt: Date }>();
   const latestUnattributedByWorkspace = new Map<string, { phase: string; status: string; startedAt: Date }>();
@@ -1124,6 +1161,13 @@ async function listPendingFinalizeBlockerIssueIds(
     if (latest.phase === "workspace_finalize" && latest.status === "succeeded") continue;
     const laterSuccessfulFinalize = latestSuccessfulFinalizeByWorkspace.get(pair.executionWorkspaceId);
     if (laterSuccessfulFinalize && laterSuccessfulFinalize > latest.startedAt) continue;
+    if (
+      latest.phase === "workspace_finalize" &&
+      latest.status !== "running" &&
+      closedWorkspaceIds.has(pair.executionWorkspaceId)
+    ) {
+      continue;
+    }
     pending.add(pair.blockerIssueId);
   }
 
