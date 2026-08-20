@@ -4362,6 +4362,46 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     });
   });
 
+  it("clears the workspace-finalize barrier when a failed finalize's workspace is already closed and can never retry", async () => {
+    const {
+      companyId,
+      executionWorkspaceId,
+      blockerId,
+      dependentId,
+      assigneeAgentId,
+    } = await seedSharedWorkspaceDependency();
+
+    // The blocker's isolated workspace was torn down (worktree already removed by
+    // the reaper) before its workspace_finalize op ran, so finalize failed and
+    // nothing will ever retry it on this workspace again.
+    await db
+      .update(executionWorkspaces)
+      .set({ status: "archived", closedAt: new Date("2026-05-23T22:04:00.000Z"), cleanupReason: "issue_terminal" })
+      .where(eq(executionWorkspaces.id, executionWorkspaceId));
+
+    await db.insert(workspaceOperations).values({
+      companyId,
+      executionWorkspaceId,
+      issueId: blockerId,
+      phase: "workspace_finalize",
+      status: "failed",
+      startedAt: new Date("2026-05-23T22:05:00.000Z"),
+    });
+
+    await expect(svc.getDependencyReadiness(dependentId)).resolves.toMatchObject({
+      isDependencyReady: true,
+      pendingFinalizeBlockerIssueIds: [],
+      unresolvedBlockerIssueIds: [],
+    });
+    await expect(svc.listWakeableBlockedDependents(blockerId)).resolves.toEqual([
+      expect.objectContaining({
+        id: dependentId,
+        assigneeAgentId,
+        blockerIssueIds: [blockerId],
+      }),
+    ]);
+  });
+
   it("treats blockers with no executionWorkspaceId as not subject to the workspace-finalize barrier", async () => {
     const companyId = randomUUID();
     const assigneeAgentId = randomUUID();
