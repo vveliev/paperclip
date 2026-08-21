@@ -4284,9 +4284,17 @@ export function companySkillService(db: Db) {
 
     if (skill.sourceType === "local_path" || skill.sourceType === "catalog") {
       const absolutePath = resolveLocalSkillFilePath(skill, normalizedPath);
-      const diskContent = absolutePath
+      let diskContent = absolutePath
         ? await fs.readFile(absolutePath, "utf8").catch(() => null)
         : null;
+      // The recorded sourceLocator is a one-time import-time path and can go
+      // stale (moved, cleaned up, ephemeral staging dir). Fall back to the
+      // materialized __runtime__ copy, which is what agents actually load
+      // from and is refreshed independently of sourceLocator.
+      if (diskContent === null && skill.sourceType === "local_path") {
+        const runtimePath = path.resolve(resolveRuntimeSkillMaterializedPath(companyId, skill), normalizedPath);
+        diskContent = await fs.readFile(runtimePath, "utf8").catch(() => null);
+      }
       if (diskContent !== null) {
         content = diskContent;
       } else if (normalizedPath === "SKILL.md") {
