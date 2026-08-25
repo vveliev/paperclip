@@ -4035,10 +4035,19 @@ export function agentRoutes(
     }
     if (requestedRuntimeConfig) {
       const baseAdapterConfig = asRecord(patchData.adapterConfig) ?? asRecord(existing.adapterConfig) ?? {};
+      // Merge onto the persisted runtimeConfig instead of replacing it wholesale.
+      // A caller that only means to touch one top-level key (e.g. modelProfiles)
+      // — including a UI that built its patch from a snapshot fetched before a
+      // concurrent change landed — must not silently drop sibling keys like
+      // `heartbeat`. adapterConfig already merges this way above; runtimeConfig
+      // did not, which is how an unrelated save could wipe a just-enabled
+      // heartbeat with no trace of the loss in config-revisions.
+      const existingRuntimeConfig = asRecord(existing.runtimeConfig) ?? {};
+      const effectiveRuntimeConfig = { ...existingRuntimeConfig, ...requestedRuntimeConfig };
       patchData.runtimeConfig = await normalizeRuntimeConfigAdapterConfigsForPersistence(
         existing.companyId,
         requestedAdapterType,
-        requestedRuntimeConfig,
+        effectiveRuntimeConfig,
         baseAdapterConfig,
       );
     }
