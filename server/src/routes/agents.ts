@@ -4733,7 +4733,17 @@ export function agentRoutes(
         adapterConfig: patchData.adapterConfig,
       });
     }
-    if (requestedRuntimeConfig) patchData.runtimeConfig = requestedRuntimeConfig;
+    if (requestedRuntimeConfig) {
+      // Merge onto the persisted runtimeConfig instead of replacing it wholesale.
+      // A caller that only means to touch one top-level key (e.g. workspaceRuntime)
+      // — including a UI that built its patch from a snapshot fetched before a
+      // concurrent change landed — must not silently drop sibling keys like
+      // `heartbeat`. adapterConfig already merges this way above; runtimeConfig
+      // did not, which is how an unrelated save could wipe a just-enabled
+      // heartbeat with no trace of the loss in config-revisions.
+      const existingRuntimeConfig = asRecord(existing.runtimeConfig) ?? {};
+      patchData.runtimeConfig = { ...existingRuntimeConfig, ...requestedRuntimeConfig };
+    }
     if (touchesAdapterConfiguration || Object.prototype.hasOwnProperty.call(patchData, "defaultEnvironmentId")) {
       await assertAgentDefaultEnvironmentSelection(
         existing.companyId,
