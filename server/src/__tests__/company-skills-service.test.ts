@@ -2026,6 +2026,77 @@ describeEmbeddedPostgres("companySkillService.list", () => {
     });
   });
 
+  it("falls back to the materialized __runtime__ copy when sourceLocator is missing", async () => {
+    if (!paperclipHome) throw new Error("Expected Paperclip test home");
+    const companyId = randomUUID();
+    const skillId = randomUUID();
+    const skillKey = `company/${companyId}/telegram-message-style`;
+    const slug = "telegram-message-style";
+    const missingSkillDir = path.join(
+      await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-fallback-source-")),
+      "gone",
+    );
+    cleanupDirs.add(path.dirname(missingSkillDir));
+
+    const managedRoot = path.join(paperclipHome, "instances", "default", "skills", companyId);
+    const runtimeDir = path.join(
+      managedRoot,
+      "__runtime__",
+      `${slug}--${createHash("sha256").update(skillKey).digest("hex").slice(0, 10)}`,
+    );
+    await fs.mkdir(path.join(runtimeDir, "references"), { recursive: true });
+    await fs.writeFile(path.join(runtimeDir, "SKILL.md"), "# Telegram Message Style\n", "utf8");
+    await fs.writeFile(path.join(runtimeDir, "references", "guide.md"), "# Runtime Guide\n", "utf8");
+    cleanupDirs.add(managedRoot);
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(companySkills).values({
+      id: skillId,
+      companyId,
+      key: skillKey,
+      slug,
+      name: "Telegram Message Style",
+      description: null,
+      markdown: "# Telegram Message Style\n",
+      sourceType: "local_path",
+      // Import-time sourceLocator is gone: neither the recorded path nor a
+      // `_staging/<slug>` path exists on disk anymore, but the materialized
+      // runtime copy every agent actually loads from does.
+      sourceLocator: missingSkillDir,
+      trustLevel: "markdown_only",
+      compatibility: "compatible",
+      fileInventory: [
+        { path: "SKILL.md", kind: "skill" },
+        { path: "references/guide.md", kind: "reference" },
+      ],
+      metadata: { sourceKind: "local_path" },
+    });
+    await db.insert(agents).values({
+      id: randomUUID(),
+      companyId,
+      name: "Reader",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {
+        paperclipSkillSync: {
+          desiredSkills: [skillKey],
+        },
+      },
+    });
+
+    await expect(svc.readFile(companyId, skillId, "references/guide.md")).resolves.toMatchObject({
+      path: "references/guide.md",
+      kind: "reference",
+      content: "# Runtime Guide\n",
+    });
+  });
+
   it("reads root-level SKILL.md for github skills with a '.' repoSkillDir", async () => {
     const companyId = randomUUID();
     const skillId = randomUUID();
