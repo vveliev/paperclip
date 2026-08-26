@@ -1,6 +1,6 @@
 import { and, count, eq } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { activityLog, heartbeatRuns } from "@paperclipai/db";
+import { activityLog, heartbeatRuns, issues } from "@paperclipai/db";
 import { isUuidLike, issueWriteDenialResponse } from "@paperclipai/shared";
 import { forbidden } from "../errors.js";
 import { logger } from "../middleware/logger.js";
@@ -110,12 +110,30 @@ export async function observeCrossIssueInfluence(
     }
 
     const sourceIssueId = readRunSourceIssueId(run.contextSnapshot);
-    if (!sourceIssueId) throw crossIssueInfluenceRunContextError();
     if (
       sourceIssueId === input.targetIssueId ||
-      (input.targetIssueIdentifier && sourceIssueId.toUpperCase() === input.targetIssueIdentifier.toUpperCase())
+      (sourceIssueId && input.targetIssueIdentifier
+        && sourceIssueId.toUpperCase() === input.targetIssueIdentifier.toUpperCase())
     ) {
       return null;
+    }
+    if (!sourceIssueId) {
+      // On-demand/board-triggered runs never record an issue in their wake-time
+      // context snapshot (see BLA-582): the run starts unscoped and only picks up
+      // an issue via checkout mid-heartbeat. Fall back to the live checkout/
+      // execution lock — if this run is the one actively holding the target
+      // issue, the write is unambiguously the run's own issue, not a cross-issue
+      // influence attempt. Only the exact lock match is trusted; anything else
+      // still fails closed.
+      const targetIssue = await tx
+        .select({ checkoutRunId: issues.checkoutRunId, executionRunId: issues.executionRunId })
+        .from(issues)
+        .where(and(eq(issues.id, input.targetIssueId), eq(issues.companyId, input.companyId)))
+        .then((rows) => rows[0] ?? null);
+      if (targetIssue && (targetIssue.checkoutRunId === input.runId || targetIssue.executionRunId === input.runId)) {
+        return null;
+      }
+      throw crossIssueInfluenceRunContextError();
     }
 
     const priorCount = await tx
