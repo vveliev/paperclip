@@ -616,14 +616,17 @@ describeEmbeddedPostgres("attention service", () => {
 
     const feed = await attentionService(db).list(companyId, { userId: "board-user" });
 
-    expect(feed.totalCount).toBe(12);
+    expect(feed.totalCount).toBe(13);
     expect(feed.countsBySourceKind).toMatchObject({
       approval: 1,
       issue_thread_interaction: 1,
       join_request: 1,
       recovery_action: 1,
       productivity_review: 1,
-      blocker_attention: 1,
+      // 2: the pre-existing terminal-blocker item for blockerLeafId, plus the
+      // BLA-687 missing-unblockDescriptor item for blockerParentId itself
+      // (blockerParentId is blocked with no unblockDescriptor set).
+      blocker_attention: 2,
       review: 2,
       failed_run: 1,
       budget_alert: 2,
@@ -665,12 +668,23 @@ describeEmbeddedPostgres("attention service", () => {
       kind: "questions",
       questionCount: 0,
     });
-    expect(feed.items.find((item) => item.sourceKind === "blocker_attention")?.detail).toMatchObject({
+    expect(feed.items.find((item) =>
+      item.sourceKind === "blocker_attention" && item.subject.id === blockerLeafId
+    )?.detail).toMatchObject({
       kind: "blocker",
       blockingIssue: null,
       blockedTaskCount: 1,
     });
-    expect(feed.items.find((item) => item.sourceKind === "blocker_attention")?.subject.id).toBe(blockerLeafId);
+    // BLA-687: blockerParentId is itself blocked with no unblockDescriptor —
+    // it must surface too, not just the terminal-blocker item above, or a
+    // regression here would be invisible to every audit that keys on the
+    // descriptor field.
+    const missingDescriptorItem = feed.items.find((item) =>
+      item.sourceKind === "blocker_attention" && item.subject.id === blockerParentId
+    );
+    expect(missingDescriptorItem).toBeTruthy();
+    expect(missingDescriptorItem?.entryRule).toContain("BLA-687");
+    expect(missingDescriptorItem?.severity).toBe("critical");
     expect(feed.items.find((item) =>
       item.sourceKind === "review" && item.subject.title === "Stalled review blocker"
     )).toMatchObject({
