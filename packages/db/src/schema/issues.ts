@@ -11,6 +11,7 @@ import {
   uniqueIndex,
   unique,
   bigint,
+  check,
 } from "drizzle-orm/pg-core";
 import { agents } from "./agents.js";
 import { projects } from "./projects.js";
@@ -82,6 +83,15 @@ export const issues = pgTable(
   },
   (table) => ({
     companyIdUq: unique("issues_company_id_uq").on(table.companyId, table.id),
+    // BLA-687: a blocked issue with no unblockDescriptor records no premise,
+    // owner, or action — nothing can ever re-check or surface it. This is
+    // the last-resort guard behind the application-level invariant in
+    // issues.ts update(): it catches any write path (present or future,
+    // including raw SQL) that the service layer doesn't.
+    blockedRequiresUnblockDescriptorCheck: check(
+      "issues_blocked_requires_unblock_descriptor_check",
+      sql`${table.status} <> 'blocked' or ${table.unblockDescriptor} is not null`,
+    ),
     companyStatusIdx: index("issues_company_status_idx").on(table.companyId, table.status),
     companyHarnessKindIdx: index("issues_company_harness_kind_idx").on(table.companyId, table.harnessKind),
     assigneeStatusIdx: index("issues_company_assignee_status_idx").on(

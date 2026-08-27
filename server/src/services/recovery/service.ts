@@ -5,6 +5,7 @@ import {
   ISSUE_DISPOSITION_REPAIR_RETRY_REASON,
   type IssueCommentMetadata,
   type IssueCommentPresentation,
+  type IssueUnblockDescriptor,
 } from "@paperclipai/shared";
 import {
   agents,
@@ -1960,6 +1961,26 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   }
 
 
+  // BLA-687: mirror the ownership a recovery action already computed onto
+  // the issue's own unblockDescriptor, instead of leaving it null while the
+  // "who/what" only lives on the separate issueRecoveryActions row. Board is
+  // the fallback owner for system-owned waits (e.g. provider_quota) too,
+  // since IssueUnblockOwner has no "system" variant.
+  function unblockDescriptorFromRecoveryAction(action: {
+    ownerAgentId: string | null;
+    ownerUserId: string | null;
+    nextAction: string;
+  }): IssueUnblockDescriptor {
+    return {
+      owner: action.ownerAgentId
+        ? { agentId: action.ownerAgentId }
+        : action.ownerUserId
+          ? { userId: action.ownerUserId }
+          : "board",
+      action: action.nextAction,
+    };
+  }
+
   function strandedRecoveryActionKind(cause: StrandedRecoveryCause) {
     return cause === SUCCESSFUL_RUN_MISSING_STATE_REASON
       ? "missing_disposition" as const
@@ -2268,7 +2289,18 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     previousStatus: StrandedPreviousStatus;
     latestRun: LatestIssueRun;
   }) {
-    const updated = await issuesSvc.update(input.issue.id, { status: "blocked" });
+    const updated = await issuesSvc.update(input.issue.id, {
+      status: "blocked",
+      // BLA-687: this is a source-scoped recovery issue whose own recovery
+      // attempt failed. There is no separate issueRecoveryActions row to
+      // mirror ownership from here, so synthesize the same board-owned
+      // descriptor the escalation comment already tells a human to act on.
+      unblockDescriptor: {
+        owner: "board",
+        action: "Inspect the failed run evidence, restore a live execution path or record the manual "
+          + "resolution, then move this recovery issue out of blocked.",
+      },
+    });
     if (!updated) return null;
 
     const prefix = await getCompanyIssuePrefix(input.issue.companyId);
@@ -2932,6 +2964,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       attemptCount: input.attemptCount,
     });
     const now = new Date();
+    const dispositionRepairNextAction =
+      "Inspect the evidence and choose whether to repair, retry the original owner, explicitly reassign, or resolve the source issue.";
     await db
       .update(issueRecoveryActions)
       .set({
@@ -2950,8 +2984,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           sourceMaxAttempts: DISPOSITION_REPAIR_MAX_ATTEMPTS,
           routingPolicy: STRANDED_BOARD_ESCALATION_POLICY,
         },
-        nextAction:
-          "Inspect the evidence and choose whether to repair, retry the original owner, explicitly reassign, or resolve the source issue.",
+        nextAction: dispositionRepairNextAction,
         wakePolicy: {
           type: "board_escalation",
           reason: input.terminalReason,
@@ -2968,6 +3001,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
 
     const updated = await issuesSvc.update(input.issue.id, {
       status: "blocked",
+      unblockDescriptor: { owner: "board", action: dispositionRepairNextAction },
     });
     if (!updated) return null;
     const sourceAssigneePreserved =
@@ -3176,6 +3210,13 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     const updated = await issuesSvc.update(input.issue.id, {
       status: "blocked",
       blockedByIssueIds: blockerIds,
+      // BLA-687: this is the exact call site that produced BLA-652 — a
+      // recoveryAction with real ownership/nextAction was already created
+      // above, but the issue's own unblockDescriptor was never populated
+      // from it, and blockedByIssueIds is frequently empty for these
+      // causes (there's no dependency issue; it's an execution/ownership
+      // gap, not a "waiting on X" one).
+      unblockDescriptor: unblockDescriptorFromRecoveryAction(recoveryAction),
     });
     if (!updated) return null;
     if (isProviderQuotaWait) return updated;
