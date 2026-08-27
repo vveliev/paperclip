@@ -52,6 +52,7 @@ import type {
   IssueProductivityReview,
   IssueProductivityReviewTrigger,
   IssueRelationIssueSummary,
+  IssueUnblockDescriptor,
   IssueWatchdogSummary,
   LowTrustBoundary,
   SuccessfulRunHandoffState,
@@ -231,6 +232,23 @@ function assertTransition(from: string, to: string) {
   if (!ALL_ISSUE_STATUSES.includes(to)) {
     throw conflict(`Unknown issue status: ${to}`);
   }
+}
+
+// BLA-687: a blocked issue with no owner/action recorded anywhere (no
+// unblockDescriptor, no unresolved blocker, no pending interaction/approval)
+// is parked with no premise anything can re-check. This is the shape every
+// caller of update() must satisfy before status can settle on "blocked" —
+// human PATCH, agent PATCH, and internal recovery-escalation writers alike.
+function isValidUnblockDescriptor(descriptor: unknown): descriptor is IssueUnblockDescriptor {
+  if (!descriptor || typeof descriptor !== "object") return false;
+  const candidate = descriptor as { owner?: unknown; action?: unknown };
+  if (candidate.owner == null) return false;
+  if (candidate.owner !== "board") {
+    if (typeof candidate.owner !== "object") return false;
+    const owner = candidate.owner as { agentId?: unknown; userId?: unknown };
+    if (typeof owner.agentId !== "string" && typeof owner.userId !== "string") return false;
+  }
+  return typeof candidate.action === "string" && candidate.action.trim().length > 0;
 }
 
 function applyStatusSideEffects(
@@ -7855,9 +7873,65 @@ export function issueService(db: Db) {
         patch.blockedTransitionAt = patch.updatedAt;
         patch.blockedOwnerNotifiedAt = null;
       } else if (existing.status === "blocked" && issueData.status && issueData.status !== "blocked") {
-        patch.unblockDescriptor = null;
+        // BLA-687 (Path 2): only clear the descriptor when the caller
+        // explicitly asked to (an explicit `unblockDescriptor: null`).
+        // Automation transitions out of blocked — most notably a plain
+        // comment implicitly reopening an agent-assigned blocked issue —
+        // must not silently discard the recorded premise/owner/action. If
+        // the issue lands back in blocked without a fresh descriptor, the
+        // prior one is what re-check loops and audits still have to go on.
+        if (issueData.unblockDescriptor === null) {
+          patch.unblockDescriptor = null;
+        } else {
+          delete patch.unblockDescriptor;
+        }
         patch.blockedTransitionAt = null;
         patch.blockedOwnerNotifiedAt = null;
+      }
+      // Only re-validate when this call is the one asserting "blocked" —
+      // entering it fresh, or reaffirming it (e.g. a recovery reconcile pass
+      // that re-touches blockedByIssueIds while staying blocked). An
+      // unrelated field edit on an issue that is already sitting blocked
+      // must not start failing just because a pre-existing row predates
+      // this invariant; the recurring check (BLA-687 criterion 4) is what
+      // surfaces those for backfill instead.
+      const assertingBlocked = issueData.status === "blocked";
+      if (assertingBlocked) {
+        const finalDescriptor = issueData.unblockDescriptor !== undefined
+          ? issueData.unblockDescriptor
+          : existing.unblockDescriptor;
+        if (!isValidUnblockDescriptor(finalDescriptor)) {
+          const requestedBlockerIds = blockedByIssueIds !== undefined
+            ? [...new Set(blockedByIssueIds)]
+            : null;
+          const hasUnresolvedBlocker = requestedBlockerIds
+            ? requestedBlockerIds.length > 0 &&
+              (await listUnresolvedBlockerIssueIds(dbOrTx, existing.companyId, requestedBlockerIds)).length > 0
+            : ((await listIssueDependencyReadinessMap(dbOrTx, existing.companyId, [id])).get(id)
+              ?.unresolvedBlockerCount ?? 0) > 0;
+          const [pendingInteraction, pendingApproval] = hasUnresolvedBlocker
+            ? [null, null]
+            : await Promise.all([
+              dbOrTx.select({ id: issueThreadInteractions.id }).from(issueThreadInteractions).where(and(
+                eq(issueThreadInteractions.companyId, existing.companyId),
+                eq(issueThreadInteractions.issueId, existing.id),
+                eq(issueThreadInteractions.status, "pending"),
+              )).limit(1).then((rows: Array<{ id: string }>) => rows[0] ?? null),
+              dbOrTx.select({ approvalId: issueApprovals.approvalId }).from(issueApprovals)
+                .innerJoin(approvals, eq(issueApprovals.approvalId, approvals.id))
+                .where(and(
+                  eq(issueApprovals.companyId, existing.companyId),
+                  eq(issueApprovals.issueId, existing.id),
+                  eq(approvals.status, "pending"),
+                )).limit(1).then((rows: Array<{ approvalId: string }>) => rows[0] ?? null),
+            ]);
+          if (!hasUnresolvedBlocker && !pendingInteraction && !pendingApproval) {
+            throw unprocessable(
+              "status=blocked requires a non-null unblockDescriptor with an owner and a non-empty action, "
+              + "or an unresolved blocker/pending interaction/approval to justify the block",
+            );
+          }
+        }
       }
       if (issueData.requestDepth !== undefined) {
         patch.requestDepth = clampIssueRequestDepth(issueData.requestDepth);
