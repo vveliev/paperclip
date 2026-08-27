@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { asc, eq } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { sql } from "drizzle-orm";
 import {
   activityLog,
@@ -5897,6 +5897,144 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
       checkoutRunId: successorRunId,
       executionRunId: successorRunId,
     });
+  });
+});
+
+describeEmbeddedPostgres("issueService.update blocked requires unblockDescriptor (BLA-687)", () => {
+  let db!: ReturnType<typeof createDb>;
+  let svc!: ReturnType<typeof issueService>;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+  let companyId!: string;
+  let agentId!: string;
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-issues-blocked-descriptor-");
+    db = createDb(tempDb.connectionString);
+    svc = issueService(db);
+  }, 20_000);
+
+  beforeEach(async () => {
+    companyId = randomUUID();
+    agentId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+  });
+
+  afterEach(async () => {
+    await db.delete(issueRelations);
+    await db.delete(issues);
+    await db.delete(agents);
+    await db.delete(companies);
+  });
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+  });
+
+  async function insertIssue(status: string, extra: Partial<typeof issues.$inferInsert> = {}) {
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "T",
+      status,
+      priority: "medium",
+      assigneeAgentId: agentId,
+      ...extra,
+    });
+    return issueId;
+  }
+
+  it("rejects a bare PATCH to blocked with no unblockDescriptor and no blocker", async () => {
+    const issueId = await insertIssue("todo");
+
+    await expect(svc.update(issueId, { status: "blocked" })).rejects.toThrow(
+      /status=blocked requires a non-null unblockDescriptor/,
+    );
+
+    const row = await db.select({ status: issues.status, unblockDescriptor: issues.unblockDescriptor })
+      .from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]);
+    expect(row).toEqual({ status: "todo", unblockDescriptor: null });
+  });
+
+  it("accepts entering blocked with a valid unblockDescriptor", async () => {
+    const issueId = await insertIssue("todo");
+
+    const updated = await svc.update(issueId, {
+      status: "blocked",
+      unblockDescriptor: { owner: "board", action: "Inspect the evidence and decide." },
+    });
+
+    expect(updated?.status).toBe("blocked");
+    expect(updated?.unblockDescriptor).toEqual({ owner: "board", action: "Inspect the evidence and decide." });
+  });
+
+  it("accepts entering blocked with an unresolved first-class blocker and no descriptor", async () => {
+    const blockerId = await insertIssue("todo");
+    const issueId = await insertIssue("todo");
+
+    const updated = await svc.update(issueId, {
+      status: "blocked",
+      blockedByIssueIds: [blockerId],
+    });
+
+    expect(updated?.status).toBe("blocked");
+    expect(updated?.unblockDescriptor).toBeNull();
+  });
+
+  it("preserves the unblockDescriptor across an automation transition out of blocked (BLA-687 Path 2)", async () => {
+    const issueId = await insertIssue("blocked", {
+      unblockDescriptor: { owner: "board", action: "Board operator: inspect and decide." },
+      blockedTransitionAt: new Date(),
+    });
+
+    // Mirrors the implicit-reopen dispatch path: a plain comment on a
+    // blocked, agent-assigned issue moves status to "todo" without ever
+    // touching unblockDescriptor.
+    const updated = await svc.update(issueId, { status: "todo" });
+
+    expect(updated?.status).toBe("todo");
+    expect(updated?.unblockDescriptor).toEqual({ owner: "board", action: "Board operator: inspect and decide." });
+  });
+
+  it("clears the unblockDescriptor when the caller explicitly asks to", async () => {
+    const issueId = await insertIssue("blocked", {
+      unblockDescriptor: { owner: "board", action: "Board operator: inspect and decide." },
+      blockedTransitionAt: new Date(),
+    });
+
+    const updated = await svc.update(issueId, { status: "todo", unblockDescriptor: null });
+
+    expect(updated?.status).toBe("todo");
+    expect(updated?.unblockDescriptor).toBeNull();
+  });
+
+  it("re-validates when a call reaffirms blocked without a descriptor and no blocker justifies it", async () => {
+    const issueId = await insertIssue("blocked", {
+      unblockDescriptor: { owner: "board", action: "Board operator: inspect and decide." },
+      blockedTransitionAt: new Date(),
+    });
+
+    // Explicitly clearing the descriptor while re-asserting blocked with no
+    // other justification must be rejected, not silently accepted.
+    await expect(svc.update(issueId, { status: "blocked", unblockDescriptor: null })).rejects.toThrow(
+      /status=blocked requires a non-null unblockDescriptor/,
+    );
   });
 });
 
