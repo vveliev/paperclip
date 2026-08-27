@@ -24747,6 +24747,18 @@ export function heartbeatService(
               .update(issues)
               .set({
                 status: "blocked",
+                // BLA-687: this raw update bypasses issuesSvc.update()'s
+                // blocked-entry bookkeeping, so it has to set its own
+                // unblockDescriptor too — the remediation text below is
+                // already computed for the comment; mirror it here so the
+                // issue doesn't park invisibly to every descriptor-keyed
+                // audit.
+                unblockDescriptor: {
+                  owner: "board",
+                  action: WORKSPACE_WORKTREE_REQUIRES_PROJECT_REMEDIATION,
+                },
+                blockedTransitionAt: now,
+                blockedOwnerNotifiedAt: null,
                 checkoutRunId: null,
                 executionRunId: null,
                 executionAgentNameKey: null,
