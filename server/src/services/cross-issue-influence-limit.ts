@@ -123,8 +123,7 @@ export async function observeCrossIssueInfluence(
       // an issue via checkout mid-heartbeat. Fall back to the live checkout/
       // execution lock — if this run is the one actively holding the target
       // issue, the write is unambiguously the run's own issue, not a cross-issue
-      // influence attempt. Only the exact lock match is trusted; anything else
-      // still fails closed.
+      // influence attempt, and skips the cap below entirely.
       const targetIssue = await tx
         .select({ checkoutRunId: issues.checkoutRunId, executionRunId: issues.executionRunId })
         .from(issues)
@@ -133,7 +132,11 @@ export async function observeCrossIssueInfluence(
       if (targetIssue && (targetIssue.checkoutRunId === input.runId || targetIssue.executionRunId === input.runId)) {
         return null;
       }
-      throw crossIssueInfluenceRunContextError();
+      // No lock match: this is a genuine cross-issue write from an unscoped
+      // run (e.g. commenting on the run's own blocked issue, which can never
+      // hold the checkout lock). That is exactly the case the per-run cap
+      // below exists to budget, not a reason to fail closed before ever
+      // reaching the counter (GIF-41) — fall through instead of throwing.
     }
 
     const priorCount = await tx
