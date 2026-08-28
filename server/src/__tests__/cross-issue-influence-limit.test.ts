@@ -207,7 +207,11 @@ describe("cross-issue influence limit rollout", () => {
     expect(fake.inserted).toEqual([]);
   });
 
-  it("fails closed when the persisted run has no source issue and no lock on the target", async () => {
+  it("falls through to the per-run cap when the persisted run has no source issue and no lock on the target (GIF-41)", async () => {
+    // Unscoped heartbeat runs never populate contextSnapshot.issueId and can
+    // never hold the checkout lock on a blocked issue, yet still need to be
+    // able to comment/PATCH their own blocked, assigned issue. That write is
+    // budgeted by the shared cap counter, not hard-rejected before reaching it.
     const fake = counterDb(0, { contextSnapshot: {} }, null);
 
     await expect(observeCrossIssueInfluence(fake.db as never, {
@@ -216,11 +220,30 @@ describe("cross-issue influence limit rollout", () => {
       agentId: "33333333-3333-4333-8333-333333333333",
       targetIssueId: "55555555-5555-4555-8555-555555555555",
       kind: "update",
-    })).rejects.toMatchObject({
-      status: 403,
-      details: { code: "cross_issue_influence_run_context_required" },
+      now: CROSS_ISSUE_INFLUENCE_ENFORCE_AT,
+    })).resolves.toMatchObject({ allowed: true, count: 1 });
+    expect(fake.inserted).toHaveLength(1);
+    expect(fake.inserted[0]).toMatchObject({ action: "issue.cross_issue_influence_observed" });
+  });
+
+  it("still fails closed past the cap for an unscoped run with no source issue and no lock match", async () => {
+    const fake = counterDb(CROSS_ISSUE_INFLUENCE_LIMIT, { contextSnapshot: {} }, null);
+
+    await expect(observeCrossIssueInfluence(fake.db as never, {
+      companyId: "22222222-2222-4222-8222-222222222222",
+      runId: "11111111-1111-4111-8111-111111111111",
+      agentId: "33333333-3333-4333-8333-333333333333",
+      targetIssueId: "55555555-5555-4555-8555-555555555555",
+      kind: "update",
+      now: CROSS_ISSUE_INFLUENCE_ENFORCE_AT,
+    })).resolves.toMatchObject({
+      allowed: false,
+      mode: "enforce",
+      count: CROSS_ISSUE_INFLUENCE_LIMIT + 1,
     });
-    expect(fake.inserted).toEqual([]);
+    expect(fake.inserted).toEqual([
+      expect.objectContaining({ action: "issue.cross_issue_influence_cap_rejected" }),
+    ]);
   });
 
   it.each([
@@ -244,7 +267,7 @@ describe("cross-issue influence limit rollout", () => {
     },
   );
 
-  it("fails closed when the target issue is locked to a different run", async () => {
+  it("counts against the cap instead of hard-failing when the target issue is locked to a different run", async () => {
     const fake = counterDb(0, { contextSnapshot: {} }, {
       checkoutRunId: "99999999-9999-4999-8999-999999999999",
     });
@@ -255,10 +278,9 @@ describe("cross-issue influence limit rollout", () => {
       agentId: "33333333-3333-4333-8333-333333333333",
       targetIssueId: "55555555-5555-4555-8555-555555555555",
       kind: "update",
-    })).rejects.toMatchObject({
-      status: 403,
-      details: { code: "cross_issue_influence_run_context_required" },
-    });
-    expect(fake.inserted).toEqual([]);
+      now: CROSS_ISSUE_INFLUENCE_ENFORCE_AT,
+    })).resolves.toMatchObject({ allowed: true, count: 1 });
+    expect(fake.inserted).toHaveLength(1);
+    expect(fake.inserted[0]).toMatchObject({ action: "issue.cross_issue_influence_observed" });
   });
 });
