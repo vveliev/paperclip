@@ -606,6 +606,10 @@ export const updateIssueSchema = objectWithoutDefaults(
   onBehalfOfUserId: z.string().trim().min(1).optional().nullable(),
   reviewInteractionId: z.string().guid().optional(),
   reviewRequest: issueReviewRequestSchema.optional().nullable(),
+  // Explicit verdict channel for the active review-stage participant. This is
+  // the only field that records or mutates a review decision — a `status`
+  // change by itself is never interpreted as approval or rejection (BLA-692).
+  reviewDecision: z.enum(["approved", "changes_requested"]).optional(),
   reopen: z.boolean().optional(),
   resume: z.boolean().optional(),
   interrupt: z.boolean().optional(),

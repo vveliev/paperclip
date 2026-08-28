@@ -53,6 +53,12 @@ type TransitionInput = {
   commentBody?: string | null;
   reviewRequest?: IssueExecutionState["reviewRequest"] | null;
   monitorExplicitlyUpdated?: boolean;
+  /**
+   * Explicit verdict from the active review-stage participant. This is the
+   * only channel that records or mutates a decision — `requestedStatus`
+   * alone must never be interpreted as approval or rejection (BLA-692).
+   */
+  reviewDecision?: "approved" | "changes_requested";
 };
 
 type TransitionResult = {
@@ -784,7 +790,9 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
     }
 
     if (principalsEqual(currentParticipant, actor)) {
-      if (requestedStatus === "done") {
+      const reviewDecision = input.reviewDecision;
+
+      if (reviewDecision === "approved") {
         if (!input.commentBody?.trim()) {
           throw unprocessable(`Approving a review or approval stage requires a comment. ${STAGE_DECISION_COMMENT_HINT}`);
         }
@@ -848,7 +856,7 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
         return { patch };
       }
 
-      if (requestedStatus && requestedStatus !== "in_review") {
+      if (reviewDecision === "changes_requested") {
         if (!input.commentBody?.trim()) {
           throw unprocessable(`Requesting changes requires a comment. ${STAGE_DECISION_COMMENT_HINT}`);
         }
@@ -898,6 +906,19 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
           decision,
           workflowControlledAssignment: true,
         };
+      }
+
+      // The active review participant is attempting to move the issue off
+      // `in_review` (or otherwise signalling a verdict) without an explicit
+      // reviewDecision. Guessing a verdict from the status value is exactly
+      // the defect this branch used to have: any non-"done" status was
+      // silently recorded as changes_requested regardless of intent, which
+      // once inverted a live AppSec APPROVE (BLA-692, BLA-114). Refuse
+      // instead of inferring.
+      if (requestedStatus !== undefined && requestedStatus !== "in_review") {
+        throw unprocessable(
+          `This issue has an active review stage assigned to you. Include "reviewDecision": "approved" or "reviewDecision": "changes_requested" in this request to record your verdict — a status change alone is not recorded as a decision. ${STAGE_DECISION_COMMENT_HINT}`,
+        );
       }
     }
 

@@ -6947,6 +6947,17 @@ export function issueRoutes(
             actorRunId: actor.runId,
           });
           const executionPolicy = normalizeIssueExecutionPolicy(lockedIssue.executionPolicy ?? null);
+          // sourceIssueStatus here is a validated, deliberate recovery target
+          // (resolveIssueRecoveryActionSchema), not a freeform status PATCH —
+          // unlike the general PATCH route, its intent is unambiguous, so it
+          // is translated into the explicit verdict channel rather than
+          // requiring recovery callers to also state reviewDecision.
+          const recoveryReviewDecision: "approved" | "changes_requested" | undefined =
+            sourceIssueStatus === "done"
+              ? "approved"
+              : sourceIssueStatus && sourceIssueStatus !== "in_review"
+                ? "changes_requested"
+                : undefined;
           const transition = applyIssueExecutionPolicyTransition({
             issue: lockedIssue,
             policy: executionPolicy,
@@ -6959,6 +6970,7 @@ export function issueRoutes(
             },
             allowBoardOverride: req.actor.type === "board",
             commentBody: resolutionNote ?? null,
+            reviewDecision: recoveryReviewDecision,
           });
           Object.assign(updateFields, transition.patch);
           if (transition.decision) {
@@ -9407,6 +9419,7 @@ export function issueRoutes(
       comment: commentBody,
       reviewInteractionId: requestedReviewInteractionId,
       reviewRequest,
+      reviewDecision,
       reopen: reopenRequested,
       resume: resumeRequested,
       interrupt: interruptRequested,
@@ -9677,6 +9690,7 @@ export function issueRoutes(
       allowBoardOverride: req.actor.type === "board",
       commentBody,
       reviewRequest: reviewRequest === undefined ? undefined : reviewRequest,
+      reviewDecision: reviewDecision === undefined ? undefined : reviewDecision,
       monitorExplicitlyUpdated: req.body.executionPolicy !== undefined && monitorChanged,
     });
     const decisionId = transition.decision ? randomUUID() : null;
@@ -12394,6 +12408,10 @@ export function issueRoutes(
           userId: actor.actorType === "user" ? actor.actorId : null,
         },
         commentBody: req.body.body,
+        // isApprovalReviewComment already required a structured, unambiguous
+        // approval marker in the comment body — this is a real explicit
+        // verdict, just carried in the comment rather than a request field.
+        reviewDecision: "approved",
       });
       const decisionId = transition.decision ? randomUUID() : null;
       if (decisionId) {

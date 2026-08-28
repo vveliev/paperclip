@@ -285,6 +285,7 @@ describe("issue execution policy transitions", () => {
         requestedAssigneePatch: {},
         actor: { agentId: qaAgentId },
         commentBody: "QA signoff complete",
+        reviewDecision: "approved",
       });
 
       expect(result.patch.status).toBe("in_review");
@@ -331,6 +332,7 @@ describe("issue execution policy transitions", () => {
         actor: { agentId: qaAgentId },
         commentBody: "QA signoff complete",
         reviewRequest: { instructions: approvalInstructions },
+        reviewDecision: "approved",
       });
 
       expect(result.patch.executionState).toMatchObject({
@@ -367,6 +369,7 @@ describe("issue execution policy transitions", () => {
         requestedAssigneePatch: {},
         actor: { userId: ctoUserId },
         commentBody: "Approved, ship it",
+        reviewDecision: "approved",
       });
 
       expect(result.patch.executionState).toMatchObject({
@@ -412,6 +415,7 @@ describe("issue execution policy transitions", () => {
         requestedAssigneePatch: {},
         actor: { agentId: qaAgentId },
         commentBody: "Needs another pass on edge cases",
+        reviewDecision: "changes_requested",
       });
 
       expect(result.patch.status).toBe("in_progress");
@@ -494,6 +498,7 @@ describe("issue execution policy transitions", () => {
         requestedAssigneePatch: {},
         actor: { agentId: qaAgentId },
         commentBody: "LGTM",
+        reviewDecision: "approved",
       });
 
       expect(result.patch.executionState).toMatchObject({
@@ -804,6 +809,7 @@ describe("issue execution policy transitions", () => {
           requestedAssigneePatch: {},
           actor: { agentId: qaAgentId },
           commentBody: "",
+          reviewDecision: "approved",
         }),
       ).toThrow(/Approving a review or approval stage requires a comment.*same PATCH request.*prior comments are not considered/);
     });
@@ -833,6 +839,7 @@ describe("issue execution policy transitions", () => {
           requestedAssigneePatch: {},
           actor: { agentId: qaAgentId },
           commentBody: null,
+          reviewDecision: "changes_requested",
         }),
       ).toThrow(/Requesting changes requires a comment.*same PATCH request.*prior comments are not considered/);
     });
@@ -862,6 +869,7 @@ describe("issue execution policy transitions", () => {
           requestedAssigneePatch: {},
           actor: { agentId: qaAgentId },
           commentBody: "   ",
+          reviewDecision: "approved",
         }),
       ).toThrow("requires a comment");
     });
@@ -1298,6 +1306,7 @@ describe("issue execution policy transitions", () => {
         requestedAssigneePatch: {},
         actor: { userId: ctoUserId },
         commentBody: "Approved, ship it",
+        reviewDecision: "approved",
       });
 
       // Must terminate the policy, not wrap around to the first stage.
@@ -1341,6 +1350,7 @@ describe("issue execution policy transitions", () => {
         requestedAssigneePatch: {},
         actor: { agentId: qaAgentId },
         commentBody: "QA pass",
+        reviewDecision: "approved",
       });
 
       expect(result.patch.status).toBe("in_review");
@@ -1379,6 +1389,7 @@ describe("issue execution policy transitions", () => {
         requestedAssigneePatch: {},
         actor: { userId: ctoUserId },
         commentBody: "Needs rework before release",
+        reviewDecision: "changes_requested",
       });
 
       expect(result.patch.status).toBe("in_progress");
@@ -1456,6 +1467,7 @@ describe("issue execution policy transitions", () => {
           requestedAssigneePatch: {},
           actor: { agentId: qaAgentId },
           commentBody: "Changes needed",
+          reviewDecision: "changes_requested",
         }),
       ).toThrow("no return assignee");
     });
@@ -1489,6 +1501,7 @@ describe("issue execution policy transitions", () => {
         requestedAssigneePatch: {},
         actor: { userId: ctoUserId },
         commentBody: "Not happy with the approach, needs rework",
+        reviewDecision: "changes_requested",
       });
 
       expect(result.patch.status).toBe("in_progress");
@@ -1830,6 +1843,7 @@ describe("review round circuit breaker", () => {
       requestedAssigneePatch: {},
       actor: { agentId: qaAgentId },
       commentBody: "Round one feedback",
+      reviewDecision: "changes_requested",
     });
 
     expect(result.patch.status).toBe("in_progress");
@@ -1883,6 +1897,7 @@ describe("review round circuit breaker", () => {
       requestedAssigneePatch: {},
       actor: { agentId: qaAgentId },
       commentBody: "Round three feedback — still not converging",
+      reviewDecision: "changes_requested",
     });
 
     // The decision is still recorded, but the stage stays pending with the
@@ -1993,6 +2008,7 @@ describe("review round circuit breaker", () => {
       requestedAssigneePatch: {},
       actor: { userId: boardUserId },
       commentBody: "Human direction: do X instead",
+      reviewDecision: "changes_requested",
     });
 
     expect(result.patch.status).toBe("in_progress");
@@ -2017,6 +2033,7 @@ describe("review round circuit breaker", () => {
       requestedAssigneePatch: {},
       actor: { userId: boardUserId },
       commentBody: "Good enough — shipping",
+      reviewDecision: "approved",
     });
 
     expect(result.decision).toMatchObject({ outcome: "approved" });
@@ -2034,6 +2051,7 @@ describe("review round circuit breaker", () => {
       requestedAssigneePatch: {},
       actor: { agentId: qaAgentId },
       commentBody: "Round ten feedback",
+      reviewDecision: "changes_requested",
     });
 
     expect(result.patch.status).toBe("in_progress");
@@ -2075,6 +2093,7 @@ describe("review round circuit breaker", () => {
       requestedAssigneePatch: {},
       actor: { agentId: qaAgentId },
       commentBody: "First and only agent round",
+      reviewDecision: "changes_requested",
     });
 
     expect(result.patch.assigneeUserId).toBe(boardUserId);
@@ -2083,5 +2102,141 @@ describe("review round circuit breaker", () => {
       currentParticipant: { type: "user", userId: boardUserId },
       changesRequestedCount: 1,
     });
+  });
+});
+
+// BLA-692: a status transition by the active review participant must never be
+// interpreted as a verdict. Only the explicit reviewDecision field records or
+// mutates a decision — this replaces the old behavior where any non-"done"
+// status was silently recorded as changes_requested (BLA-114, live on BLA-625).
+describe("explicit reviewDecision channel (BLA-692)", () => {
+  const policy = reviewOnlyPolicy();
+  const reviewStageId = policy.stages[0].id;
+
+  function reviewPendingIssue() {
+    return {
+      status: "in_review",
+      assigneeAgentId: qaAgentId,
+      assigneeUserId: null,
+      executionPolicy: policy,
+      executionState: {
+        status: "pending",
+        currentStageId: reviewStageId,
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: qaAgentId },
+        returnAssignee: { type: "agent", agentId: coderAgentId },
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+    };
+  }
+
+  it("refuses a status change from the review participant with no reviewDecision, even when the comment states a verdict in prose", () => {
+    // Reproduces the exact BLA-625 shape: the reviewer hands the issue back
+    // with status in_progress and states APPROVE in prose. Prose is not the
+    // verdict channel — this must be refused, not silently bucketed as
+    // changes_requested.
+    expect(() =>
+      applyIssueExecutionPolicyTransition({
+        issue: reviewPendingIssue(),
+        policy,
+        requestedStatus: "in_progress",
+        requestedAssigneePatch: {},
+        actor: { agentId: qaAgentId },
+        commentBody: "Reviewed and my verdict is APPROVE. Handing back for a remaining task-scope item.",
+      }),
+    ).toThrow(/reviewDecision.*approved.*reviewDecision.*changes_requested/);
+  });
+
+  it("refuses a done status from the review participant with no reviewDecision (no implicit approve)", () => {
+    expect(() =>
+      applyIssueExecutionPolicyTransition({
+        issue: reviewPendingIssue(),
+        policy,
+        requestedStatus: "done",
+        requestedAssigneePatch: {},
+        actor: { agentId: qaAgentId },
+        commentBody: "LGTM",
+      }),
+    ).toThrow(/reviewDecision/);
+  });
+
+  it("refuses a blocked status from the review participant with no reviewDecision (BLA-114 comment e1a72c8e)", () => {
+    expect(() =>
+      applyIssueExecutionPolicyTransition({
+        issue: reviewPendingIssue(),
+        policy,
+        requestedStatus: "blocked",
+        requestedAssigneePatch: {},
+        actor: { agentId: qaAgentId },
+        commentBody: "Blocked on an external dependency",
+      }),
+    ).toThrow(/reviewDecision/);
+  });
+
+  it("records an explicit approve verdict even when status is not done, decoupling the decision from status", () => {
+    // The BLA-625 scenario done right: AppSec approves the review stage while
+    // handing the issue back (status stays in_progress) for unrelated
+    // follow-up work, instead of being forced to choose between "done"
+    // (closes the whole issue prematurely) or an inferred rejection.
+    const result = applyIssueExecutionPolicyTransition({
+      issue: reviewPendingIssue(),
+      policy,
+      requestedStatus: "in_progress",
+      requestedAssigneePatch: {},
+      actor: { agentId: qaAgentId },
+      commentBody: "My verdict is APPROVE. Handing back for a remaining task-scope item.",
+      reviewDecision: "approved",
+    });
+
+    expect(result.decision).toMatchObject({
+      stageId: reviewStageId,
+      stageType: "review",
+      outcome: "approved",
+    });
+    expect(result.patch.executionState).toMatchObject({
+      status: "completed",
+      lastDecisionOutcome: "approved",
+    });
+    // The transition does not force status — the caller's own "in_progress"
+    // passes through untouched by this patch.
+    expect(result.patch.status).toBeUndefined();
+  });
+
+  it("records an explicit changes_requested verdict and ignores an unrelated requestedStatus value", () => {
+    const result = applyIssueExecutionPolicyTransition({
+      issue: reviewPendingIssue(),
+      policy,
+      requestedStatus: "blocked",
+      requestedAssigneePatch: {},
+      actor: { agentId: qaAgentId },
+      commentBody: "Needs another pass",
+      reviewDecision: "changes_requested",
+    });
+
+    expect(result.decision).toMatchObject({
+      stageId: reviewStageId,
+      stageType: "review",
+      outcome: "changes_requested",
+    });
+    // changes_requested always hands back to the executor regardless of the
+    // caller's requestedStatus value.
+    expect(result.patch.status).toBe("in_progress");
+    expect(result.patch.assigneeAgentId).toBe(coderAgentId);
+  });
+
+  it("does not require reviewDecision when the review participant does not change status", () => {
+    const result = applyIssueExecutionPolicyTransition({
+      issue: reviewPendingIssue(),
+      policy,
+      requestedStatus: undefined,
+      requestedAssigneePatch: {},
+      actor: { agentId: qaAgentId },
+      commentBody: "Just a progress note",
+    });
+
+    expect(result.patch).toEqual({});
   });
 });
