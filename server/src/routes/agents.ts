@@ -1593,6 +1593,8 @@ export function agentRoutes(
       title: agent.title,
       status: agent.status,
       trustPreset: LOW_TRUST_REVIEW_PRESET,
+      adapterConfigRedacted: true,
+      runtimeConfigRedacted: true,
     };
   }
 
@@ -2822,6 +2824,8 @@ export function agentRoutes(
       ...agent,
       adapterConfig: {},
       runtimeConfig: {},
+      adapterConfigRedacted: true,
+      runtimeConfigRedacted: true,
     };
   }
 
