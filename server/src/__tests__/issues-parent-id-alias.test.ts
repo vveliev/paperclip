@@ -30,7 +30,15 @@ describeEmbeddedPostgres("issue list parentIssueId query alias", () => {
     ]);
     await ctx.db.insert(issues).values([
       { id: childId, companyId, title: "Child", status: "todo", priority: "medium", parentId },
-      { id: blockedChildId, companyId, title: "Blocked child", status: "blocked", priority: "medium", parentId },
+      {
+        id: blockedChildId,
+        companyId,
+        title: "Blocked child",
+        status: "blocked",
+        unblockDescriptor: { owner: "board", action: "Test fixture: pre-existing blocked issue." },
+        priority: "medium",
+        parentId,
+      },
       {
         id: randomUUID(),
         companyId,
@@ -44,6 +52,7 @@ describeEmbeddedPostgres("issue list parentIssueId query alias", () => {
         companyId,
         title: "Blocked other child",
         status: "blocked",
+        unblockDescriptor: { owner: "board", action: "Test fixture: pre-existing blocked issue." },
         priority: "medium",
         parentId: otherParentId,
       },

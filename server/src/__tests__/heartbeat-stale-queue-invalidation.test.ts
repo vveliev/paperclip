@@ -1177,6 +1177,7 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       companyId,
       title: "Parked max-turn continuation",
       status: "blocked",
+      unblockDescriptor: { owner: "board", action: "Test fixture: pre-existing blocked issue." },
       priority: "medium",
       assigneeAgentId: agentId,
     });

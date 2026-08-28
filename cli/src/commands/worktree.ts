@@ -1380,6 +1380,16 @@ export async function quarantineSeededWorktreeExecutionState(
             executionLockedAt: null,
             executionWorkspaceId: null,
             updatedAt: new Date(),
+            ...(nextStatus === "blocked"
+              ? {
+                unblockDescriptor: {
+                  owner: "board" as const,
+                  action: "Quarantined during worktree seed so copied in-flight work does not auto-run "
+                    + "in this isolated instance. Reassign or unblock here only if you intentionally want "
+                    + "the worktree instance to own this task.",
+                },
+              }
+              : {}),
           })
           .where(eq(issues.id, issue.id));
 
