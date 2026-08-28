@@ -39,6 +39,7 @@ import {
   getManagedInstanceConfig,
   type ManagedInstanceConfig,
 } from "./services/managed-config.js";
+import { getOperatorSettingDefaults } from "./services/setting-defaults.js";
 import { setupEnvironmentCustomImageTerminalWebSocketServer } from "./realtime/environment-custom-image-terminal-ws.js";
 import { setupLiveEventsWebSocketServer } from "./realtime/live-events-ws.js";
 import { setupRunnerPrpWebSocketServer } from "./realtime/runner-prp-ws.js";
@@ -67,6 +68,7 @@ import {
   toolAccessService,
   workspaceOperationService,
 } from "./services/index.js";
+import { questionResponseDeliveryService } from "./services/question-response-delivery.js";
 import { queueIssueAssignmentWakeup } from "./services/issue-assignment-wakeup.js";
 import { createSecretProposalsService } from "./services/secret-proposals.js";
 import { environmentRuntimeService } from "./services/environment-runtime.js";
@@ -688,6 +690,22 @@ export async function startServer(): Promise<StartedServer> {
     throw err;
   }
 
+  // Operator setting defaults (PAPERCLIP_SETTING_DEFAULTS). Same fail-closed
+  // posture as the managed-config parse above: malformed JSON or an invalid
+  // value for a known field refuses startup; unknown field names only warn.
+  try {
+    const operatorDefaults = getOperatorSettingDefaults();
+    if (operatorDefaults && Object.keys(operatorDefaults).length > 0) {
+      logger.warn(
+        { defaultedSettings: Object.keys(operatorDefaults).sort() },
+        "operator setting defaults active",
+      );
+    }
+  } catch (err) {
+    logger.error({ err }, "invalid PAPERCLIP_SETTING_DEFAULTS; refusing to start (fail closed)");
+    throw err;
+  }
+
   const uiMode = config.uiDevMiddleware ? "vite-dev" : config.serveUi ? "static" : "none";
   const storageService = createStorageServiceFromConfig(config);
   const feedback = feedbackService(db as any, {
@@ -1116,6 +1134,9 @@ export async function startServer(): Promise<StartedServer> {
   const ENVIRONMENT_LEASE_CLEANUP_SWEEP_BACKOFF_MS = 5 * 60 * 1000;
   const environmentLeaseCleanupHeartbeat =
     heartbeat ?? heartbeatService(db as any, { pluginWorkerManager });
+  const questionResponseDeliveries = questionResponseDeliveryService(db as any, {
+    heartbeat: environmentLeaseCleanupHeartbeat,
+  });
   const runEnvironmentLeaseCleanupSweep = (backoffMs: number) =>
     environmentLeaseCleanupHeartbeat
       .sweepPendingCleanupLeases({ backoffMs })
@@ -1131,6 +1152,14 @@ export async function startServer(): Promise<StartedServer> {
     if (heartbeatSchedulerStopped) return;
     trackHeartbeatSchedulerWork(runEnvironmentLeaseCleanupSweep(ENVIRONMENT_LEASE_CLEANUP_SWEEP_BACKOFF_MS));
   };
+
+  await questionResponseDeliveries.sweepPending().then((result) => {
+    if (result.scanned > 0) {
+      logger.info(result, "startup question-response delivery sweep completed");
+    }
+  }).catch((err) => {
+    logger.error({ err }, "startup question-response delivery sweep failed");
+  });
 
   if (heartbeat) {
     const secretProposals = createSecretProposalsService(db as any);
@@ -1540,6 +1569,16 @@ export async function startServer(): Promise<StartedServer> {
           })
           .catch((err) => {
             logger.error({ err }, "periodic secret proposal expiry sweep failed");
+          }));
+
+        trackHeartbeatSchedulerWork(questionResponseDeliveries.sweepPending()
+          .then((result) => {
+            if (result.scanned > 0) {
+              logger.info(result, "periodic question-response delivery sweep completed");
+            }
+          })
+          .catch((err) => {
+            logger.error({ err }, "periodic question-response delivery sweep failed");
           }));
 
         if (heartbeatSchedulerStopped) return;
