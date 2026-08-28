@@ -427,6 +427,8 @@ describe.sequential("agent permission routes", () => {
     expect(res.status).toBe(200);
     expect(res.body.adapterConfig).toEqual({});
     expect(res.body.runtimeConfig).toEqual({});
+    expect(res.body.adapterConfigRedacted).toBe(true);
+    expect(res.body.runtimeConfigRedacted).toBe(true);
   }, 20_000);
 
   it("redacts env values in board agent detail responses", async () => {
@@ -482,6 +484,8 @@ describe.sequential("agent permission routes", () => {
       heartbeat: { enabled: false },
     });
     expect(res.body.permissions).toMatchObject({ trustPreset: LOW_TRUST_REVIEW_PRESET });
+    expect(res.body.adapterConfigRedacted).toBeUndefined();
+    expect(res.body.runtimeConfigRedacted).toBeUndefined();
   }, 20_000);
 
   // TEC-7032 reported the leak against the company agent-list endpoint, which
@@ -675,6 +679,8 @@ describe.sequential("agent permission routes", () => {
         id: agentId,
         adapterConfig: {},
         runtimeConfig: {},
+        adapterConfigRedacted: true,
+        runtimeConfigRedacted: true,
       }),
     ]);
   });
