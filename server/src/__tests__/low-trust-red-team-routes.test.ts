@@ -1039,6 +1039,8 @@ describeEmbeddedPostgres("low-trust red-team HTTP route regression suite", () =>
     expect(lowTrustRes.body).not.toHaveProperty("runtimeConfig");
     expect(lowTrustRes.body).not.toHaveProperty("permissions");
     expect(lowTrustRes.body).not.toHaveProperty("access");
+    expect(lowTrustRes.body.adapterConfigRedacted).toBe(true);
+    expect(lowTrustRes.body.runtimeConfigRedacted).toBe(true);
     expectNoCanary(lowTrustRes.body, fixture.canaries.agentConfig);
 
     const lowTrustSelfByIdRes = await request(createApp(db, agentActor(fixture)))
@@ -1053,6 +1055,8 @@ describeEmbeddedPostgres("low-trust red-team HTTP route regression suite", () =>
     expect(lowTrustSelfByIdRes.body).not.toHaveProperty("runtimeConfig");
     expect(lowTrustSelfByIdRes.body).not.toHaveProperty("permissions");
     expect(lowTrustSelfByIdRes.body).not.toHaveProperty("access");
+    expect(lowTrustSelfByIdRes.body.adapterConfigRedacted).toBe(true);
+    expect(lowTrustSelfByIdRes.body.runtimeConfigRedacted).toBe(true);
     expectNoCanary(lowTrustSelfByIdRes.body, fixture.canaries.agentConfig);
 
     const lowTrustPeerConfigRes = await request(createApp(db, agentActor(fixture)))
@@ -1079,6 +1083,8 @@ describeEmbeddedPostgres("low-trust red-team HTTP route regression suite", () =>
     });
     expect(issueScopedLowTrustRes.body).not.toHaveProperty("adapterConfig");
     expect(issueScopedLowTrustRes.body).not.toHaveProperty("runtimeConfig");
+    expect(issueScopedLowTrustRes.body.adapterConfigRedacted).toBe(true);
+    expect(issueScopedLowTrustRes.body.runtimeConfigRedacted).toBe(true);
     expectNoCanary(issueScopedLowTrustRes.body, fixture.canaries.agentConfig);
 
     for (const restrictedActor of [
@@ -1129,6 +1135,8 @@ describeEmbeddedPostgres("low-trust red-team HTTP route regression suite", () =>
     });
     expect(projectScopedLowTrustRes.body).not.toHaveProperty("adapterConfig");
     expect(projectScopedLowTrustRes.body).not.toHaveProperty("runtimeConfig");
+    expect(projectScopedLowTrustRes.body.adapterConfigRedacted).toBe(true);
+    expect(projectScopedLowTrustRes.body.runtimeConfigRedacted).toBe(true);
     expectNoCanary(projectScopedLowTrustRes.body, fixture.canaries.agentConfig);
   });
 

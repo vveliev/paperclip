@@ -84,6 +84,14 @@ export interface Agent {
   adapterType: AgentAdapterType;
   adapterConfig: Record<string, unknown>;
   runtimeConfig: AgentRuntimeConfig;
+  /**
+   * True when `adapterConfig` above is `{}` because the viewer lacks
+   * `agent_config:read` for this agent, not because the stored config is
+   * actually empty. Absent (not `false`) when the viewer has full access.
+   */
+  adapterConfigRedacted?: boolean;
+  /** Same redaction signal as {@link adapterConfigRedacted}, for `runtimeConfig`. */
+  runtimeConfigRedacted?: boolean;
   defaultEnvironmentId?: string | null;
   budgetMonthlyCents: number;
   spentMonthlyCents: number;
