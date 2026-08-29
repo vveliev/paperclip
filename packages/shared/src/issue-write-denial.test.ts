@@ -86,6 +86,14 @@ describe("describeIssueWriteDenial", () => {
     expect(copy.sanctionedPath).toContain("PAPERCLIP_RUN_ID");
   });
 
+  it("interpolates the caller's actual run id instead of leaving a raw template placeholder", () => {
+    const copy = describeIssueWriteDenial("cross_issue_influence_run_context_required", {
+      runId: "31ec5839-d70a-4ab7-8b21-bbbafab6f9b5",
+    });
+    expect(copy.sanctionedPath).toContain("31ec5839-d70a-4ab7-8b21-bbbafab6f9b5");
+    expect(copy.sanctionedPath).not.toContain("$PAPERCLIP_RUN_ID");
+  });
+
   it("tells a spoof attempt that the write itself was fine", () => {
     const copy = describeIssueWriteDenial("issue_write_attribution_spoof_rejected", {
       actorLabel: "Fable",
