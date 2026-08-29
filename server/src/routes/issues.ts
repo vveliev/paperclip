@@ -1215,6 +1215,7 @@ const ISSUE_WAKE_DIAGNOSTIC_KNOWN_REASONS = new Set([
   "issue_status_changed",
   "issue_reopened_via_comment",
   "issue_children_completed",
+  "issue_execution_promoted",
 ]);
 
 const ISSUE_WAKE_DIAGNOSTIC_KNOWN_STATUSES = new Set([
