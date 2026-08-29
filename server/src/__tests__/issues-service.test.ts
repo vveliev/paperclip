@@ -6036,6 +6036,66 @@ describeEmbeddedPostgres("issueService.update blocked requires unblockDescriptor
       /status=blocked requires a non-null unblockDescriptor/,
     );
   });
+
+  it("rejects a PATCH to blocked with a valid descriptor but no assignee (GIF-66)", async () => {
+    const issueId = await insertIssue("todo", { assigneeAgentId: null });
+
+    await expect(svc.update(issueId, {
+      status: "blocked",
+      unblockDescriptor: { owner: "board", action: "Inspect the evidence and decide." },
+    })).rejects.toThrow(/status=blocked requires a named owner/);
+
+    const row = await db.select({ status: issues.status, assigneeAgentId: issues.assigneeAgentId })
+      .from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]);
+    expect(row).toEqual({ status: "todo", assigneeAgentId: null });
+  });
+
+  it("rejects unassigning an already-blocked issue via the same PATCH (GIF-66)", async () => {
+    const issueId = await insertIssue("blocked", {
+      unblockDescriptor: { owner: "board", action: "Board operator: inspect and decide." },
+      blockedTransitionAt: new Date(),
+    });
+
+    await expect(svc.update(issueId, {
+      status: "blocked",
+      assigneeAgentId: null,
+    })).rejects.toThrow(/status=blocked requires a named owner/);
+  });
+
+  it("accepts entering blocked with an existing user assignee and no agent assignee (GIF-66)", async () => {
+    const issueId = await insertIssue("todo", { assigneeAgentId: null, assigneeUserId: "board-user-1" });
+
+    const updated = await svc.update(issueId, {
+      status: "blocked",
+      unblockDescriptor: { owner: "board", action: "Inspect the evidence and decide." },
+    });
+
+    expect(updated?.status).toBe("blocked");
+    expect(updated?.assigneeUserId).toBe("board-user-1");
+  });
+
+  it("rejects creating an issue directly into blocked with no assignee (GIF-66)", async () => {
+    await expect(svc.create(companyId, {
+      title: "Dead letter from birth",
+      description: null,
+      status: "blocked",
+      priority: "medium",
+    })).rejects.toThrow(/status=blocked requires a named owner/);
+  });
+
+  it("accepts creating an issue directly into blocked with an assignee (GIF-66)", async () => {
+    const issue = await svc.create(companyId, {
+      title: "Blocked with an owner from birth",
+      description: null,
+      status: "blocked",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      unblockDescriptor: { owner: "board", action: "Inspect the evidence and decide." },
+    });
+
+    expect(issue?.status).toBe("blocked");
+    expect(issue?.assigneeAgentId).toBe(agentId);
+  });
 });
 
 describeEmbeddedPostgres("accepted plan decomposition", () => {
