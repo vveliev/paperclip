@@ -184,10 +184,27 @@ function wakeDiagnosticActivityTargetsIssue(issueId: string) {
   )`;
 }
 
+function isTerminalIssueStatus(status: string) {
+  return status === "done" || status === "cancelled";
+}
+
+// GIF-49: a terminal issue (done/cancelled) must not silently revert to
+// "blocked". This previously had no guard at all — an internal
+// recovery/continuation sweep acting on a snapshot that predates a terminal
+// write (e.g. an agent's PATCH status=done landing after the sweep already
+// picked the issue as a stranded candidate) could blind-overwrite a `done`
+// issue back to `blocked` and clear `completedAt`, producing an
+// unattributed revert minutes after the issue actually closed. Reopening a
+// terminal issue back to "todo"/"in_progress" (e.g. a human comment or an
+// explicit PATCH) stays unrestricted — that path never targets "blocked"
+// directly, so no caller needs an opt-in here.
 function assertTransition(from: string, to: string) {
   if (from === to) return;
   if (!ALL_ISSUE_STATUSES.includes(to)) {
     throw conflict(`Unknown issue status: ${to}`);
+  }
+  if (isTerminalIssueStatus(from) && to === "blocked") {
+    throw conflict(`Cannot move issue from terminal status "${from}" directly to "blocked"`);
   }
 }
 
