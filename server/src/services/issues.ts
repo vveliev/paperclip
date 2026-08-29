@@ -7254,6 +7254,15 @@ export function issueService(db: Db) {
       if (data.status === "in_progress" && !data.assigneeAgentId && !data.assigneeUserId) {
         throw unprocessable("in_progress issues require an assignee");
       }
+      // GIF-66: mirror update()'s blocked-transition guard so an issue can't
+      // be created directly into "blocked" with no owner either — a blocked
+      // issue is only re-examined when its assignee wakes.
+      if (data.status === "blocked" && !data.assigneeAgentId && !data.assigneeUserId) {
+        throw unprocessable(
+          "status=blocked requires a named owner (assigneeAgentId or assigneeUserId); "
+          + "a blocked issue with no assignee is never re-examined",
+        );
+      }
       return db.transaction(async (tx) => {
         const idempotencyKey = rawIdempotencyKey?.trim() || null;
         const normalizedTitle = normalizeCreateIssueTitle(issueData.title);
@@ -7865,6 +7874,11 @@ export function issueService(db: Db) {
         assertTransition(existing.status, issueData.status);
       }
 
+      const nextAssigneeAgentId =
+        issueData.assigneeAgentId !== undefined ? issueData.assigneeAgentId : existing.assigneeAgentId;
+      const nextAssigneeUserId =
+        issueData.assigneeUserId !== undefined ? issueData.assigneeUserId : existing.assigneeUserId;
+
       const patch: Partial<typeof issues.$inferInsert> = {
         ...issueData,
         updatedAt: new Date(),
@@ -7897,6 +7911,16 @@ export function issueService(db: Db) {
       // surfaces those for backfill instead.
       const assertingBlocked = issueData.status === "blocked";
       if (assertingBlocked) {
+        // GIF-66: same defect class as the unblockDescriptor check below
+        // (GIF-52) — a blocked issue with no assignee is never re-examined,
+        // since re-checks fire by waking the assignee. Reject it at the same
+        // transition-into-blocked guard instead of letting it recur.
+        if (!nextAssigneeAgentId && !nextAssigneeUserId) {
+          throw unprocessable(
+            "status=blocked requires a named owner (assigneeAgentId or assigneeUserId); "
+            + "a blocked issue with no assignee is never re-examined",
+          );
+        }
         const finalDescriptor = issueData.unblockDescriptor !== undefined
           ? issueData.unblockDescriptor
           : existing.unblockDescriptor;
@@ -7936,11 +7960,6 @@ export function issueService(db: Db) {
       if (issueData.requestDepth !== undefined) {
         patch.requestDepth = clampIssueRequestDepth(issueData.requestDepth);
       }
-
-      const nextAssigneeAgentId =
-        issueData.assigneeAgentId !== undefined ? issueData.assigneeAgentId : existing.assigneeAgentId;
-      const nextAssigneeUserId =
-        issueData.assigneeUserId !== undefined ? issueData.assigneeUserId : existing.assigneeUserId;
 
       if (nextAssigneeAgentId && nextAssigneeUserId) {
         throw unprocessable("Issue can only have one assignee");
