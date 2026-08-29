@@ -548,6 +548,35 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     ).toHaveLength(1);
   });
 
+  it("GIF-49: does not revert a done issue to blocked when escalation runs off a stale in_progress snapshot", async () => {
+    const { sourceIssue } = await seedCompany();
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+
+    // Mirrors the reported bug: the sweep already captured `sourceIssue`
+    // (status "in_progress") as a stranded candidate before the assignee's
+    // own `PATCH status=done` landed. The stale snapshot is what gets
+    // passed into escalateStrandedAssignedIssue below, exactly like a real
+    // sweep pass would.
+    await db.update(issues).set({ status: "done", completedAt: new Date() }).where(eq(issues.id, sourceIssue.id));
+
+    const result = await recovery.escalateStrandedAssignedIssue({
+      issue: sourceIssue,
+      previousStatus: "in_progress",
+      latestRun: null,
+    });
+
+    expect(result).toBeNull();
+    const [row] = await db.select().from(issues).where(eq(issues.id, sourceIssue.id));
+    expect(row?.status).toBe("done");
+    expect(row?.completedAt).not.toBeNull();
+    const notices = await db
+      .select()
+      .from(issueComments)
+      .where(eq(issueComments.issueId, sourceIssue.id));
+    expect(notices).toHaveLength(0);
+  });
+
   it("gives a distinct recovery identity and a new operator notice when the unresolved base ref changes", async () => {
     const { coderId, sourceIssue } = await seedCompany();
     const enqueueWakeup = vi.fn(async () => null);

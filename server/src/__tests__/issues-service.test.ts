@@ -6355,6 +6355,46 @@ describeEmbeddedPostgres("issueService.update blocked requires unblockDescriptor
     expect(issue?.status).toBe("blocked");
     expect(issue?.assigneeAgentId).toBe(agentId);
   });
+
+  it("GIF-49: rejects reverting a done issue to blocked, and completedAt survives the rejected write", async () => {
+    const issueId = await insertIssue("todo");
+    const done = await svc.update(issueId, { status: "done" });
+    expect(done?.status).toBe("done");
+    expect(done?.completedAt).not.toBeNull();
+
+    // This mirrors the exact shape reported in GIF-49: a continuation/
+    // recovery sweep calling update() with status: "blocked" against an
+    // issue that has already reached a terminal status. It must be
+    // rejected outright rather than silently reverting the issue and
+    // clearing completedAt.
+    await expect(svc.update(issueId, {
+      status: "blocked",
+      unblockDescriptor: { owner: "board", action: "Investigate." },
+    })).rejects.toThrow(/Cannot move issue from terminal status "done" directly to "blocked"/);
+
+    const row = await db.select({ status: issues.status, completedAt: issues.completedAt })
+      .from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]);
+    expect(row?.status).toBe("done");
+    expect(row?.completedAt).not.toBeNull();
+  });
+
+  it("GIF-49: rejects reverting a cancelled issue to blocked", async () => {
+    const issueId = await insertIssue("todo");
+    await svc.update(issueId, { status: "cancelled" });
+
+    await expect(svc.update(issueId, {
+      status: "blocked",
+      unblockDescriptor: { owner: "board", action: "Investigate." },
+    })).rejects.toThrow(/Cannot move issue from terminal status "cancelled" directly to "blocked"/);
+  });
+
+  it("GIF-49: still allows reopening a done issue to todo directly", async () => {
+    const issueId = await insertIssue("todo");
+    await svc.update(issueId, { status: "done" });
+
+    const reopened = await svc.update(issueId, { status: "todo" });
+    expect(reopened?.status).toBe("todo");
+  });
 });
 
 describeEmbeddedPostgres("accepted plan decomposition", () => {
