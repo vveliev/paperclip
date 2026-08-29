@@ -14,12 +14,18 @@ import type {
 } from "@paperclipai/shared";
 import { toPublicAdapterAuthSessionStatus } from "@paperclipai/shared";
 import {
-  CODEX_DEVICE_LOGIN_COMMAND,
+  CODEX_DEVICE_LOGIN_COMMAND as DEFAULT_CODEX_LOGIN_COMMAND,
+  parseDeviceLoginPrompt,
   runDeviceLogin,
-  type DeviceLoginOutcome,
+  type DeviceLoginOutcome as RunnerDeviceLoginOutcome,
   type DeviceLoginPrompt,
   type SandboxLoginDriver,
 } from "@paperclipai/adapter-codex-local/server";
+import {
+  GROK_DEVICE_LOGIN_COMMAND as DEFAULT_GROK_LOGIN_COMMAND,
+  parseGrokDeviceLoginPrompt,
+} from "@paperclipai/adapter-grok-local/server";
+import type { AdapterLoginPrompt } from "@paperclipai/adapter-utils";
 import {
   createLoginPtyTransport,
   type LoginPtySessionOpener,
@@ -27,7 +33,7 @@ import {
 import type { EnvironmentRuntimeService } from "./environment-runtime.js";
 import { buildLoginLeaseAcquireArgs } from "./adapter-login-lease.js";
 import { environmentService } from "./environments.js";
-import { runDescriptorBoundAuthRead } from "./codex-device-login-credential-read.js";
+import { runDescriptorBoundAuthRead } from "./device-login-credential-read.js";
 import {
   resolveLoginCommandKey,
   validateLoginSessionHome,
@@ -47,7 +53,7 @@ import type { LoginPtyWorkerManagerLike } from "./setup-token-transport-binding.
 // through the owner read path.
 
 /** The host timeout for the sandbox login command. It is exactly five minutes. */
-export const CODEX_DEVICE_LOGIN_TIMEOUT_MS = 300_000;
+export const DEVICE_LOGIN_TIMEOUT_MS = 300_000;
 
 // The fixed error for a sandbox provider that does not advertise the login
 // pseudo-terminal capability. The Codex device login runs the login command on a
@@ -55,9 +61,9 @@ export const CODEX_DEVICE_LOGIN_TIMEOUT_MS = 300_000;
 // host the login. The route returns this specific, typed error and starts no
 // session, so an unsupported provider never reaches a session row, a lease, or a
 // pseudo-terminal.
-export const CODEX_DEVICE_LOGIN_PROVIDER_UNSUPPORTED =
+export const DEVICE_LOGIN_PROVIDER_UNSUPPORTED =
   "The sandbox provider does not support the Codex device login.";
-export const CODEX_DEVICE_LOGIN_PROVIDER_UNSUPPORTED_CODE =
+export const DEVICE_LOGIN_PROVIDER_UNSUPPORTED_CODE =
   "codex_device_login_provider_unsupported";
 
 /**
@@ -67,8 +73,18 @@ export const CODEX_DEVICE_LOGIN_PROVIDER_UNSUPPORTED_CODE =
  */
 export const LOGIN_LEASE_SESSION_TAG_KEY = "adapterLoginSessionId";
 
-/** The default Codex adapter type for a login session. */
-export const CODEX_DEVICE_LOGIN_ADAPTER_TYPE: AgentAdapterType = "codex_local";
+/**
+ * The closed set of displayed-code adapter types. The shared
+ * `adapter_auth_sessions` table also holds a Claude setup-token row. That row
+ * uses a different login panel mode. So every store read and every reaper scan
+ * filters to this set, instead of trusting the raw row's own value. No route
+ * makes a row of an adapter type outside `codex_local` reachable yet. A later
+ * phase widens the set of reachable adapters, with no change to this filter.
+ */
+export const DISPLAYED_CODE_ADAPTER_TYPES: readonly AgentAdapterType[] = [
+  "codex_local",
+  "grok_local",
+];
 
 /**
  * The provider delete result the service observes on a terminal path. The
@@ -178,7 +194,7 @@ export interface LoginSessionActivityEvent {
 
 export type LoginSessionActivityRecorder = (event: LoginSessionActivityEvent) => void;
 
-export interface StartCodexDeviceLoginInput {
+export interface StartDeviceLoginInput {
   companyId: string;
   environmentId: string;
   adapterType: AgentAdapterType;
@@ -193,7 +209,7 @@ export interface StartCodexDeviceLoginInput {
   signal?: AbortSignal;
 }
 
-export interface CodexDeviceLoginOutcome {
+export interface DeviceLoginOutcome {
   sessionId: string;
   /** The resolved public terminal status. */
   status: AdapterAuthSessionStatus;
@@ -206,7 +222,7 @@ export interface CodexDeviceLoginOutcome {
   sandboxDeleteObserved: boolean;
 }
 
-export interface StartCodexDeviceLoginResult {
+export interface StartDeviceLoginResult {
   /** The initial public response after the insert and the acquisition. */
   session: AdapterAuthSessionResponse;
   /**
@@ -214,7 +230,7 @@ export interface StartCodexDeviceLoginResult {
    * readiness check, the promotion write, and the cleanup-state handoff, and
    * then it records the terminal status.
    */
-  completed: Promise<CodexDeviceLoginOutcome>;
+  completed: Promise<DeviceLoginOutcome>;
 }
 
 /** The service throws this when the active company credential slot is taken. */
@@ -304,12 +320,18 @@ export interface AdapterAuthSessionStore {
   compareAndSetStatus(input: CompareAndSetAdapterAuthSessionStatusInput): Promise<boolean>;
   get(sessionId: string): Promise<AdapterAuthSessionRow | null>;
   /**
-   * Read a session by its public session id, scoped to the company and the Codex
-   * device-login adapter. The predicate carries the company id, so a query never
-   * keys on the public session id alone, and a foreign-company caller reads
-   * nothing. It never accepts the internal primary-key `id`.
+   * Read a session by its public session id, scoped to the company. The
+   * predicate carries the company id, so a query never keys on the public
+   * session id alone, and a foreign-company caller reads nothing. It never
+   * accepts the internal primary-key `id`. `adapterType` scopes the read to one
+   * requested adapter type. When the caller omits it, the read scopes to every
+   * displayed-code adapter type.
    */
-  getByPublicId(publicSessionId: string, companyId: string): Promise<AdapterAuthSessionRow | null>;
+  getByPublicId(
+    publicSessionId: string,
+    companyId: string,
+    adapterType?: AgentAdapterType,
+  ): Promise<AdapterAuthSessionRow | null>;
   /** Run `fn` while the process holds the promotion critical-section lock for the
    *  company, owner, and adapter slot. The reaper reclaims a stale `promoting`
    *  row inside this lock, so a reclaim never interleaves with a live credential
@@ -531,11 +553,12 @@ export function createDbAdapterAuthSessionStore(
       const row = rows[0];
       return row ? toRow(row) : null;
     },
-    async getByPublicId(publicSessionId, companyId) {
-      // The predicate carries the company id and the Codex device-login adapter,
-      // so a read never keys on the public session id alone. A foreign-company or
-      // foreign-adapter caller reads nothing. The internal primary-key `id` never
-      // matches, so a caller cannot address a row by the internal id.
+    async getByPublicId(publicSessionId, companyId, adapterType) {
+      // The predicate carries the company id, so a read never keys on the public
+      // session id alone. A foreign-company caller reads nothing. The internal
+      // primary-key `id` never matches, so a caller cannot address a row by the
+      // internal id. The adapter predicate scopes the read to the one requested
+      // type, or, when the caller omits it, to every displayed-code adapter type.
       const rows = await db
         .select()
         .from(adapterAuthSessions)
@@ -543,7 +566,9 @@ export function createDbAdapterAuthSessionStore(
           and(
             eq(adapterAuthSessions.publicSessionId, publicSessionId),
             eq(adapterAuthSessions.companyId, companyId),
-            eq(adapterAuthSessions.adapterType, CODEX_DEVICE_LOGIN_ADAPTER_TYPE),
+            adapterType
+              ? eq(adapterAuthSessions.adapterType, adapterType)
+              : inArray(adapterAuthSessions.adapterType, DISPLAYED_CODE_ADAPTER_TYPES),
           ),
         )
         .limit(1);
@@ -563,8 +588,8 @@ export function createDbAdapterAuthSessionStore(
         .where(
           and(
             // The shared table also holds the setup-token rows, so every reaper
-            // scan filters by the device-login adapter to reach only Codex rows.
-            eq(adapterAuthSessions.adapterType, CODEX_DEVICE_LOGIN_ADAPTER_TYPE),
+            // scan filters by the closed set of displayed-code adapter types.
+            inArray(adapterAuthSessions.adapterType, DISPLAYED_CODE_ADAPTER_TYPES),
             inArray(adapterAuthSessions.status, [...ADAPTER_AUTH_ACTIVE_STATUSES]),
             isNotNull(adapterAuthSessions.expiresAt),
             lte(adapterAuthSessions.expiresAt, nowAt),
@@ -583,7 +608,7 @@ export function createDbAdapterAuthSessionStore(
         .from(adapterAuthSessions)
         .where(
           and(
-            eq(adapterAuthSessions.adapterType, CODEX_DEVICE_LOGIN_ADAPTER_TYPE),
+            inArray(adapterAuthSessions.adapterType, DISPLAYED_CODE_ADAPTER_TYPES),
             eq(adapterAuthSessions.status, "cleanup_pending"),
           ),
         );
@@ -595,7 +620,7 @@ export function createDbAdapterAuthSessionStore(
         .from(adapterAuthSessions)
         .where(
           and(
-            eq(adapterAuthSessions.adapterType, CODEX_DEVICE_LOGIN_ADAPTER_TYPE),
+            inArray(adapterAuthSessions.adapterType, DISPLAYED_CODE_ADAPTER_TYPES),
             isNotNull(adapterAuthSessions.providerLeaseId),
           ),
         );
@@ -703,23 +728,121 @@ export function terminalCleanupWrite(
 }
 
 // ---------------------------------------------------------------------------
+// The host-owned displayed-code login profile. `runLogin` resolves one profile
+// per login from the trusted adapter type, so a host-owned map, not the runner
+// package, chooses the command, the home variable name, the prompt parser, and
+// the timeout for each displayed-code adapter.
+// ---------------------------------------------------------------------------
+
+/**
+ * The per-adapter values a displayed-code login run needs. `homeEnvVar` names
+ * the environment variable the sandbox login pseudo-terminal opener sets to the
+ * server-controlled session home, for example `CODEX_HOME`. The credential file
+ * name under that home stays the same for every adapter.
+ */
+export interface DisplayedCodeLoginProfile {
+  /** The login command the sandbox pseudo-terminal runs. */
+  command: string;
+  /** The environment variable name the login command reads its home from. */
+  homeEnvVar: string;
+  /** Parses the authorization prompt from the login output. Returns null when
+   *  the output holds no prompt yet. */
+  parsePrompt(output: string): AdapterLoginPrompt | null;
+  /** The host timeout for the sandbox login command. */
+  timeoutMs: number;
+  /** The mandatory credential promotion for this adapter. */
+  promotion: CredentialPromotion;
+}
+
+/** A promotion placeholder for a profile map entry. The service always resolves
+ *  the real promotion from {@link DeviceLoginServiceDeps.promotion} before it
+ *  runs a login, so this value never runs in production. */
+const UNCONFIGURED_PROMOTION: CredentialPromotion = {
+  promote() {
+    throw new Error("device login: no credential promotion is configured for this adapter.");
+  },
+};
+
+/**
+ * The host-owned profile for every displayed-code adapter type. `AgentAdapterType`
+ * covers every adapter, not only the displayed-code ones. So the map is a partial
+ * record: a lookup for an adapter type with no entry yields `undefined`. Both the
+ * `codex_local` entry and the `grok_local` entry are reachable today: the route
+ * admission gate in `agents.ts` and the `login-command.ts` closed key map now
+ * cover `grok_local` too.
+ *
+ * `homeEnvVar` names the environment variable the sandbox login pseudo-terminal
+ * opener sets, for documentation only: no code reads this member today. The
+ * opener (`composeLaunchLine` in the Daytona plugin) holds its own fixed
+ * `CODEX_HOME` / `GROK_HOME` mapping, keyed off the closed login command key,
+ * not off this profile. This matches the existing `codex_local` entry, whose
+ * `homeEnvVar` has been unread the same way since phase 1.
+ */
+export const DISPLAYED_CODE_PROFILES: Readonly<
+  Partial<Record<AgentAdapterType, DisplayedCodeLoginProfile>>
+> = {
+  codex_local: {
+    command: DEFAULT_CODEX_LOGIN_COMMAND,
+    homeEnvVar: "CODEX_HOME",
+    parsePrompt: parseDeviceLoginPrompt,
+    timeoutMs: DEVICE_LOGIN_TIMEOUT_MS,
+    promotion: UNCONFIGURED_PROMOTION,
+  },
+  grok_local: {
+    command: DEFAULT_GROK_LOGIN_COMMAND,
+    homeEnvVar: "GROK_HOME",
+    parsePrompt: parseGrokDeviceLoginPrompt,
+    timeoutMs: DEVICE_LOGIN_TIMEOUT_MS,
+    promotion: UNCONFIGURED_PROMOTION,
+  },
+};
+
+// ---------------------------------------------------------------------------
 // The service.
 // ---------------------------------------------------------------------------
 
-export interface CodexDeviceLoginServiceDeps {
+export interface DeviceLoginServiceDeps {
   store: AdapterAuthSessionStore;
   runtime: LoginSessionRuntime;
-  /** The mandatory credential promotion. A successful login authenticates only
-   *  after this promotion resolves; a throw fails the session and writes nothing. */
-  promotion: CredentialPromotion;
+  /**
+   * The mandatory credential promotion, keyed by adapter type. A successful
+   * login authenticates only after the promotion for its own adapter type
+   * resolves; a throw fails the session and writes nothing. An adapter type
+   * with no entry falls back to the `codex_local` entry, matching the profile
+   * map's own fallback below. Keying by adapter type keeps each adapter's
+   * promotion running only for its own logins: a `grok_local` login never
+   * runs the Codex promotion, and a `codex_local` login never runs the Grok
+   * one.
+   */
+  promotionByAdapterType: Partial<Record<AgentAdapterType, CredentialPromotion>>;
   recordActivity?: LoginSessionActivityRecorder;
   now?: () => Date;
 }
 
-export function createCodexDeviceLoginService(deps: CodexDeviceLoginServiceDeps) {
-  const { store, runtime, promotion } = deps;
+export function createDeviceLoginService(deps: DeviceLoginServiceDeps) {
+  const { store, runtime, promotionByAdapterType } = deps;
   const now = deps.now ?? (() => new Date());
   const recordActivity = deps.recordActivity ?? (() => {});
+
+  /**
+   * Resolve the displayed-code profile for one login, with this service
+   * instance's injected, adapter-scoped promotion in place of the map's
+   * placeholder. Falls back to the `codex_local` profile (and the
+   * `codex_local` promotion) for an adapter type with no entry of its own, so
+   * a login for an adapter type outside the map keeps running the same
+   * command, parser, and promotion it always did before the map existed.
+   * `codex_local` and `grok_local` are reachable through the route admission
+   * gate today; the fallback stays in place for a future adapter type with no
+   * profile entry.
+   */
+  function resolveProfile(adapterType: AgentAdapterType): DisplayedCodeLoginProfile {
+    const staticProfile = DISPLAYED_CODE_PROFILES[adapterType] ?? DISPLAYED_CODE_PROFILES.codex_local!;
+    const promotion =
+      promotionByAdapterType[adapterType] ??
+      promotionByAdapterType.codex_local ??
+      UNCONFIGURED_PROMOTION;
+    return { ...staticProfile, promotion };
+  }
 
   // The one-time prompt per session. The service holds it in memory only. The
   // owner read path returns it; it never reaches the durable row or an activity
@@ -727,15 +850,15 @@ export function createCodexDeviceLoginService(deps: CodexDeviceLoginServiceDeps)
   const promptsBySession = new Map<string, DeviceLoginPrompt>();
 
   async function start(
-    input: StartCodexDeviceLoginInput,
-  ): Promise<StartCodexDeviceLoginResult> {
+    input: StartDeviceLoginInput,
+  ): Promise<StartDeviceLoginResult> {
     const sessionId = randomUUID();
     // The public session identifier the API returns and looks up. It is an
     // independent CSPRNG value, so it never equals the internal `sessionId` and a
     // caller cannot address the row by the internal id.
     const publicSessionId = randomUUID();
     const startedAt = now();
-    const ttlSeconds = input.ttlSeconds ?? CODEX_DEVICE_LOGIN_TIMEOUT_MS / 1000;
+    const ttlSeconds = input.ttlSeconds ?? resolveProfile(input.adapterType).timeoutMs / 1000;
     const expiresAt = new Date(startedAt.getTime() + ttlSeconds * 1000);
     const base = {
       sessionId,
@@ -830,13 +953,14 @@ export function createCodexDeviceLoginService(deps: CodexDeviceLoginServiceDeps)
   }
 
   async function runLogin(ctx: {
-    input: StartCodexDeviceLoginInput;
+    input: StartDeviceLoginInput;
     sessionId: string;
     lease: LoginSessionLease;
     base: Omit<LoginSessionActivityEvent, "phase">;
     activity: (phase: LoginSessionActivityPhase) => void;
-  }): Promise<CodexDeviceLoginOutcome> {
+  }): Promise<DeviceLoginOutcome> {
     const { input, sessionId, lease, activity } = ctx;
+    const profile = resolveProfile(input.adapterType);
 
     // Serialize every status write for this session, so a late write from a
     // callback never overwrites a later transition. Each write runs after the
@@ -870,11 +994,20 @@ export function createCodexDeviceLoginService(deps: CodexDeviceLoginServiceDeps)
     }
 
     let authBytes: Buffer | null = null;
-    let outcome: DeviceLoginOutcome;
+    let outcome: RunnerDeviceLoginOutcome;
     try {
       const result = await runDeviceLogin(lease.driver, {
-        command: CODEX_DEVICE_LOGIN_COMMAND,
-        timeoutMs: CODEX_DEVICE_LOGIN_TIMEOUT_MS,
+        command: profile.command,
+        timeoutMs: profile.timeoutMs,
+        // `RunDeviceLoginOptions.parsePrompt` keeps the runner's own required-code
+        // prompt shape. The profile parser returns the wider adapter-neutral
+        // shape, so this adapts one call's result without widening the runner's
+        // own `onPrompt` contract. Every `codex_local` prompt carries a code, so
+        // this is a no-op today.
+        parsePrompt: (output) => {
+          const prompt = profile.parsePrompt(output);
+          return prompt && prompt.code !== undefined ? { url: prompt.url, code: prompt.code } : null;
+        },
         signal: input.signal,
         authPath: lease.authPath,
         onPrompt: (prompt) => {
@@ -926,7 +1059,7 @@ export function createCodexDeviceLoginService(deps: CodexDeviceLoginServiceDeps)
         if (!credential || credential.length === 0) {
           throw new Error("missing_credential");
         }
-        await promotion.promote(credential, {
+        await profile.promotion.promote(credential, {
           sessionId,
           companyId: input.companyId,
           startedByUserId: input.startedByUserId,
@@ -988,7 +1121,7 @@ export function createCodexDeviceLoginService(deps: CodexDeviceLoginServiceDeps)
     sessionId: string;
     lease: LoginSessionLease;
     activity: (phase: LoginSessionActivityPhase) => void;
-  }): Promise<CodexDeviceLoginOutcome> {
+  }): Promise<DeviceLoginOutcome> {
     const { sessionId, lease, activity } = ctx;
     const observation = await observeSandboxDelete(() => lease.deleteSandbox());
     if (observation.confirmed) {
@@ -1020,7 +1153,7 @@ export function createCodexDeviceLoginService(deps: CodexDeviceLoginServiceDeps)
       },
     ) => Promise<boolean>;
     activity: (phase: LoginSessionActivityPhase) => void;
-  }): Promise<CodexDeviceLoginOutcome> {
+  }): Promise<DeviceLoginOutcome> {
     const { sessionId, lease, terminal, reason, expectedStatuses, conditionalTransition, activity } =
       ctx;
 
@@ -1133,7 +1266,7 @@ export function createCodexDeviceLoginService(deps: CodexDeviceLoginServiceDeps)
   return { start, readOwnerSession, cancelOwnerSession };
 }
 
-export type CodexDeviceLoginService = ReturnType<typeof createCodexDeviceLoginService>;
+export type DeviceLoginService = ReturnType<typeof createDeviceLoginService>;
 
 /** Resolve the public status of a row. A `cleanup_pending` row resolves the
  *  retained terminal status; every other status maps through the shared helper. */
@@ -1162,13 +1295,13 @@ function buildFailure(
 
 /** The fixed, session-specific Codex home template. The session identifier is
  *  server-generated, so no caller controls this path. */
-export function sessionCodexHomePath(sessionId: string): string {
+export function sessionLoginHomePath(sessionId: string): string {
   return `/tmp/paperclip-adapter-login/${sessionId}`;
 }
 
 /** The fixed, session-specific credential path. No caller controls it. */
 export function sessionCredentialPath(sessionId: string): string {
-  return `${sessionCodexHomePath(sessionId)}/auth.json`;
+  return `${sessionLoginHomePath(sessionId)}/auth.json`;
 }
 
 /**
@@ -1266,7 +1399,7 @@ const CODEX_LOGIN_PTY_BIND_FAILED =
   "device login failed: the sandbox pseudo-terminal transport is not bound.";
 
 /** The dependencies the worker-bound Codex live pseudo-terminal opener needs. */
-export interface CodexWorkerBoundLoginPtyOpenerDeps {
+export interface WorkerBoundLoginPtyOpenerDeps {
   /** The plugin worker manager that owns the host route gate. */
   workerManager: LoginPtyWorkerManagerLike;
   /** A non-leaking status sink. It receives only fixed status lines. */
@@ -1292,8 +1425,8 @@ function readLeaseMetaString(value: unknown): string | null {
  * never from the caller. It validates the session home shape before the worker
  * RPC. It fails closed when the lease carries no sandbox worker binding.
  */
-export function createCodexWorkerBoundLoginPtyOpener(
-  deps: CodexWorkerBoundLoginPtyOpenerDeps,
+export function createWorkerBoundLoginPtyOpener(
+  deps: WorkerBoundLoginPtyOpenerDeps,
 ): OpenLoginPtySession {
   const log = deps.log ?? (() => {});
   return async (binding) => {
@@ -1398,7 +1531,7 @@ export function createProductionLoginSessionRuntime(
         ...(record.lease.metadata ?? {}),
         [LOGIN_LEASE_SESSION_TAG_KEY]: input.sessionId,
       });
-      const sessionHome = sessionCodexHomePath(input.sessionId);
+      const sessionHome = sessionLoginHomePath(input.sessionId);
       const authPath = sessionCredentialPath(input.sessionId);
       const providerLeaseId = record.lease.providerLeaseId ?? record.lease.id;
       // Resolve the live pseudo-terminal opener for this lease. When no live
@@ -1422,7 +1555,7 @@ export function createProductionLoginSessionRuntime(
         environment: record.environment,
         lease: record.lease,
         sessionHome,
-        timeoutMs: CODEX_DEVICE_LOGIN_TIMEOUT_MS,
+        timeoutMs: DEVICE_LOGIN_TIMEOUT_MS,
       });
       const driverKey = record.environment.driver;
       return {
