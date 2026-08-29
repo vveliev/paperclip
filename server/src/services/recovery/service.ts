@@ -27,7 +27,7 @@ import {
 import { parseObject, asBoolean, asNumber } from "../../adapters/utils.js";
 import { runningProcesses } from "../../adapters/index.js";
 import { visibleIssueCondition } from "../issue-visibility.js";
-import { forbidden, notFound } from "../../errors.js";
+import { forbidden, notFound, HttpError } from "../../errors.js";
 import { logger } from "../../middleware/logger.js";
 import { isPidAlive, isProcessGroupAlive } from "../local-service-supervisor.js";
 import { redactSensitiveText } from "../../redaction.js";
@@ -656,6 +656,33 @@ export function recoveryService(
   const treeControlSvc = issueTreeControlService(db);
   const budgets = budgetService(db);
   let resolvedDependencyWakeBackstopCandidateCursor: string | null = null;
+
+  // GIF-49: every reconcile/escalate pass below decides to write `status:
+  // "blocked"` (or similar) off an `issue`/`candidate` row read earlier in
+  // the same sweep. If the issue reached done/cancelled after that snapshot
+  // but before this write lands, `issuesSvc.update` now rejects the
+  // terminal -> non-terminal transition instead of silently reverting a
+  // finished issue. Route every such write through this helper so that
+  // rejection is treated as "nothing to escalate" and does not abort the
+  // rest of the sweep.
+  async function updateIssueTolerateTerminalConflict(
+    issueId: string,
+    data: Parameters<typeof issuesSvc.update>[1],
+    context: string,
+  ) {
+    try {
+      return await issuesSvc.update(issueId, data);
+    } catch (err) {
+      if (err instanceof HttpError && err.status === 409) {
+        logger.info(
+          { issueId, err: err.message, context },
+          "recovery sweep skipped a status write: issue left the status this sweep observed before the write landed",
+        );
+        return null;
+      }
+      throw err;
+    }
+  }
 
   async function getAgent(agentId: string) {
     return db.select().from(agents).where(eq(agents.id, agentId)).then((rows) => rows[0] ?? null);
@@ -1661,7 +1688,7 @@ export function recoveryService(
     previousStatus: StrandedPreviousStatus;
     latestRun: LatestIssueRun;
   }) {
-    const updated = await issuesSvc.update(input.issue.id, {
+    const updated = await updateIssueTolerateTerminalConflict(input.issue.id, {
       status: "blocked",
       // BLA-687: this is a source-scoped recovery issue whose own recovery
       // attempt failed. There is no separate issueRecoveryActions row to
@@ -1672,7 +1699,7 @@ export function recoveryService(
         action: "Inspect the failed run evidence, restore a live execution path or record the manual "
           + "resolution, then move this recovery issue out of blocked.",
       },
-    });
+    }, "escalateStrandedRecoveryIssueInPlace");
     if (!updated) return null;
 
     const prefix = await getCompanyIssuePrefix(input.issue.companyId);
@@ -1818,7 +1845,11 @@ export function recoveryService(
     const blockedByIssueIds = [...new Set([...existingBlockers.map((row) => row.id), ...openChildren.map((row) => row.id)])];
     if (blockedByIssueIds.length === 0) return null;
 
-    const updated = await issuesSvc.update(issue.id, { status: "blocked", blockedByIssueIds });
+    const updated = await updateIssueTolerateTerminalConflict(
+      issue.id,
+      { status: "blocked", blockedByIssueIds },
+      "resolveContinuationWaitingOnReview",
+    );
     if (!updated) return null;
 
     const waitingOn = formatIssueLinksForComment([...openChildren, ...existingBlockers]);
@@ -2255,13 +2286,13 @@ export function recoveryService(
       if (durablePathRestored || healthyChildren.length > 0 || hasNewSourcePath) {
         if (healthyChildren.length > 0 && !sourceState.hasDurableWaitingPath) {
           const blockerIds = await existingUnresolvedBlockerIssueIds(issue.companyId, issue.id);
-          await issuesSvc.update(issue.id, {
+          await updateIssueTolerateTerminalConflict(issue.id, {
             status: "blocked",
             blockedByIssueIds: [...new Set([
               ...blockerIds,
               ...healthyChildren.map((child) => child.id),
             ])],
-          });
+          }, "reconcileDispositionRepairActions");
         }
         const resolved = await recoveryActionsSvc.resolveActiveForIssue({
           companyId: action.companyId,
@@ -2371,10 +2402,10 @@ export function recoveryService(
         eq(issueRecoveryActions.companyId, input.issue.companyId),
       ));
 
-    const updated = await issuesSvc.update(input.issue.id, {
+    const updated = await updateIssueTolerateTerminalConflict(input.issue.id, {
       status: "blocked",
       unblockDescriptor: { owner: "board", action: dispositionRepairNextAction },
-    });
+    }, "escalateDispositionRepairToBoard");
     if (!updated) return null;
     const sourceAssigneePreserved =
       updated.assigneeAgentId === input.issue.assigneeAgentId &&
@@ -2579,7 +2610,7 @@ export function recoveryService(
       });
     }
     const blockerIds = await existingUnresolvedBlockerIssueIds(input.issue.companyId, input.issue.id);
-    const updated = await issuesSvc.update(input.issue.id, {
+    const updated = await updateIssueTolerateTerminalConflict(input.issue.id, {
       status: "blocked",
       blockedByIssueIds: blockerIds,
       // BLA-687: this is the exact call site that produced BLA-652 — a
@@ -2589,7 +2620,7 @@ export function recoveryService(
       // causes (there's no dependency issue; it's an execution/ownership
       // gap, not a "waiting on X" one).
       unblockDescriptor: unblockDescriptorFromRecoveryAction(recoveryAction),
-    });
+    }, "escalateStrandedAssignedIssue");
     if (!updated) return null;
     if (isProviderQuotaWait) return updated;
     const sourceAssigneePreserved =
