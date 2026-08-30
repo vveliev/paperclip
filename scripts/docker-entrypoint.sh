@@ -35,13 +35,30 @@ fi
 # (Docker named volume, Railway volume, Kubernetes PV) arrives root-owned
 # and shadows the image's build-time chown, so with the default UID the old
 # remap-only condition dropped privileges onto an unwritable home and the
-# server crashed on its first mkdir. The probe is a first-mismatch find
-# over the WHOLE tree (uid and gid): a root-owned mount or descendant
-# (init containers, backup restores, files written before a remap) is
-# found immediately and repaired recursively, a GID-only remap is caught,
-# and a fully-correct tree costs one metadata-only walk with no chown.
+# server crashed on its first mkdir.
+#
+# The probe used to be a first-mismatch find over the WHOLE tree. That is
+# correct but not scoped to the failure mode it exists for: a fresh mount,
+# a backup restore, or an init container all land wrong ownership at (or
+# near) the volume root, not several million inodes deep inside a single
+# leaf directory. On a long-lived PVC that accumulates per-project working
+# trees (each with its own node_modules), the full walk costs 20-60+
+# minutes of nothing-found metadata reads on every single restart -- see
+# home-lab#(paperclip disk incident, 2026-08-30) for a walk that ran past
+# an hour on a ~2.3M-inode volume. That's the same shape of problem
+# home-lab#287 already fixed on the kubelet side: fsGroupChangePolicy:
+# OnRootMismatch stopped kubelet's own recursive chown by trusting the
+# mount root's ownership as a proxy for the whole volume. This mirrors
+# that same trade-off at the application layer: check the root and its
+# immediate children (cheap, bounded by the number of top-level entries,
+# not by tree depth) rather than walking every leaf. A mismatch confined
+# to a deeply nested path with an otherwise-correct root/children would
+# no longer be caught here -- accepted, because every mismatch we've
+# actually hit (fresh mount, restore, remap) has shown up at this depth,
+# and a real deep-tree miss surfaces as a diagnosable EACCES at runtime
+# rather than a silent multi-hour boot.
 home_dir="${PAPERCLIP_HOME:-/paperclip}"
-if [ -d "$home_dir" ] && [ -n "$(find "$home_dir" \( ! -user node -o ! -group node \) -print -quit 2>/dev/null)" ]; then
+if [ -d "$home_dir" ] && [ -n "$(find "$home_dir" -maxdepth 1 \( ! -user node -o ! -group node \) -print -quit 2>/dev/null)" ]; then
     chown -R node:node "$home_dir"
 fi
 
