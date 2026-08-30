@@ -62,4 +62,41 @@ if [ -d "$home_dir" ] && [ -n "$(find "$home_dir" -maxdepth 1 \( ! -user node -o
     chown -R node:node "$home_dir"
 fi
 
+# The check above is shallow by design, so a real mismatch confined to a
+# deep path (buried inside some project's git worktree, say) would never
+# get caught by it. Backfill that gap off the critical path instead of
+# widening the startup check: once per PAPERCLIP_OWNERSHIP_AUDIT_INTERVAL_DAYS
+# (default weekly), walk the whole tree in the background at the lowest
+# scheduling priority and repair anything wrong. A marker file on the
+# volume itself (not in-process state) tracks when it last ran, so this
+# stays a cheap single stat() on every restart that isn't due -- the
+# common case -- rather than re-running on a timer that resets whenever
+# the pod does. Runs as root (before gosu drops privileges below) since
+# repairing ownership needs it; exec later doesn't kill this -- it only
+# replaces the calling shell, so the backgrounded subshell is reparented
+# to tini and keeps running.
+audit_marker="$home_dir/.ownership-audit-last-run"
+audit_interval_days="${PAPERCLIP_OWNERSHIP_AUDIT_INTERVAL_DAYS:-7}"
+(
+    if [ -d "$home_dir" ]; then
+        now=$(date +%s)
+        last=0
+        [ -f "$audit_marker" ] && last=$(cat "$audit_marker" 2>/dev/null || echo 0)
+        case "$last" in ''|*[!0-9]*) last=0 ;; esac
+        age_days=$(( (now - last) / 86400 ))
+        if [ "$age_days" -ge "$audit_interval_days" ]; then
+            mismatches=$(nice -n 19 find "$home_dir" \( ! -user node -o ! -group node \) -print 2>/dev/null)
+            if [ -n "$mismatches" ]; then
+                echo "ownership-audit: mismatched paths found under $home_dir, repairing:" >&2
+                echo "$mismatches" >&2
+                nice -n 19 chown -R node:node "$home_dir"
+            else
+                echo "ownership-audit: full-tree scan of $home_dir clean, no mismatches" >&2
+            fi
+            date +%s > "$audit_marker"
+            chown node:node "$audit_marker" 2>/dev/null || true
+        fi
+    fi
+) &
+
 exec gosu node "$@"
