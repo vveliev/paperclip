@@ -232,6 +232,7 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
       companyId,
       title: "Hire an agent",
       status: "blocked",
+      unblockDescriptor: { owner: "board", action: "Test fixture: pre-existing blocked issue." },
       priority: "medium",
       responsibleUserId: "responsible-user",
       assigneeAgentId: agentId,

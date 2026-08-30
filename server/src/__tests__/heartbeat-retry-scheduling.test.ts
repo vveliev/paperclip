@@ -397,6 +397,9 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       executionLockedAt: now,
       issueNumber: 1,
       identifier: `${issuePrefix}-1`,
+      unblockDescriptor: (input?.issueStatus ?? "in_progress") === "blocked"
+        ? { owner: "board", action: "Test fixture: pre-existing blocked issue." }
+        : null,
     });
 
     return { companyId, agentId, issueId, runId, now };
@@ -1369,6 +1372,9 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       await db.update(issues).set({
         status: issueStatus,
         updatedAt: new Date(now.getTime() + 500),
+        unblockDescriptor: issueStatus === "blocked"
+          ? { owner: "board", action: "Test fixture: pre-existing blocked issue." }
+          : null,
       }).where(eq(issues.id, issueId));
 
       const promotion = await heartbeat.promoteDueScheduledRetries(scheduled.dueAt);

@@ -1845,14 +1845,24 @@ export function recoveryService(
     const blockedByIssueIds = [...new Set([...existingBlockers.map((row) => row.id), ...openChildren.map((row) => row.id)])];
     if (blockedByIssueIds.length === 0) return null;
 
+    const waitingOn = formatIssueLinksForComment([...openChildren, ...existingBlockers]);
     const updated = await updateIssueTolerateTerminalConflict(
       issue.id,
-      { status: "blocked", blockedByIssueIds },
+      {
+        status: "blocked",
+        blockedByIssueIds,
+        // BLA-687: the DB check constraint requires a non-null unblockDescriptor
+        // on every blocked row regardless of whether blockedByIssueIds also
+        // justifies the block at the app-validation layer.
+        unblockDescriptor: {
+          owner: "board",
+          action: `Waiting on ${waitingOn} to finish; this will continue automatically once they resolve.`,
+        },
+      },
       "resolveContinuationWaitingOnReview",
     );
     if (!updated) return null;
 
-    const waitingOn = formatIssueLinksForComment([...openChildren, ...existingBlockers]);
     await issuesSvc.addComment(
       issue.id,
       `This task is waiting on ${waitingOn} to finish. ` +
@@ -2292,6 +2302,13 @@ export function recoveryService(
               ...blockerIds,
               ...healthyChildren.map((child) => child.id),
             ])],
+            // BLA-687: the DB check constraint requires a non-null unblockDescriptor
+            // on every blocked row regardless of whether blockedByIssueIds also
+            // justifies the block at the app-validation layer.
+            unblockDescriptor: {
+              owner: "board",
+              action: "Waiting on open sub-tasks to finish; this will continue automatically once they resolve.",
+            },
           }, "reconcileDispositionRepairActions");
         }
         const resolved = await recoveryActionsSvc.resolveActiveForIssue({

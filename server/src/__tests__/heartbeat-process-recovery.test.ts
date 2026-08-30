@@ -3054,6 +3054,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       companyId,
       title: "Original stranded source",
       status: "blocked",
+      unblockDescriptor: { owner: "board", action: "Test fixture: pre-existing blocked issue." },
       priority: "medium",
       issueNumber: 2,
       identifier: `${issuePrefix}-2`,
@@ -5734,7 +5735,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
     await db
       .update(issues)
-      .set({ status: "blocked" })
+      .set({
+        status: "blocked",
+        unblockDescriptor: { owner: "board", action: "Test fixture: pre-existing blocked issue." },
+      })
       .where(eq(issues.id, issueId));
     const [legacyAction] = await db
       .insert(issueRecoveryActions)
@@ -7965,6 +7969,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       companyId,
       title: "Original source issue",
       status: "blocked",
+      unblockDescriptor: { owner: "board", action: "Test fixture: pre-existing blocked issue." },
       priority: "medium",
       issueNumber: 2,
       identifier: `${issuePrefix}-2`,
@@ -8103,6 +8108,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         companyId,
         title: "Blocked work",
         status: "blocked",
+        unblockDescriptor: { owner: "board", action: "Test fixture: pre-existing blocked issue." },
         priority: "high",
         assigneeAgentId: blockedAssigneeAgentId,
         responsibleUserId: "responsible-user",
@@ -8857,6 +8863,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       companyId,
       title: "Original stranded source",
       status: "blocked",
+      unblockDescriptor: { owner: "board", action: "Test fixture: pre-existing blocked issue." },
       priority: "medium",
       issueNumber: 2,
       identifier: `${issuePrefix}-2`,
@@ -8936,6 +8943,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       companyId,
       title: "Original stranded source",
       status: "blocked",
+      unblockDescriptor: { owner: "board", action: "Test fixture: pre-existing blocked issue." },
       priority: "medium",
       issueNumber: 2,
       identifier: `${issuePrefix}-2`,
