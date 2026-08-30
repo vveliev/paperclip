@@ -7533,6 +7533,21 @@ export function issueService(db: Db) {
         if (values.status === "cancelled") {
           values.cancelledAt = new Date();
         }
+        // The DB check constraint (issues_blocked_requires_unblock_descriptor_check)
+        // requires a non-null unblockDescriptor on every blocked row unconditionally.
+        // update() already synthesizes one when a caller relies on blockedByIssueIds
+        // instead of an explicit descriptor; mirror that here so creating an issue
+        // directly in "blocked" status doesn't fail the insert with a raw Postgres
+        // constraint violation.
+        if (values.status === "blocked" && !isValidUnblockDescriptor(values.unblockDescriptor)) {
+          values.unblockDescriptor = {
+            owner: "board",
+            action: blockedByIssueIds !== undefined && blockedByIssueIds.length > 0
+              ? "Waiting on an unresolved blocker; this will continue automatically once it resolves."
+              : "Legacy escalation predating the BLA-687 invariant. Inspect the issue's recovery "
+                + "evidence/comments and choose a disposition.",
+          };
+        }
         Object.assign(
           values,
           buildInitialIssueMonitorFields({
@@ -7972,6 +7987,20 @@ export function issueService(db: Db) {
               + "or an unresolved blocker/pending interaction/approval to justify the block",
             );
           }
+          // The DB check constraint (issues_blocked_requires_unblock_descriptor_check)
+          // requires a non-null unblockDescriptor on every blocked row unconditionally —
+          // it has no notion of "justified by a blocker/interaction/approval instead".
+          // Synthesize one here so a caller that relies on that alternate justification
+          // (and never sets unblockDescriptor itself) doesn't fail the write with a raw
+          // Postgres constraint violation instead of succeeding as this validation intends.
+          patch.unblockDescriptor = {
+            owner: "board",
+            action: hasUnresolvedBlocker
+              ? "Waiting on an unresolved blocker; this will continue automatically once it resolves."
+              : pendingInteraction
+                ? "Waiting on a pending issue-thread interaction response."
+                : "Waiting on a pending approval decision.",
+          };
         }
       }
       if (issueData.requestDepth !== undefined) {

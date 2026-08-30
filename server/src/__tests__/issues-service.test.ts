@@ -2643,6 +2643,7 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
         companyId,
         title: "Blocked issue",
         status: "blocked",
+        unblockDescriptor: { owner: "board", action: "Test fixture: pre-existing blocked issue." },
         priority: "medium",
       },
       {
@@ -4019,6 +4020,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
         identifier: "PAP-15046",
         title: "Dependent",
         status: "blocked",
+        unblockDescriptor: { owner: "board", action: "Test fixture: pre-existing blocked issue." },
         priority: "medium",
         assigneeAgentId,
       },
@@ -4133,6 +4135,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
         companyId,
         title: "Blocked issue",
         status: "blocked",
+        unblockDescriptor: { owner: "board", action: "Test fixture: pre-existing blocked issue." },
         priority: "medium",
       },
     ]);
@@ -4150,11 +4153,23 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
 
   it("returns blocked-by summaries on newly created issues", async () => {
     const companyId = randomUUID();
+    const assigneeAgentId = randomUUID();
     await db.insert(companies).values({
       id: companyId,
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: assigneeAgentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
     });
 
     const blockerId = randomUUID();
@@ -4171,6 +4186,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
       status: "blocked",
       priority: "medium",
       blockedByIssueIds: [blockerId],
+      assigneeAgentId,
     });
 
     expect(created.blockedBy.map((relation) => relation.id)).toEqual([blockerId]);
@@ -4184,11 +4200,23 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
 
   it("returns blocked-by summaries on newly created child issues", async () => {
     const companyId = randomUUID();
+    const assigneeAgentId = randomUUID();
     await db.insert(companies).values({
       id: companyId,
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: assigneeAgentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
     });
 
     const parentId = randomUUID();
@@ -4215,6 +4243,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
       status: "blocked",
       priority: "medium",
       blockedByIssueIds: [blockerId],
+      assigneeAgentId,
     });
 
     expect(child.parentId).toBe(parentId);
@@ -4270,9 +4299,9 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     const issueC = randomUUID();
     const issueD = randomUUID();
     await db.insert(issues).values([
-      { id: issueA, companyId, identifier: "PAP-1", title: "Issue A", status: "blocked", priority: "medium" },
-      { id: issueB, companyId, identifier: "PAP-2", title: "Issue B", status: "blocked", priority: "medium" },
-      { id: issueC, companyId, identifier: "PAP-3", title: "Issue C", status: "blocked", priority: "medium" },
+      { id: issueA, companyId, identifier: "PAP-1", title: "Issue A", status: "blocked", unblockDescriptor: { owner: "board", action: "Test fixture: pre-existing blocked issue." }, priority: "medium" },
+      { id: issueB, companyId, identifier: "PAP-2", title: "Issue B", status: "blocked", unblockDescriptor: { owner: "board", action: "Test fixture: pre-existing blocked issue." }, priority: "medium" },
+      { id: issueC, companyId, identifier: "PAP-3", title: "Issue C", status: "blocked", unblockDescriptor: { owner: "board", action: "Test fixture: pre-existing blocked issue." }, priority: "medium" },
       { id: issueD, companyId, identifier: "PAP-4", title: "Issue D", status: "todo", priority: "high" },
     ]);
 
@@ -4354,6 +4383,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
         companyId,
         title: "Blocked issue",
         status: "blocked",
+        unblockDescriptor: { owner: "board", action: "Test fixture: pre-existing blocked issue." },
         priority: "medium",
         assigneeAgentId,
       },
@@ -4617,6 +4647,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
         companyId,
         title: "Dependent",
         status: "blocked",
+        unblockDescriptor: { owner: "board", action: "Test fixture: pre-existing blocked issue." },
         priority: "medium",
         assigneeAgentId,
       },
@@ -4688,6 +4719,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
         companyId,
         title: "Source issue",
         status: "blocked",
+        unblockDescriptor: { owner: "board", action: "Test fixture: pre-existing blocked issue." },
         priority: "medium",
       },
       {
@@ -4827,6 +4859,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
         parentId,
         title: "Child B",
         status: "blocked",
+        unblockDescriptor: { owner: "board", action: "Test fixture: pre-existing blocked issue." },
         priority: "medium",
         issueNumber: 2,
       },
@@ -6243,7 +6276,7 @@ describeEmbeddedPostgres("issueService.update blocked requires unblockDescriptor
     expect(updated?.unblockDescriptor).toEqual({ owner: "board", action: "Inspect the evidence and decide." });
   });
 
-  it("accepts entering blocked with an unresolved first-class blocker and no descriptor", async () => {
+  it("accepts entering blocked with an unresolved first-class blocker and no descriptor, synthesizing one", async () => {
     const blockerId = await insertIssue("todo");
     const issueId = await insertIssue("todo");
 
@@ -6253,7 +6286,14 @@ describeEmbeddedPostgres("issueService.update blocked requires unblockDescriptor
     });
 
     expect(updated?.status).toBe("blocked");
-    expect(updated?.unblockDescriptor).toBeNull();
+    // issues_blocked_requires_unblock_descriptor_check requires a non-null
+    // descriptor on every blocked row unconditionally — leaving it null here
+    // (as this test originally asserted) would fail that DB check constraint.
+    // update() synthesizes a board-owned one instead of leaving it unset.
+    expect(updated?.unblockDescriptor).toEqual({
+      owner: "board",
+      action: expect.stringContaining("unresolved blocker"),
+    });
   });
 
   it("preserves the unblockDescriptor across an automation transition out of blocked (BLA-687 Path 2)", async () => {

@@ -247,6 +247,7 @@ describeEmbeddedPostgres("issue scheduled retry routes", () => {
       companyId,
       title: "Waiting for recovery",
       status: "blocked",
+      unblockDescriptor: { owner: "board", action: "Test fixture: pre-existing blocked issue." },
       priority: "medium",
     });
     await db.insert(issueRelations).values({
@@ -549,7 +550,10 @@ describeEmbeddedPostgres("issue scheduled retry routes", () => {
     });
     await db
       .update(issues)
-      .set({ status: "blocked" })
+      .set({
+        status: "blocked",
+        unblockDescriptor: { owner: "board", action: "Test fixture: pre-existing blocked issue." },
+      })
       .where(eq(issues.id, issueId));
 
     const res = await request(createApp(boardActor(companyId)))
