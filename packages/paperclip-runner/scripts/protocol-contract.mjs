@@ -122,6 +122,7 @@ export function compileProtocolValidators(schemaRecords) {
     conformanceFixture: get("conformance-fixture"),
     conformanceOutput: get("conformance-output"),
     fixture: get("fixture"),
+    providerDescriptor: get("provider-descriptor"),
     questionAdapterFixture: get("question-adapter-fixture"),
   };
 }
@@ -169,6 +170,10 @@ export function assertReplayFixtureCompatibility(fixture) {
   for (const [index, event] of fixture.events.entries()) {
     requireSchema(event, "paperclip.prp.event.v1", `events[${index}]`);
     requireVersion(event.schemaVersion, SUPPORTED_EVENT_SCHEMA_VERSION, `events[${index}].schemaVersion`);
+    const semanticToolVersion = event.payload?.semantic_tool?.schemaVersion;
+    if (semanticToolVersion !== undefined) {
+      requireVersion(semanticToolVersion, 1, `events[${index}].payload.semantic_tool.schemaVersion`);
+    }
   }
 
   requireSchema(fixture.result, "paperclip.run_result.v1", "result");

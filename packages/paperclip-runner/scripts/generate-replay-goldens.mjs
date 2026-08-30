@@ -18,6 +18,11 @@ const fixtureNames = [
   "duplicate-event",
   "source-gap",
   "unknown-optional-fields",
+  "semantic-tool-artifact-happy-path",
+  "semantic-tool-denial-redaction",
+  "semantic-tool-conflict-duplicate-retry",
+  "semantic-tool-governance-wake-monitor",
+  "semantic-tool-unknown-optional-envelope",
 ];
 const check = process.argv.includes("--check");
 const stale = [];

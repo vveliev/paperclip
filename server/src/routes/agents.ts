@@ -5307,6 +5307,7 @@ export function agentRoutes(
 
     const columns = {
       id: heartbeatRuns.id,
+      runtimeMode: heartbeatRuns.runtimeMode,
       companyId: heartbeatRuns.companyId,
       status: heartbeatRuns.status,
       invocationSource: heartbeatRuns.invocationSource,
@@ -5532,6 +5533,7 @@ export function agentRoutes(
     const liveRuns = await db
       .select({
         id: heartbeatRuns.id,
+        runtimeMode: heartbeatRuns.runtimeMode,
         status: heartbeatRuns.status,
         invocationSource: heartbeatRuns.invocationSource,
         triggerDetail: heartbeatRuns.triggerDetail,

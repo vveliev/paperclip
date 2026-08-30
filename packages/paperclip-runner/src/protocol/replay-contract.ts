@@ -207,14 +207,20 @@ function ajvIssue(error: ErrorObject): ProtocolValidationIssue {
   };
 }
 
+interface SemanticCallBinding {
+  envelope: PrpSemanticToolEnvelope;
+  index: number;
+}
+
 function bindingIssues(fixture: PrpFixture): ProtocolValidationIssue[] {
   const issues: ProtocolValidationIssue[] = [];
   const uniqueEvents = new Map<string, PrpEvent>();
   const semanticCalls = new Map<
     string,
     {
-      input?: { envelope: PrpSemanticToolEnvelope; index: number };
-      result?: { envelope: PrpSemanticToolEnvelope; index: number };
+      input?: SemanticCallBinding;
+      result?: SemanticCallBinding;
+      reconciled?: SemanticCallBinding;
     }
   >();
   fixture.events.forEach((event, index) => {
@@ -283,32 +289,77 @@ function bindingIssues(fixture: PrpFixture): ProtocolValidationIssue[] {
           message: `semantic_tool call ${semanticTool.callId} must contain exactly one ${phase} envelope`,
         });
       } else {
-        call[phase] = { envelope: semanticTool, index };
+        call[phase] = {
+          envelope: semanticTool,
+          index,
+        };
         semanticCalls.set(semanticTool.callId, call);
       }
     }
   });
 
   for (const [callId, call] of semanticCalls) {
-    if (call.input === undefined || call.result === undefined) {
-      const present = call.input ?? call.result;
+    const terminalPhaseCount =
+      Number(call.result !== undefined) + Number(call.reconciled !== undefined);
+    if (call.input === undefined || terminalPhaseCount !== 1) {
+      const present = call.input ?? call.result ?? call.reconciled;
       issues.push({
         code: "binding_mismatch",
         path: `/events/${present?.index ?? 0}/payload/semantic_tool/callId`,
-        message: `semantic_tool call ${callId} must contain one input and one result envelope`,
+        message: `semantic_tool call ${callId} must contain one input and exactly one result or reconciled envelope`,
       });
       continue;
     }
-    for (const field of ["operationId", "idempotencyKey"] as const) {
-      if (
-        canonicalJson(call.input.envelope[field]) !==
-        canonicalJson(call.result.envelope[field])
-      ) {
-        issues.push({
-          code: "binding_mismatch",
-          path: `/events/${call.result.index}/payload/semantic_tool/${field}`,
-          message: `semantic_tool result ${field} must match its input envelope`,
-        });
+    if (call.result !== undefined) {
+      for (const field of [
+        "operationId",
+        "idempotencyKey",
+        "correlation",
+      ] as const) {
+        if (
+          canonicalJson(call.input.envelope[field]) !==
+          canonicalJson(call.result.envelope[field])
+        ) {
+          issues.push({
+            code: "binding_mismatch",
+            path: `/events/${call.result.index}/payload/semantic_tool/${field}`,
+            message: `semantic_tool result ${field} must match its input envelope`,
+          });
+        }
+      }
+    }
+    if (call.reconciled !== undefined) {
+      // A replacement runner may reconcile a call after recovering the run.
+      // The authenticated ingestion boundary owns runner authorization, while
+      // replay keeps each event's sourceInstanceId as immutable provenance.
+      for (const field of ["operationId", "idempotencyKey"] as const) {
+        if (
+          canonicalJson(call.input.envelope[field]) !==
+          canonicalJson(call.reconciled.envelope[field])
+        ) {
+          issues.push({
+            code: "binding_mismatch",
+            path: `/events/${call.reconciled.index}/payload/semantic_tool/${field}`,
+            message: `semantic_tool reconciled ${field} must match its input envelope`,
+          });
+        }
+      }
+      for (const field of [
+        "runId",
+        "normalizedSessionId",
+        "turnId",
+        "itemId",
+      ] as const) {
+        if (
+          call.input.envelope.correlation[field] !==
+          call.reconciled.envelope.correlation[field]
+        ) {
+          issues.push({
+            code: "binding_mismatch",
+            path: `/events/${call.reconciled.index}/payload/semantic_tool/correlation/${field}`,
+            message: `semantic_tool reconciled correlation ${field} must match its input envelope`,
+          });
+        }
       }
     }
   }

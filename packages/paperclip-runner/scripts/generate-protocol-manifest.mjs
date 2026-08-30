@@ -22,8 +22,10 @@ const protocolRoot = resolve(packageRoot, "protocol");
 const schemaDirectory = resolve(protocolRoot, "schemas");
 const fixtureDirectory = resolve(protocolRoot, "fixtures");
 const outputPath = resolve(protocolRoot, "manifest.json");
-const expectedRejectedFixture =
-  "fixtures/replay/unsupported-required-version.json";
+const expectedRejectedFixtures = new Set([
+  "fixtures/replay/unsupported-required-version.json",
+  "fixtures/replay/semantic-tool-unsupported-required-version.json",
+]);
 
 export async function buildProtocolManifest() {
   const schemas = await loadSchemaCatalog(schemaDirectory);
@@ -42,7 +44,7 @@ export async function buildProtocolManifest() {
     if (relativePath.startsWith("fixtures/replay/golden/")) {
       compatibilityCase = "deterministic-replay-oracle";
     } else if (relativePath.startsWith("fixtures/replay/")) {
-      if (relativePath === expectedRejectedFixture) {
+      if (expectedRejectedFixtures.has(relativePath)) {
         expectation = "reject";
         compatibilityCase = "unknown-required-version";
         try {
