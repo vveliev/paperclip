@@ -1,5 +1,5 @@
 {
-  "id": "d7769e3f-01a0-4428-a17d-afd8b13d04cb",
+  "id": "cbdfd719-eeb3-46b4-9d98-3d76aaff82b3",
   "prevId": "b7788149-64e9-4273-b400-91828a0402bb",
   "version": "7",
   "dialect": "postgresql",
@@ -25462,7 +25462,12 @@
         }
       },
       "policies": {},
-      "checkConstraints": {},
+      "checkConstraints": {
+        "issues_blocked_requires_unblock_descriptor_check": {
+          "name": "issues_blocked_requires_unblock_descriptor_check",
+          "value": "\"issues\".\"status\" <> 'blocked' or \"issues\".\"unblock_descriptor\" is not null"
+        }
+      },
       "isRLSEnabled": false
     },
     "public.join_requests": {
