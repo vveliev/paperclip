@@ -3970,11 +3970,23 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
 
   it("returns blocked-by summaries on newly created issues", async () => {
     const companyId = randomUUID();
+    const assigneeAgentId = randomUUID();
     await db.insert(companies).values({
       id: companyId,
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: assigneeAgentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
     });
 
     const blockerId = randomUUID();
@@ -3991,6 +4003,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
       status: "blocked",
       priority: "medium",
       blockedByIssueIds: [blockerId],
+      assigneeAgentId,
     });
 
     expect(created.blockedBy.map((relation) => relation.id)).toEqual([blockerId]);
@@ -4004,11 +4017,23 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
 
   it("returns blocked-by summaries on newly created child issues", async () => {
     const companyId = randomUUID();
+    const assigneeAgentId = randomUUID();
     await db.insert(companies).values({
       id: companyId,
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: assigneeAgentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
     });
 
     const parentId = randomUUID();
@@ -4035,6 +4060,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
       status: "blocked",
       priority: "medium",
       blockedByIssueIds: [blockerId],
+      assigneeAgentId,
     });
 
     expect(child.parentId).toBe(parentId);
