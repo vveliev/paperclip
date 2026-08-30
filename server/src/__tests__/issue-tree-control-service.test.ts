@@ -359,7 +359,12 @@ describeEmbeddedPostgres("issueTreeControlService", () => {
 
     await db
       .update(issues)
-      .set({ status: "blocked", cancelledAt: null, updatedAt: new Date() })
+      .set({
+        status: "blocked",
+        unblockDescriptor: { owner: "board", action: "Test fixture: pre-existing blocked issue." },
+        cancelledAt: null,
+        updatedAt: new Date(),
+      })
       .where(eq(issues.id, todoChildId));
 
     const restorePreview = await svc.preview(companyId, rootIssueId, { mode: "restore" });

@@ -118,6 +118,9 @@ describeEmbeddedPostgres("issue blocker attention", () => {
       originFingerprint: input.originFingerprint ?? "default",
       executionState: input.executionState ?? null,
       description: input.description ?? null,
+      unblockDescriptor: input.status === "blocked"
+        ? { owner: "board", action: "Test fixture: pre-existing blocked issue." }
+        : null,
     });
     return id;
   }

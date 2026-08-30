@@ -192,7 +192,11 @@ describeEmbeddedPostgres("attention service", () => {
       originId: input.originId ?? null,
       originFingerprint: input.originFingerprint ?? "default",
       executionState: input.executionState ?? null,
-      unblockDescriptor: input.unblockDescriptor ?? null,
+      unblockDescriptor: input.unblockDescriptor !== undefined
+        ? input.unblockDescriptor
+        : input.status === "blocked"
+          ? { owner: "board", action: "Test fixture: pre-existing blocked issue." }
+          : null,
       blockedTransitionAt: input.blockedTransitionAt ?? null,
       harnessKind: input.harnessKind ?? null,
       createdAt: input.createdAt,
@@ -302,6 +306,13 @@ describeEmbeddedPostgres("attention service", () => {
       assigneeAgentId: workerId,
       updatedAt: baseTime,
     });
+    // This fixture used to omit unblockDescriptor entirely to exercise the
+    // BLA-687 "missing descriptor" attention path (the `!descriptor` branch in
+    // attention.ts). issues_blocked_requires_unblock_descriptor_check now makes
+    // that state impossible to insert — there is no non-null value that both
+    // satisfies the constraint and reads as falsy there — so insertIssue's
+    // default board-owned descriptor applies instead, and the assertions below
+    // check the "human-owned descriptor" branch it now takes.
     const blockerParentId = await insertIssue({
       companyId,
       identifier: "ATN-4",
@@ -624,8 +635,10 @@ describeEmbeddedPostgres("attention service", () => {
       recovery_action: 1,
       productivity_review: 1,
       // 2: the pre-existing terminal-blocker item for blockerLeafId, plus the
-      // BLA-687 missing-unblockDescriptor item for blockerParentId itself
-      // (blockerParentId is blocked with no unblockDescriptor set).
+      // board-owned-descriptor item for blockerParentId itself (blockerParentId
+      // is blocked with a board-owned unblockDescriptor — see the fixture note
+      // above the seed for why this is no longer the BLA-687 "missing
+      // descriptor" case it originally was).
       blocker_attention: 2,
       review: 2,
       failed_run: 1,
@@ -675,16 +688,14 @@ describeEmbeddedPostgres("attention service", () => {
       blockingIssue: null,
       blockedTaskCount: 1,
     });
-    // BLA-687: blockerParentId is itself blocked with no unblockDescriptor —
-    // it must surface too, not just the terminal-blocker item above, or a
-    // regression here would be invisible to every audit that keys on the
-    // descriptor field.
-    const missingDescriptorItem = feed.items.find((item) =>
+    // blockerParentId is itself blocked with a board-owned unblockDescriptor —
+    // it must surface too, not just the terminal-blocker item above.
+    const boardOwnedDescriptorItem = feed.items.find((item) =>
       item.sourceKind === "blocker_attention" && item.subject.id === blockerParentId
     );
-    expect(missingDescriptorItem).toBeTruthy();
-    expect(missingDescriptorItem?.entryRule).toContain("BLA-687");
-    expect(missingDescriptorItem?.severity).toBe("critical");
+    expect(boardOwnedDescriptorItem).toBeTruthy();
+    expect(boardOwnedDescriptorItem?.entryRule).toBe("blocked issue has a human-owned unblockDescriptor");
+    expect(boardOwnedDescriptorItem?.severity).toBe("high");
     expect(feed.items.find((item) =>
       item.sourceKind === "review" && item.subject.title === "Stalled review blocker"
     )).toMatchObject({

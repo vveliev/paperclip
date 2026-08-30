@@ -147,6 +147,9 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
       originKind: opts.sourceOriginKind ?? "manual",
       completedAt: sourceStatus === "done" ? terminalEvidenceAt : null,
       cancelledAt: sourceStatus === "cancelled" ? terminalEvidenceAt : null,
+      unblockDescriptor: sourceStatus === "blocked"
+        ? { owner: "board", action: "Test fixture: pre-existing blocked issue." }
+        : null,
       updatedAt: startedAt,
       createdAt: startedAt,
     });
