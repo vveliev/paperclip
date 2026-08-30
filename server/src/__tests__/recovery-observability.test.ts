@@ -211,6 +211,9 @@ describeEmbeddedPostgres("recovery observability report", () => {
       assigneeAgentId: input.finalAssigneeAgentId,
       issueNumber: input.n,
       identifier: `SRC-${input.n}`,
+      unblockDescriptor: input.finalIssueStatus === "blocked"
+        ? { owner: "board", action: "Test fixture: pre-existing blocked issue." }
+        : null,
     });
     await db.insert(issueRecoveryActions).values({
       id: randomUUID(),

@@ -1767,6 +1767,10 @@ describeEmbeddedPostgres(
           parentId: fixture.issues.reviewRoot.id,
           title: "Visible blocked vendor wait",
           status: "blocked",
+          unblockDescriptor: {
+            owner: "board",
+            action: "Test fixture: pre-existing blocked issue.",
+          },
           priority: "medium",
           description:
             "external owner: Visible vendor\nexternal action: Finish visible review",
@@ -1776,6 +1780,10 @@ describeEmbeddedPostgres(
           projectId: fixture.projects.outOfScope.id,
           title: "Hidden blocked vendor wait",
           status: "blocked",
+          unblockDescriptor: {
+            owner: "board",
+            action: "Test fixture: pre-existing blocked issue.",
+          },
           priority: "medium",
           description:
             "external owner: Hidden vendor\nexternal action: Finish hidden review",

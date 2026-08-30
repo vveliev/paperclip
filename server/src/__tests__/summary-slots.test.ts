@@ -230,6 +230,7 @@ describeEmbeddedPostgres("summary slot service", () => {
           issueNumber: 101,
           title: "Waiting on board approval",
           status: "blocked",
+          unblockDescriptor: { owner: "board", action: "Test fixture: pre-existing blocked issue." },
           priority: "high",
         },
         {
@@ -257,6 +258,7 @@ describeEmbeddedPostgres("summary slot service", () => {
           issueNumber: 104,
           title: "Other project issue",
           status: "blocked",
+          unblockDescriptor: { owner: "board", action: "Test fixture: pre-existing blocked issue." },
           priority: "critical",
         },
       ]);
@@ -350,6 +352,7 @@ describeEmbeddedPostgres("summary slot service", () => {
           issueNumber: 202,
           title: "Second workspace task",
           status: "blocked",
+          unblockDescriptor: { owner: "board", action: "Test fixture: pre-existing blocked issue." },
           priority: "high",
         },
       ]);

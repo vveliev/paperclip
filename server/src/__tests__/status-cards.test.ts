@@ -707,7 +707,10 @@ describeEmbeddedPostgres("status card routes", () => {
     expect(generationIssueId).toBeTruthy();
 
     // The setup run gets stuck and blocks the task instead of writing a summary.
-    await issueService(db).update(generationIssueId, { status: "blocked" });
+    await issueService(db).update(generationIssueId, {
+      status: "blocked",
+      unblockDescriptor: { owner: "board", action: "Test fixture: pre-existing blocked issue." },
+    });
 
     // The card releases its generation claim, so the tile stops spinning and the
     // board offers "Run now" again (generatingIssueId null → not "setup running").
@@ -929,7 +932,7 @@ describeEmbeddedPostgres("status card routes", () => {
     const compileIssueId = created.body.generatingIssueId as string;
     const compileRun = await seedRun(company.id, summarizer.id);
     await db.update(issues).set({ checkoutRunId: compileRun.id }).where(eq(issues.id, compileIssueId));
-    const matchedIssue = await db.insert(issues).values({ companyId: company.id, title: "Launch blocked on approval", status: "blocked", priority: "high" }).returning().then((rows) => rows[0]!);
+    const matchedIssue = await db.insert(issues).values({ companyId: company.id, title: "Launch blocked on approval", status: "blocked", unblockDescriptor: { owner: "board", action: "Test fixture: pre-existing blocked issue." }, priority: "high" }).returning().then((rows) => rows[0]!);
     const mentionedIdentifier = `M${randomUUID().replace(/[^0-9]/g, "").slice(0, 6)}X-7`;
     const mentionedIssue = await db.insert(issues).values({ companyId: company.id, identifier: mentionedIdentifier, title: "Related migration follow-up", status: "in_progress", priority: "medium" }).returning().then((rows) => rows[0]!);
 
@@ -1045,7 +1048,7 @@ describeEmbeddedPostgres("status card routes", () => {
     let generationIssueId = created.body.generatingIssueId as string;
     let run = await seedRun(company.id, summarizer.id);
     await db.update(issues).set({ checkoutRunId: run.id }).where(eq(issues.id, generationIssueId));
-    const watchedIssue = await db.insert(issues).values({ companyId: company.id, title: "Launch is blocked on approval", status: "blocked", priority: "high" }).returning().then((rows) => rows[0]!);
+    const watchedIssue = await db.insert(issues).values({ companyId: company.id, title: "Launch is blocked on approval", status: "blocked", unblockDescriptor: { owner: "board", action: "Test fixture: pre-existing blocked issue." }, priority: "high" }).returning().then((rows) => rows[0]!);
     let writerApp = createApp(db, agentActor(company.id, summarizer.id, run.id));
     const queryPayload = {
       queries: [{ scope: "issues", status: ["blocked", "done"], updatedWithin: "7d", sort: "updated", limit: 20, offset: 0 }],
