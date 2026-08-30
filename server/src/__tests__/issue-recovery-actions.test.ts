@@ -2029,7 +2029,11 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     const { companyId, managerId, coderId, sourceIssueId } = await seedCompany();
     await db
       .update(issues)
-      .set({ status: "blocked", assigneeAgentId: coderId })
+      .set({
+        status: "blocked",
+        assigneeAgentId: coderId,
+        unblockDescriptor: { owner: "board", action: "Test fixture: pre-existing blocked issue." },
+      })
       .where(eq(issues.id, sourceIssueId));
     const recoveryActionSvc = issueRecoveryActionService(db);
     const action = await recoveryActionSvc.upsertSourceScoped({
@@ -2122,7 +2126,12 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     const { companyId, managerId, sourceIssueId } = await seedCompany();
     await db
       .update(issues)
-      .set({ status: "blocked", assigneeAgentId: null, assigneeUserId: "board-user" })
+      .set({
+        status: "blocked",
+        assigneeAgentId: null,
+        assigneeUserId: "board-user",
+        unblockDescriptor: { owner: "board", action: "Test fixture: pre-existing blocked issue." },
+      })
       .where(eq(issues.id, sourceIssueId));
     const recoveryActionSvc = issueRecoveryActionService(db);
     const action = await recoveryActionSvc.upsertSourceScoped({
@@ -2167,7 +2176,12 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     const { companyId, managerId, sourceIssueId } = await seedCompany();
     await db
       .update(issues)
-      .set({ status: "blocked", assigneeAgentId: null, assigneeUserId: "board-user" })
+      .set({
+        status: "blocked",
+        assigneeAgentId: null,
+        assigneeUserId: "board-user",
+        unblockDescriptor: { owner: "board", action: "Test fixture: pre-existing blocked issue." },
+      })
       .where(eq(issues.id, sourceIssueId));
     const recoveryActionSvc = issueRecoveryActionService(db);
     const action = await recoveryActionSvc.upsertSourceScoped({
@@ -2308,7 +2322,12 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     const { companyId, managerId, sourceIssueId } = await seedCompany();
     await db
       .update(issues)
-      .set({ status: "blocked", assigneeAgentId: null, assigneeUserId: "board-user" })
+      .set({
+        status: "blocked",
+        assigneeAgentId: null,
+        assigneeUserId: "board-user",
+        unblockDescriptor: { owner: "board", action: "Test fixture: pre-existing blocked issue." },
+      })
       .where(eq(issues.id, sourceIssueId));
     const recoveryActionSvc = issueRecoveryActionService(db);
     const action = await recoveryActionSvc.upsertSourceScoped({
@@ -2358,7 +2377,12 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     const { companyId, managerId, coderId, sourceIssueId } = await seedCompany();
     await db
       .update(issues)
-      .set({ status: "blocked", assigneeAgentId: null, assigneeUserId: "board-user" })
+      .set({
+        status: "blocked",
+        assigneeAgentId: null,
+        assigneeUserId: "board-user",
+        unblockDescriptor: { owner: "board", action: "Test fixture: pre-existing blocked issue." },
+      })
       .where(eq(issues.id, sourceIssueId));
     const recoveryActionSvc = issueRecoveryActionService(db);
     const action = await recoveryActionSvc.upsertSourceScoped({
@@ -2403,7 +2427,12 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     const { companyId, managerId, coderId, sourceIssueId } = await seedCompany();
     await db
       .update(issues)
-      .set({ status: "blocked", assigneeAgentId: null, assigneeUserId: "board-user" })
+      .set({
+        status: "blocked",
+        assigneeAgentId: null,
+        assigneeUserId: "board-user",
+        unblockDescriptor: { owner: "board", action: "Test fixture: pre-existing blocked issue." },
+      })
       .where(eq(issues.id, sourceIssueId));
     const recoveryActionSvc = issueRecoveryActionService(db);
     const action = await recoveryActionSvc.upsertSourceScoped({
@@ -2453,7 +2482,12 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     const { companyId, managerId, sourceIssueId } = await seedCompany();
     await db
       .update(issues)
-      .set({ status: "blocked", assigneeAgentId: null, assigneeUserId: "board-user" })
+      .set({
+        status: "blocked",
+        assigneeAgentId: null,
+        assigneeUserId: "board-user",
+        unblockDescriptor: { owner: "board", action: "Test fixture: pre-existing blocked issue." },
+      })
       .where(eq(issues.id, sourceIssueId));
     const recoveryActionSvc = issueRecoveryActionService(db);
     const action = await recoveryActionSvc.upsertSourceScoped({
@@ -2644,7 +2678,10 @@ describeEmbeddedPostgres("issue recovery actions", () => {
 
   it("allows false-positive recovery resolution to restore a blocked source issue in the same request", async () => {
     const { companyId, managerId, sourceIssueId } = await seedCompany();
-    await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, sourceIssueId));
+    await db.update(issues).set({
+      status: "blocked",
+      unblockDescriptor: { owner: "board", action: "Test fixture: pre-existing blocked issue." },
+    }).where(eq(issues.id, sourceIssueId));
     const recoveryActionSvc = issueRecoveryActionService(db);
     const action = await recoveryActionSvc.upsertSourceScoped({
       companyId,

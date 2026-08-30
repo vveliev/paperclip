@@ -197,6 +197,9 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
         executionLockedAt: new Date(),
         ...(completedAt ? { completedAt } : {}),
         ...(cancelledAt ? { cancelledAt } : {}),
+        ...(status === "blocked"
+          ? { unblockDescriptor: { owner: "board", action: "Test fixture: pre-existing blocked issue." } }
+          : {}),
       });
 
       const res = await request(createApp(agentActor(companyId, agentId, currentRunId)))
