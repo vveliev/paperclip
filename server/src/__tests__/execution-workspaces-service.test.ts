@@ -2156,6 +2156,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       title: "Source task",
       identifier: "PAP-123",
       status: "blocked",
+      unblockDescriptor: { owner: "board", action: "Test fixture: pre-existing blocked issue." },
       priority: "medium",
     });
     await db.insert(executionWorkspaces).values({
@@ -2278,6 +2279,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       title: "Source task",
       identifier: "PAP-124",
       status: "blocked",
+      unblockDescriptor: { owner: "board", action: "Test fixture: pre-existing blocked issue." },
       priority: "medium",
     });
     await db.insert(executionWorkspaces).values({
@@ -2359,6 +2361,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       title: "Source task",
       identifier: "PAP-125",
       status: "blocked",
+      unblockDescriptor: { owner: "board", action: "Test fixture: pre-existing blocked issue." },
       priority: "medium",
     });
     await db.insert(executionWorkspaces).values({
@@ -2432,6 +2435,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       title: "Source task",
       identifier: "PAP-126",
       status: "blocked",
+      unblockDescriptor: { owner: "board", action: "Test fixture: pre-existing blocked issue." },
       priority: "medium",
     });
     await db.insert(executionWorkspaces).values({
@@ -2531,6 +2535,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       title: "Source task",
       identifier: "PAP-124",
       status: "blocked",
+      unblockDescriptor: { owner: "board", action: "Test fixture: pre-existing blocked issue." },
       priority: "medium",
       assigneeAgentId: agentId,
     });
@@ -2671,6 +2676,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       title: "Source task",
       identifier: "PAP-125",
       status: "blocked",
+      unblockDescriptor: { owner: "board", action: "Test fixture: pre-existing blocked issue." },
       priority: "medium",
     });
     await db.insert(executionWorkspaces).values({
@@ -2822,6 +2828,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       title: "Source task awaiting review",
       identifier: "PAP-125",
       status: "blocked",
+      unblockDescriptor: { owner: "board", action: "Test fixture: pre-existing blocked issue." },
       priority: "medium",
       assigneeAgentId: coderAgentId,
       executionPolicy: {
@@ -3002,6 +3009,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
           title: "Source task",
           identifier: "PAP-125",
           status: "blocked",
+          unblockDescriptor: { owner: "board", action: "Test fixture: pre-existing blocked issue." },
           priority: "medium",
           assigneeAgentId: agentId,
         },
@@ -3136,6 +3144,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       projectId,
       title: "Source task",
       status: "blocked",
+      unblockDescriptor: { owner: "board", action: "Test fixture: pre-existing blocked issue." },
       priority: "medium",
     });
     await db.insert(executionWorkspaces).values({
@@ -3221,6 +3230,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       projectId,
       title: "Source task",
       status: "blocked",
+      unblockDescriptor: { owner: "board", action: "Test fixture: pre-existing blocked issue." },
       priority: "medium",
     });
     await db.insert(executionWorkspaces).values({
@@ -3306,6 +3316,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       projectId,
       title: "Source task",
       status: "blocked",
+      unblockDescriptor: { owner: "board", action: "Test fixture: pre-existing blocked issue." },
       priority: "medium",
     });
     await db.insert(executionWorkspaces).values({
@@ -3410,6 +3421,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       projectId,
       title: "Source task",
       status: "blocked",
+      unblockDescriptor: { owner: "board", action: "Test fixture: pre-existing blocked issue." },
       priority: "medium",
     });
     await db.insert(executionWorkspaces).values({
@@ -3517,6 +3529,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       projectId,
       title: "Source task",
       status: "blocked",
+      unblockDescriptor: { owner: "board", action: "Test fixture: pre-existing blocked issue." },
       priority: "medium",
     });
     await db.insert(executionWorkspaces).values({
@@ -3646,6 +3659,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       projectId,
       title: "Source task",
       status: "blocked",
+      unblockDescriptor: { owner: "board", action: "Test fixture: pre-existing blocked issue." },
       priority: "medium",
     });
     await db.insert(executionWorkspaces).values({
@@ -3829,6 +3843,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       projectId,
       title: "Source task",
       status: "blocked",
+      unblockDescriptor: { owner: "board", action: "Test fixture: pre-existing blocked issue." },
       priority: "medium",
     });
     await db.insert(executionWorkspaces).values({
