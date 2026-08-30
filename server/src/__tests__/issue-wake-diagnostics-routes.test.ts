@@ -124,6 +124,9 @@ async function seedIssue(
     priority: "medium",
     assigneeAgentId: input.assigneeAgentId ?? null,
     responsibleUserId: "board-user",
+    unblockDescriptor: (input.status ?? "todo") === "blocked"
+      ? { owner: "board", action: "Test fixture: pre-existing blocked issue." }
+      : null,
   }).returning();
   return issue!;
 }
