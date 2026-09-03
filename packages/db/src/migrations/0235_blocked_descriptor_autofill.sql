@@ -1,15 +1,16 @@
 -- Replace BLA-687's CHECK constraint with a BEFORE-write trigger that fills the
 -- descriptor in rather than rejecting the write.
 --
--- Why: 0231 added issues_blocked_requires_unblock_descriptor_check to guarantee
--- that a blocked issue always records a premise, owner and action. The guarantee
--- is right. Enforcing it by *rejecting* the write was not, because the code that
--- writes status='blocked' does not supply a descriptor. server/src/services/
--- recovery/service.ts has NINE `status: "blocked"` writes and none of them set
--- unblock_descriptor -- escalateStrandedRecoveryIssueInPlace() among them. Those
--- are upstream (paperclipai/paperclip) code paths, which this fork re-inherits on
--- every PAPERCLIP_REF bump, so patching the call sites would be permanent
--- divergence that a future merge silently undoes.
+-- Why: 0234 added issues_blocked_requires_unblock_descriptor_check to guarantee
+-- that a blocked issue always records an owner and action. The guarantee is
+-- right. Enforcing it by *rejecting* the write was not, because at least one
+-- status='blocked' write path in server/src/services/recovery/service.ts
+-- (ensureIssueBlockedByEscalation) does not supply a descriptor, and that is
+-- an upstream (paperclipai/paperclip) code path this fork re-inherits on every
+-- PAPERCLIP_REF bump -- patching call sites one at a time is permanent
+-- divergence a future merge can silently undo, or reintroduce for a path
+-- added later. A CHECK constraint rejects the write no matter which caller,
+-- upstream or raw SQL, forgets the column; a trigger fills it in instead.
 --
 -- What it cost, on the live instance 2026-09-03: the recovery sweep tried to park
 -- one stranded issue (BLA-819) as blocked, the CHECK rejected it, and because
@@ -55,8 +56,8 @@ CREATE TRIGGER "issues_blocked_descriptor_autofill"
   EXECUTE FUNCTION "issues_blocked_descriptor_autofill"();--> statement-breakpoint
 
 -- Backfill anything the CHECK let through before the trigger existed. Should be a
--- no-op given 0231 backfilled and the CHECK held the line since, but a migration
--- that assumes the invariant it is about to depend on is how 0231 nearly failed.
+-- no-op given 0234 backfilled and the CHECK held the line since, but assuming an
+-- invariant holds instead of verifying it is exactly how this outage happened.
 UPDATE "issues"
 SET "unblock_descriptor" = jsonb_build_object(
   'owner', 'board',
