@@ -1632,6 +1632,13 @@
       "when": 1788071725682,
       "tag": "0234_uneven_shocker",
       "breakpoints": true
+    },
+    {
+      "idx": 235,
+      "version": "7",
+      "when": 1788416000000,
+      "tag": "0235_blocked_descriptor_autofill",
+      "breakpoints": true
     }
   ]
 }

@@ -11,7 +11,6 @@ import {
   uniqueIndex,
   unique,
   bigint,
-  check,
 } from "drizzle-orm/pg-core";
 import { agents } from "./agents.js";
 import { projects } from "./projects.js";
@@ -88,10 +87,23 @@ export const issues = pgTable(
     // the last-resort guard behind the application-level invariant in
     // issues.ts update(): it catches any write path (present or future,
     // including raw SQL) that the service layer doesn't.
-    blockedRequiresUnblockDescriptorCheck: check(
-      "issues_blocked_requires_unblock_descriptor_check",
-      sql`${table.status} <> 'blocked' or ${table.unblockDescriptor} is not null`,
-    ),
+    //
+    // Enforced by the issues_blocked_descriptor_autofill trigger (migration
+    // 0235), NOT by a CHECK constraint. 0231 used a CHECK; it was replaced
+    // because rejecting the write turned a metadata gap into an outage.
+    // server/src/services/recovery/service.ts writes status: "blocked" in
+    // nine places and supplies a descriptor in none of them — those are
+    // upstream paths this fork re-inherits on every PAPERCLIP_REF bump. On
+    // 2026-09-03 one such write (a stranded-run park) was rejected 63 times
+    // over six hours, and because index.ts chains the recovery stages with a
+    // single terminal .catch(), each rejection aborted the entire pass:
+    // no stranded-run recovery, stale-lock sweep, or productivity
+    // reconciliation ran board-wide, with nothing alerting.
+    //
+    // The trigger keeps the guarantee (no blocked row without a descriptor)
+    // and removes the failure mode (no write can fail because of it). If you
+    // are tempted to restore the CHECK, fix the nine call sites first — and
+    // note a future upstream merge can reintroduce a tenth.
     companyStatusIdx: index("issues_company_status_idx").on(table.companyId, table.status),
     companyHarnessKindIdx: index("issues_company_harness_kind_idx").on(table.companyId, table.harnessKind),
     assigneeStatusIdx: index("issues_company_assignee_status_idx").on(
