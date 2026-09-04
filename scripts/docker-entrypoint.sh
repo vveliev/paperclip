@@ -74,7 +74,12 @@ fi
 # the pod does. Runs as root (before gosu drops privileges below) since
 # repairing ownership needs it; exec later doesn't kill this -- it only
 # replaces the calling shell, so the backgrounded subshell is reparented
-# to tini and keeps running.
+# to tini and keeps running. The marker itself is written via `gosu node`
+# rather than root + a follow-up chown: a root-owned marker sitting at the
+# volume root would be exactly the kind of top-level mismatch the shallow
+# startup probe above looks for, silently defeating its fast path (and, on
+# a fully clean tree, tripping a chown on every single boot) from the very
+# next restart on.
 audit_marker="$home_dir/.ownership-audit-last-run"
 audit_interval_days="${PAPERCLIP_OWNERSHIP_AUDIT_INTERVAL_DAYS:-7}"
 (
@@ -93,8 +98,7 @@ audit_interval_days="${PAPERCLIP_OWNERSHIP_AUDIT_INTERVAL_DAYS:-7}"
             else
                 echo "ownership-audit: full-tree scan of $home_dir clean, no mismatches" >&2
             fi
-            date +%s > "$audit_marker"
-            chown node:node "$audit_marker" 2>/dev/null || true
+            gosu node sh -c 'date +%s > "$1"' _ "$audit_marker"
         fi
     fi
 ) &
