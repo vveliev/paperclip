@@ -1171,6 +1171,7 @@ const ISSUE_WAKE_DIAGNOSTIC_KNOWN_REASONS = new Set([
   "issue_unblock_requested",
   "heartbeat_timer",
   "issue_monitor_due",
+  "monitor_due",
   "issue_monitor_recovery",
   "issue_monitor_recovery_issue",
   "task_watchdog_stopped_subtree",
