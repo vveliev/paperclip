@@ -13,6 +13,7 @@ export {
   type MigrationBootstrapResult,
   type Db,
 } from "./client.js";
+export { applyDatabaseInvariants, type DatabaseInvariantResult } from "./invariants.js";
 export {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
