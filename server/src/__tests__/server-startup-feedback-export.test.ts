@@ -647,6 +647,28 @@ describe("startServer feedback export wiring", () => {
     expect(fakeServer.close).toHaveBeenCalledTimes(1);
   });
 
+  it("runs every later startup recovery stage even when an earlier stage throws", async () => {
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      heartbeatSchedulerEnabled: true,
+      heartbeatSchedulerIntervalMs: 30000,
+    }));
+    // Simulate the production incident (one unrepairable stranded issue) but
+    // during the startup recovery pass rather than a later periodic tick.
+    heartbeatServiceMock.reconcileStrandedAssignedIssues.mockRejectedValueOnce(
+      new Error("simulated unrepairable stranded issue"),
+    );
+
+    await expect(startServer()).resolves.toBeDefined();
+
+    // Before this fix, these later stages were skipped for the whole startup
+    // pass because they shared one trailing .catch() with the earlier stage.
+    expect(heartbeatServiceMock.reconcileResolvedDependencyWakes).toHaveBeenCalledTimes(1);
+    expect(heartbeatServiceMock.reconcileTaskWatchdogs).toHaveBeenCalledTimes(1);
+    expect(heartbeatServiceMock.scanSilentActiveRuns).toHaveBeenCalledTimes(1);
+    expect(heartbeatServiceMock.sweepStaleIssueLocks).toHaveBeenCalledTimes(1);
+    expect(heartbeatServiceMock.reconcileProductivityReviews).toHaveBeenCalledTimes(1);
+  });
+
   it("refuses authenticated public startup without an external database URL", async () => {
     loadConfigMock.mockReturnValue(buildTestConfig({
       deploymentExposure: "public",

@@ -1412,55 +1412,93 @@ export async function startServer(): Promise<StartedServer> {
           }
         }
 
-        const promotion = await heartbeat.promoteDueScheduledRetries();
-        await heartbeat.resumeQueuedRuns();
-        const reconciled = await heartbeat.reconcileStrandedAssignedIssues();
-        if (
-          promotion.promoted > 0 ||
-          reconciled.assignmentDispatched > 0 ||
-          reconciled.dispatchRequeued > 0 ||
-          reconciled.continuationRequeued > 0 ||
-          reconciled.successfulRunHandoffEscalated > 0 ||
-          reconciled.escalated > 0
-        ) {
-          logger.warn(
-            { promotedScheduledRetries: promotion.promoted, promotedScheduledRetryRunIds: promotion.runIds, ...reconciled },
-            "startup heartbeat recovery changed assigned issue state",
-          );
+        // Each stage below is independent of the others, so each runs inside its
+        // own try/catch instead of sharing one. Without this, a thrown error at
+        // any stage (e.g. one unrepairable issue inside
+        // reconcileStrandedAssignedIssues) propagated straight to the single
+        // .catch() at the end of this IIFE, silently skipping every later stage
+        // for this startup pass — dependency-wake reconciliation, task
+        // watchdogs, silent-active-run scanning, stale-lock sweeping, and
+        // productivity reviews included. This is the same class of bug the
+        // periodic tick chain had; see the equivalent per-stage split further
+        // down.
+        try {
+          const promotion = await heartbeat.promoteDueScheduledRetries();
+          await heartbeat.resumeQueuedRuns();
+          const reconciled = await heartbeat.reconcileStrandedAssignedIssues();
+          if (
+            promotion.promoted > 0 ||
+            reconciled.assignmentDispatched > 0 ||
+            reconciled.dispatchRequeued > 0 ||
+            reconciled.continuationRequeued > 0 ||
+            reconciled.successfulRunHandoffEscalated > 0 ||
+            reconciled.escalated > 0
+          ) {
+            logger.warn(
+              { promotedScheduledRetries: promotion.promoted, promotedScheduledRetryRunIds: promotion.runIds, ...reconciled },
+              "startup heartbeat recovery changed assigned issue state",
+            );
+          }
+        } catch (err) {
+          logger.error({ err }, "startup heartbeat recovery failed");
         }
 
-        const dependencyWakesReconciled = await heartbeat.reconcileResolvedDependencyWakes();
-        if (dependencyWakesReconciled.healed > 0) {
-          logger.warn(
-            { ...dependencyWakesReconciled },
-            "startup dependency-wake reconciliation restored task execution paths",
-          );
+        try {
+          const dependencyWakesReconciled = await heartbeat.reconcileResolvedDependencyWakes();
+          if (dependencyWakesReconciled.healed > 0) {
+            logger.warn(
+              { ...dependencyWakesReconciled },
+              "startup dependency-wake reconciliation restored task execution paths",
+            );
+          }
+        } catch (err) {
+          logger.error({ err }, "startup dependency-wake reconciliation failed");
         }
 
-        const taskWatchdogsReconciled = await heartbeat.reconcileTaskWatchdogs();
-        if (taskWatchdogsReconciled.triggered > 0) {
-          logger.warn(
-            { ...taskWatchdogsReconciled },
-            "startup task-watchdog reconciliation triggered watchdog work",
-          );
+        try {
+          const taskWatchdogsReconciled = await heartbeat.reconcileTaskWatchdogs();
+          if (taskWatchdogsReconciled.triggered > 0) {
+            logger.warn(
+              { ...taskWatchdogsReconciled },
+              "startup task-watchdog reconciliation triggered watchdog work",
+            );
+          }
+        } catch (err) {
+          logger.error({ err }, "startup task-watchdog reconciliation failed");
         }
 
-        const scanned = await heartbeat.scanSilentActiveRuns();
-        if (scanned.created > 0 || scanned.escalated > 0) {
-          logger.warn({ ...scanned }, "startup active-run output watchdog created review work");
+        try {
+          const scanned = await heartbeat.scanSilentActiveRuns();
+          if (scanned.created > 0 || scanned.escalated > 0) {
+            logger.warn({ ...scanned }, "startup active-run output watchdog created review work");
+          }
+        } catch (err) {
+          logger.error({ err }, "startup active-run output watchdog failed");
         }
 
-        const swept = await heartbeat.sweepStaleIssueLocks();
-        if (swept.cleared > 0) {
-          logger.warn({ ...swept }, "startup stale-lock sweeper cleared issue locks");
+        try {
+          const swept = await heartbeat.sweepStaleIssueLocks();
+          if (swept.cleared > 0) {
+            logger.warn({ ...swept }, "startup stale-lock sweeper cleared issue locks");
+          }
+        } catch (err) {
+          logger.error({ err }, "startup stale-lock sweep failed");
         }
 
-        const reviewed = await heartbeat.reconcileProductivityReviews();
-        if (reviewed.created > 0 || reviewed.updated > 0 || reviewed.failed > 0) {
-          logger.warn({ ...reviewed }, "startup productivity reconciliation created or updated review work");
+        try {
+          const reviewed = await heartbeat.reconcileProductivityReviews();
+          if (reviewed.created > 0 || reviewed.updated > 0 || reviewed.failed > 0) {
+            logger.warn({ ...reviewed }, "startup productivity reconciliation created or updated review work");
+          }
+        } catch (err) {
+          logger.error({ err }, "startup productivity reconciliation failed");
         }
       })().catch((err) => {
-        logger.error({ err }, "startup heartbeat recovery failed");
+        // Each stage above catches its own failure, so anything reaching here is a
+        // setup error rather than one stage misbehaving -- hence the narrower name.
+        // The rethrow is kept: a startup-setup failure should still surface rather
+        // than be swallowed, which is what this outer catch did before.
+        logger.error({ err }, "startup heartbeat recovery setup failed");
         throw err;
       });
       trackHeartbeatSchedulerWork(startupHeartbeatRecovery);
