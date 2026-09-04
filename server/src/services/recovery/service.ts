@@ -3288,6 +3288,22 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     recoveryCause?: StrandedRecoveryCause;
     successfulRunHandoffEvidence?: SuccessfulRunHandoffRecoveryEvidence | null;
   }) {
+    // BLA-1054: `input.issue` is a snapshot read at the start of the
+    // reconcile sweep, which can iterate many candidates before it reaches
+    // this one. If the assignee lands a terminal write (most commonly
+    // `done`) on this issue while the sweep is still in flight, the stale
+    // snapshot must not be allowed to force it back to `blocked` — re-check
+    // the live status right before writing and no-op if it has moved on
+    // from the status this escalation was decided against.
+    const current = await db
+      .select({ status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, input.issue.id))
+      .then((rows) => rows[0] ?? null);
+    if (!current || current.status !== input.previousStatus) {
+      return null;
+    }
+
     if (isStrandedIssueRecoveryIssue(input.issue)) {
       return escalateStrandedRecoveryIssueInPlace({
         issue: input.issue,
