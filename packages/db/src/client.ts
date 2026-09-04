@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { drizzle as drizzlePg } from "drizzle-orm/postgres-js";
 import { migrate as migratePg } from "drizzle-orm/postgres-js/migrator";
+import { applyDatabaseInvariants } from "./invariants.js";
 import { readFile, readdir } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import postgres from "postgres";
@@ -944,6 +945,23 @@ export async function inspectMigrations(url: string): Promise<MigrationState> {
 }
 
 export async function applyPendingMigrations(url: string): Promise<void> {
+  await applyPendingMigrationsInner(url);
+  // Runs on every path, including the up-to-date early return, because an existing
+  // database still needs the invariants. See invariants.ts for why these are not
+  // numbered migrations.
+  //
+  // The name now under-describes the behaviour: this does more than apply pending
+  // migrations. A clearer seam would be `ensureDatabaseReady()` composing the two
+  // steps explicitly. It is deliberately not renamed. This is a fork of an upstream
+  // that edits this file often, and `applyPendingMigrations` is upstream's exported
+  // name with callers across the CLI, the server, and the test harness. Renaming it
+  // would put a permanent conflict in a hot file to fix a naming smell -- the same
+  // recurring-conflict cost this commit removed from the migration directory. The
+  // wrapper keeps the fork's delta to two lines in one function.
+  await applyDatabaseInvariants(url);
+}
+
+async function applyPendingMigrationsInner(url: string): Promise<void> {
   const initialState = await inspectMigrations(url);
   if (initialState.status === "upToDate") return;
 
