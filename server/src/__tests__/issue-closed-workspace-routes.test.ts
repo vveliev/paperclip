@@ -256,6 +256,28 @@ describe.sequential("closed isolated workspace issue routes", () => {
     expect(res.status).toBe(201);
   });
 
+  it("does not reopen the closed isolated workspace for a plain comment that leaves a blocked issue blocked (BLA-1027)", async () => {
+    // A plain note is posted on an already-blocked, unassigned issue -- no
+    // reopen/resume intent, and nothing implicitly moves it to todo (no
+    // assignee agent to hand it back to). The issue stays blocked, so nothing
+    // downstream needs the workspace rebuilt: forcing that rebuild here is
+    // exactly the bug BLA-1027 reports (an unrelated rebuild failure turns
+    // into a 503 that blocks posting the comment at all).
+    mockIssueService.getById.mockResolvedValue({ ...makeIssue(), status: "blocked", assigneeAgentId: null });
+    mockIssueService.addComment.mockResolvedValue({
+      id: "comment-2",
+      body: "still blocked, rechecked",
+    });
+
+    const res = await request(createApp())
+      .post(`/api/issues/${issueId}/comments`)
+      .send({ body: "still blocked, rechecked" });
+
+    expect(res.status).toBe(201);
+    expect(mockExecutionWorkspaceService.reopenClosedIsolatedExecutionWorkspaceForIssue).not.toHaveBeenCalled();
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
   it("reopens the closed isolated workspace and accepts a comment update", async () => {
     mockIssueService.update.mockResolvedValue({ ...makeIssue(), status: "todo" });
 
