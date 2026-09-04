@@ -2509,11 +2509,22 @@ async function listPendingFinalizeBlockerIssueIds(
     if (!latest) continue; // no ops recorded -> nothing to finalize for this blocker
     if (latest.phase === "workspace_finalize" && latest.status === "succeeded")
       continue;
-    const laterSuccessfulFinalize = latestSuccessfulFinalizeByWorkspace.get(
-      pair.executionWorkspaceId,
-    );
-    if (laterSuccessfulFinalize && laterSuccessfulFinalize > latest.startedAt)
+    // Every pair reaching this function has an already-`done` blocker (see
+    // listIssueDependencyReadinessMap, the only caller). Once the blocker is
+    // done, any workspace_finalize that ever succeeded proves the sync-back
+    // this barrier protects already landed — legitimate further changes
+    // shouldn't occur post-done. So a *non-running* later attempt, success or
+    // not, is a stray retry/reconcile and must not re-wedge the dependent
+    // (BLA-1034: an earlier success followed by a later failed retry left the
+    // workspace permanently unfinalized because this used to require the
+    // success to be the *later* op). Only an attempt still `running` holds
+    // the gate open, since it may be actively producing a different result.
+    if (
+      latest.status !== "running" &&
+      latestSuccessfulFinalizeByWorkspace.has(pair.executionWorkspaceId)
+    ) {
       continue;
+    }
     if (
       latest.phase === "workspace_finalize" &&
       latest.status !== "running" &&
