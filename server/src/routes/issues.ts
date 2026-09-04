@@ -13386,13 +13386,28 @@ export function issueRoutes(
       return;
     }
     if (!(await assertCrossIssueInfluenceWithinRunCap(req, res, issue, "comment"))) return;
+    const willTransitionIssueOutOfTerminalStatus =
+      effectiveMoveToTodoRequested &&
+      (isClosed || (isBlocked && !hasUnresolvedFirstClassBlockers) || shouldResumeInProgressScheduledRetry);
+    // An issue that isn't currently closed or blocked always reopens its
+    // closed workspace on comment, unchanged from prior behavior. An issue
+    // that IS closed or blocked only needs the workspace rebuilt when the
+    // comment will actually move it out of that terminal status -- that's the
+    // only path below that can dispatch a run against the workspace
+    // afterward. A plain evidence/status comment on an already-blocked or
+    // already-closed issue (no reopen/resume intent, or still-unresolved
+    // blockers) leaves the issue terminal and never touches the workspace, so
+    // forcing a rebuild here just turns an unrelated git/provisioning failure
+    // into a 503 that blocks posting the comment at all (BLA-1027).
+    const needsWorkspaceReopenForComment =
+      !(isClosed || isBlocked) || willTransitionIssueOutOfTerminalStatus;
     // Reopen the closed isolated workspace only after every access, resume-intent,
     // blocker, and run-cap gate passes. A rejected comment must not rebuild and
     // republish the workspace as active, because the issue stays terminal and the
     // reaper then skips the leaked workspace.
     let reopenedWorkspace: Pick<ExecutionWorkspace, "id"> | null = null;
     let reopenedGeneration: number | null = null;
-    if (closedExecutionWorkspace) {
+    if (closedExecutionWorkspace && needsWorkspaceReopenForComment) {
       const reopenOutcome = await reopenClosedIssueExecutionWorkspaceOrRespond(
         req,
         res,
@@ -13434,10 +13449,7 @@ export function issueRoutes(
 
     let scheduledRetrySupersededByComment = false;
     let cancelledScheduledRetryRunId: string | null = null;
-    if (
-      effectiveMoveToTodoRequested &&
-      (isClosed || (isBlocked && !hasUnresolvedFirstClassBlockers) || shouldResumeInProgressScheduledRetry)
-    ) {
+    if (willTransitionIssueOutOfTerminalStatus) {
       scheduledRetrySupersededByComment = shouldResumeInProgressScheduledRetry && issue.status === "in_progress";
       cancelledScheduledRetryRunId = scheduledRetrySupersededByComment
         ? await cancelScheduledRetrySupersededByComment({
