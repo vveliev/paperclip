@@ -37,13 +37,19 @@ function defaultTimeoutAt(explicit: Date | null | undefined, now: Date): Date | 
   return new Date(now.getTime() + DEFAULT_RECOVERY_ACTION_TIMEOUT_MS);
 }
 
-// Only `active` rows expire on their own. `escalated` means a human already
-// owns the flag explicitly (see the recovery-budget-exhaustion branch below,
-// which always sets timeoutAt: null when it escalates) - auto-clearing that
-// would silently undo a deliberate hand-off instead of just forcing a
-// cheap re-check.
+// Only `active` rows with no attempt bound expire on their own. `escalated`
+// means a human already owns the flag explicitly (see the
+// recovery-budget-exhaustion branch below, which always sets timeoutAt: null
+// when it escalates) - auto-clearing that would silently undo a deliberate
+// hand-off instead of just forcing a cheap re-check. Rows with a
+// non-null `maxAttempts` (e.g. bounded_owner_disposition_repair retries) are
+// already bounded and actively re-evaluated by their own reconciliation
+// loop, which repurposes `timeoutAt` as a "next attempt due" marker rather
+// than a hard expiry - lazily expiring those here would race the loop and
+// resolve the row out from under it before it gets to retry (BLA-1074 was
+// about rows that are unbounded in *both* dimensions, e.g. BLA-54/56).
 function isExpiredActiveRow(row: IssueRecoveryActionRow, now: Date): boolean {
-  if (row.status !== "active" || row.timeoutAt == null) return false;
+  if (row.status !== "active" || row.timeoutAt == null || row.maxAttempts != null) return false;
   const timeoutAt = asDatabaseDate(row.timeoutAt);
   return timeoutAt != null && timeoutAt.getTime() <= now.getTime();
 }
