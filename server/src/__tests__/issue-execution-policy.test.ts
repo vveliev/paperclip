@@ -569,6 +569,82 @@ describe("issue execution policy transitions", () => {
       ).toThrow("Only the active reviewer or approver can advance");
     });
 
+    it("active participant hands the stage back to a co-participant without recording a decision", () => {
+      const multiReviewerPolicy = makePolicy([
+        {
+          type: "review",
+          participants: [
+            { type: "agent", agentId: qaAgentId },
+            { type: "agent", agentId: ctoAgentId },
+          ],
+        },
+      ]);
+      const multiReviewerStageId = multiReviewerPolicy.stages[0].id;
+      const result = applyIssueExecutionPolicyTransition({
+        issue: {
+          status: "in_review",
+          assigneeAgentId: qaAgentId,
+          assigneeUserId: null,
+          executionPolicy: multiReviewerPolicy,
+          executionState: {
+            status: "pending",
+            currentStageId: multiReviewerStageId,
+            currentStageIndex: 0,
+            currentStageType: "review",
+            currentParticipant: { type: "agent", agentId: qaAgentId },
+            returnAssignee: { type: "agent", agentId: coderAgentId },
+            completedStageIds: [],
+            lastDecisionId: null,
+            lastDecisionOutcome: null,
+          },
+        },
+        policy: multiReviewerPolicy,
+        requestedAssigneePatch: { assigneeAgentId: ctoAgentId },
+        actor: { agentId: qaAgentId },
+        commentBody: "Out of my depth on this one, over to you",
+      });
+
+      expect(result.patch.status).toBe("in_review");
+      expect(result.patch.assigneeAgentId).toBe(ctoAgentId);
+      expect(result.patch.assigneeUserId).toBeNull();
+      expect(result.patch.executionState).toMatchObject({
+        status: "pending",
+        currentStageId: multiReviewerStageId,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: ctoAgentId },
+        returnAssignee: { type: "agent", agentId: coderAgentId },
+      });
+      expect(result.decision).toBeUndefined();
+      expect(result.workflowControlledAssignment).toBe(true);
+    });
+
+    it("active participant cannot hand the stage back to a non-participant", () => {
+      expect(() =>
+        applyIssueExecutionPolicyTransition({
+          issue: {
+            status: "in_review",
+            assigneeAgentId: qaAgentId,
+            assigneeUserId: null,
+            executionPolicy: policy,
+            executionState: {
+              status: "pending",
+              currentStageId: reviewStageId,
+              currentStageIndex: 0,
+              currentStageType: "review",
+              currentParticipant: { type: "agent", agentId: qaAgentId },
+              returnAssignee: { type: "agent", agentId: coderAgentId },
+              completedStageIds: [],
+              lastDecisionId: null,
+              lastDecisionOutcome: null,
+            },
+          },
+          policy,
+          requestedAssigneePatch: { assigneeUserId: boardUserId },
+          actor: { agentId: qaAgentId },
+        }),
+      ).toThrow("Only the active reviewer or approver can advance");
+    });
+
     it("board override can cancel an active review without recording an approval decision", () => {
       const result = applyIssueExecutionPolicyTransition({
         issue: {
