@@ -484,6 +484,42 @@ describe("startServer feedback export wiring", () => {
     });
   });
 
+  // GIF-125: upstream paperclipai/paperclip#12681 deleted the Issue Graph
+  // Liveness Auto Recovery feature (the disabled-by-default escalation
+  // superstructure) but kept the simpler resolved-dependency-wake backstop
+  // this fork actually depends on for `issue_blockers_resolved` wakes,
+  // renaming it to `reconcileResolvedDependencyWakes`. That rename produced
+  // zero merge conflicts because this fork's own commits never touch these
+  // call sites, so a future upstream change could drop them just as
+  // silently. Pin both call sites here so that class of regression fails a
+  // test instead of merging invisibly again.
+  it("still reconciles resolved dependency wakes at startup and on the periodic tick (GIF-125)", async () => {
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      heartbeatSchedulerEnabled: true,
+      heartbeatSchedulerIntervalMs: 30000,
+    }));
+    let intervalCallback: (() => void) | null = null;
+    const setIntervalSpy = vi
+      .spyOn(globalThis, "setInterval")
+      .mockImplementation(((callback: () => void) => {
+        intervalCallback = callback;
+        return 1 as unknown as ReturnType<typeof setInterval>;
+      }) as typeof setInterval);
+
+    try {
+      await startServer();
+      expect(heartbeatServiceMock.reconcileResolvedDependencyWakes).toHaveBeenCalledTimes(1);
+
+      expect(intervalCallback).not.toBeNull();
+      intervalCallback?.();
+      await vi.waitFor(() => {
+        expect(heartbeatServiceMock.reconcileResolvedDependencyWakes).toHaveBeenCalledTimes(2);
+      });
+    } finally {
+      setIntervalSpy.mockRestore();
+    }
+  });
+
   it("keeps routine ticks and setup cleanup active when heartbeat scheduling is suppressed", async () => {
     loadConfigMock.mockReturnValue(buildTestConfig({
       heartbeatSchedulerEnabled: true,
