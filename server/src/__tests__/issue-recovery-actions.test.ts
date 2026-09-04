@@ -117,6 +117,184 @@ describe("issueRecoveryActionService", () => {
     expect(fakeDb.update).toHaveBeenCalledTimes(1);
     expect(fakeDb.insert).toHaveBeenCalledTimes(1);
   });
+
+  it("defaults a new active action's timeoutAt instead of leaving it permanent (BLA-1074)", async () => {
+    let insertedValues: Record<string, unknown> | null = null;
+    const fakeDb = {
+      select: vi.fn(() => ({
+        from() { return this; },
+        where() { return this; },
+        orderBy() { return this; },
+        limit: () => Promise.resolve([]),
+      })),
+      insert: vi.fn(() => ({
+        values: vi.fn((values: Record<string, unknown>) => {
+          insertedValues = values;
+          return { returning: vi.fn(async () => [makeRecoveryActionRow({ ...values, id: "new-action" })]) };
+        }),
+      })),
+    };
+
+    const before = Date.now();
+    const result = await issueRecoveryActionService(fakeDb as never).upsertSourceScoped({
+      companyId: "company-1",
+      sourceIssueId: "source-1",
+      kind: "workspace_validation",
+      ownerType: "board",
+      cause: "workspace_validation_failed",
+      fingerprint: "workspace-validation:fingerprint",
+      nextAction: "Board operator: repair the workspace.",
+    });
+
+    expect(result.timeoutAt).not.toBeNull();
+    expect((insertedValues!.timeoutAt as Date).getTime()).toBeGreaterThan(before);
+  });
+
+  it("leaves an explicit null timeoutAt alone (opt-out is respected)", async () => {
+    let insertedValues: Record<string, unknown> | null = null;
+    const fakeDb = {
+      select: vi.fn(() => ({
+        from() { return this; },
+        where() { return this; },
+        orderBy() { return this; },
+        limit: () => Promise.resolve([]),
+      })),
+      insert: vi.fn(() => ({
+        values: vi.fn((values: Record<string, unknown>) => {
+          insertedValues = values;
+          return { returning: vi.fn(async () => [makeRecoveryActionRow({ ...values, id: "new-action" })]) };
+        }),
+      })),
+    };
+
+    await issueRecoveryActionService(fakeDb as never).upsertSourceScoped({
+      companyId: "company-1",
+      sourceIssueId: "source-1",
+      kind: "active_run_watchdog",
+      ownerType: "system",
+      cause: "process_lost",
+      fingerprint: "process-lost:fingerprint",
+      nextAction: "n/a",
+      timeoutAt: null,
+    });
+
+    expect(insertedValues!.timeoutAt).toBeNull();
+  });
+
+  it("getActiveForIssue treats a past-timeoutAt active row as cleared and resolves it in place", async () => {
+    const staleRow = makeRecoveryActionRow({
+      id: "stale-action",
+      status: "active",
+      timeoutAt: new Date("2000-01-01T00:00:00.000Z"),
+    });
+    let updateSet: Record<string, unknown> | null = null;
+    const fakeDb = {
+      select: vi.fn(() => ({
+        from() { return this; },
+        where() { return this; },
+        orderBy() { return this; },
+        limit: () => Promise.resolve([staleRow]),
+      })),
+      update: vi.fn(() => ({
+        set: vi.fn((values: Record<string, unknown>) => {
+          updateSet = values;
+          return { where: vi.fn(() => ({ returning: vi.fn(async () => [{ ...staleRow, ...values }]) })) };
+        }),
+      })),
+    };
+
+    const result = await issueRecoveryActionService(fakeDb as never).getActiveForIssue("company-1", "source-1");
+
+    expect(result).toBeNull();
+    expect(fakeDb.update).toHaveBeenCalledTimes(1);
+    expect(updateSet).toMatchObject({ status: "resolved", outcome: "expired" });
+  });
+
+  it("getActiveForIssue returns a row whose timeoutAt has not passed yet", async () => {
+    const freshRow = makeRecoveryActionRow({
+      id: "fresh-action",
+      status: "active",
+      timeoutAt: new Date(Date.now() + 60 * 60 * 1000),
+    });
+    const fakeDb = {
+      select: vi.fn(() => ({
+        from() { return this; },
+        where() { return this; },
+        orderBy() { return this; },
+        limit: () => Promise.resolve([freshRow]),
+      })),
+      update: vi.fn(),
+    };
+
+    const result = await issueRecoveryActionService(fakeDb as never).getActiveForIssue("company-1", "source-1");
+
+    expect(result).toMatchObject({ id: "fresh-action" });
+    expect(fakeDb.update).not.toHaveBeenCalled();
+  });
+
+  it("does not auto-expire an escalated row even with a past timeoutAt", async () => {
+    const escalatedRow = makeRecoveryActionRow({
+      id: "escalated-action",
+      status: "escalated",
+      timeoutAt: new Date("2000-01-01T00:00:00.000Z"),
+    });
+    const fakeDb = {
+      select: vi.fn(() => ({
+        from() { return this; },
+        where() { return this; },
+        orderBy() { return this; },
+        limit: () => Promise.resolve([escalatedRow]),
+      })),
+      update: vi.fn(),
+    };
+
+    const result = await issueRecoveryActionService(fakeDb as never).getActiveForIssue("company-1", "source-1");
+
+    expect(result).toMatchObject({ id: "escalated-action", status: "escalated" });
+    expect(fakeDb.update).not.toHaveBeenCalled();
+  });
+
+  it("listActiveForIssues excludes and resolves expired rows while keeping fresh ones", async () => {
+    const staleRow = makeRecoveryActionRow({
+      id: "stale-action",
+      sourceIssueId: "source-stale",
+      status: "active",
+      timeoutAt: new Date("2000-01-01T00:00:00.000Z"),
+    });
+    const freshRow = makeRecoveryActionRow({
+      id: "fresh-action",
+      sourceIssueId: "source-fresh",
+      status: "active",
+      timeoutAt: new Date(Date.now() + 60 * 60 * 1000),
+    });
+    const updatedIds: string[] = [];
+    const fakeDb = {
+      select: vi.fn(() => ({
+        from() { return this; },
+        where() { return this; },
+        orderBy: () => Promise.resolve([staleRow, freshRow]),
+      })),
+      update: vi.fn(() => ({
+        set: vi.fn((values: Record<string, unknown>) => ({
+          where: vi.fn(() => ({
+            returning: vi.fn(async () => {
+              updatedIds.push("stale-action");
+              return [{ ...staleRow, ...values }];
+            }),
+          })),
+        })),
+      })),
+    };
+
+    const result = await issueRecoveryActionService(fakeDb as never).listActiveForIssues("company-1", [
+      "source-stale",
+      "source-fresh",
+    ]);
+
+    expect(result.has("source-stale")).toBe(false);
+    expect(result.get("source-fresh")).toMatchObject({ id: "fresh-action" });
+    expect(updatedIds).toEqual(["stale-action"]);
+  });
 });
 
 if (!embeddedPostgresSupport.supported) {

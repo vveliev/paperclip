@@ -228,6 +228,7 @@ const OUTCOME_LABEL: Record<IssueRecoveryActionOutcome, string> = {
   blocked: "blocked",
   escalated: "escalated",
   cancelled: "cancelled",
+  expired: "expired without re-confirmation",
 };
 
 function readEvidenceString(value: unknown): string | null {

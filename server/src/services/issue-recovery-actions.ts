@@ -12,12 +12,46 @@ import type {
 const ACTIVE_RECOVERY_ACTION_STATUSES = ["active", "escalated"] as const satisfies readonly IssueRecoveryActionStatus[];
 const MAX_UPSERT_RETRIES = 3;
 
+// A recovery action with no timeoutAt is permanent by construction: nothing
+// ever re-evaluates it, so a fixed underlying fault leaves the flag (and the
+// issue it holds) stuck forever (BLA-1074). Every action gets a default
+// expiry unless the caller passes an explicit `timeoutAt` (including
+// `null`, which opts a specific action out). `escalated` actions are exempt
+// (see isExpiredActiveRow) because that status means a human already owns
+// it; auto-clearing would silently take back a deliberate hand-off.
+const DEFAULT_RECOVERY_ACTION_TIMEOUT_MS = 6 * 60 * 60 * 1000;
+
 type IssueRecoveryActionRow = typeof issueRecoveryActions.$inferSelect;
 type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 type DbOrTransaction = Db | DbTransaction;
 
 function asDatabaseDate(value: string | Date | null) {
   return typeof value === "string" ? new Date(value) : value;
+}
+
+// `undefined` means "caller didn't specify a timeout" -> apply the default.
+// An explicit `null` (or a concrete Date) is a deliberate choice and passes
+// through unchanged.
+function defaultTimeoutAt(explicit: Date | null | undefined, now: Date): Date | null {
+  if (explicit !== undefined) return explicit;
+  return new Date(now.getTime() + DEFAULT_RECOVERY_ACTION_TIMEOUT_MS);
+}
+
+// Only `active` rows with no attempt bound expire on their own. `escalated`
+// means a human already owns the flag explicitly (see the
+// recovery-budget-exhaustion branch below, which always sets timeoutAt: null
+// when it escalates) - auto-clearing that would silently undo a deliberate
+// hand-off instead of just forcing a cheap re-check. Rows with a
+// non-null `maxAttempts` (e.g. bounded_owner_disposition_repair retries) are
+// already bounded and actively re-evaluated by their own reconciliation
+// loop, which repurposes `timeoutAt` as a "next attempt due" marker rather
+// than a hard expiry - lazily expiring those here would race the loop and
+// resolve the row out from under it before it gets to retry (BLA-1074 was
+// about rows that are unbounded in *both* dimensions, e.g. BLA-54/56).
+function isExpiredActiveRow(row: IssueRecoveryActionRow, now: Date): boolean {
+  if (row.status !== "active" || row.timeoutAt == null || row.maxAttempts != null) return false;
+  const timeoutAt = asDatabaseDate(row.timeoutAt);
+  return timeoutAt != null && timeoutAt.getTime() <= now.getTime();
 }
 
 function isRecoveryBudgetExhausted(evidence: Record<string, unknown>) {
@@ -149,6 +183,30 @@ export function issueRecoveryActionService(db: Db) {
     }
   }
 
+  // Lazily clears a stale `active` row when it's read past its timeoutAt,
+  // instead of leaving it to silently keep gating the issue. The WHERE guard
+  // makes this idempotent under a race: if another writer already resolved
+  // or refreshed the row, this update matches zero rows and the caller falls
+  // back to treating the (now-changed) row as not this expired snapshot.
+  async function expireRow(
+    dbOrTx: DbOrTransaction,
+    row: IssueRecoveryActionRow,
+    now: Date,
+  ): Promise<IssueRecoveryActionRow | null> {
+    const [expired] = await dbOrTx
+      .update(issueRecoveryActions)
+      .set({
+        status: "resolved",
+        outcome: "expired",
+        resolutionNote: "Recovery action expired without being re-confirmed; treated as cleared so the issue can be picked up again.",
+        resolvedAt: now,
+        updatedAt: now,
+      })
+      .where(and(eq(issueRecoveryActions.id, row.id), eq(issueRecoveryActions.status, "active")))
+      .returning();
+    return expired ?? null;
+  }
+
   async function getActiveForIssue(
     companyId: string,
     sourceIssueId: string,
@@ -167,7 +225,13 @@ export function issueRecoveryActionService(db: Db) {
       .orderBy(desc(issueRecoveryActions.updatedAt))
       .limit(1)
       .then((rows) => rows[0] ?? null);
-    return row ? toReadModel(row) : null;
+    if (!row) return null;
+    const now = new Date();
+    if (isExpiredActiveRow(row, now)) {
+      await expireRow(dbOrTx, row, now);
+      return null;
+    }
+    return toReadModel(row);
   }
 
   async function listActiveForIssues(companyId: string, sourceIssueIds: string[]) {
@@ -183,8 +247,14 @@ export function issueRecoveryActionService(db: Db) {
         ),
       )
       .orderBy(desc(issueRecoveryActions.updatedAt));
+    const now = new Date();
+    const expired = rows.filter((row) => isExpiredActiveRow(row, now));
+    if (expired.length > 0) {
+      await Promise.all(expired.map((row) => expireRow(db, row, now)));
+    }
     const result = new Map<string, IssueRecoveryAction>();
     for (const row of rows) {
+      if (isExpiredActiveRow(row, now)) continue;
       if (!result.has(row.sourceIssueId)) result.set(row.sourceIssueId, toReadModel(row));
     }
     return result;
@@ -231,7 +301,7 @@ export function issueRecoveryActionService(db: Db) {
       monitorPolicy: input.monitorPolicy ?? null,
       attemptCount: input.attemptCount ?? 1,
       maxAttempts: input.maxAttempts ?? null,
-      timeoutAt: input.timeoutAt ?? null,
+      timeoutAt: defaultTimeoutAt(input.timeoutAt, now),
       lastAttemptAt: input.lastAttemptAt ?? now,
     };
   }
@@ -420,7 +490,7 @@ export function issueRecoveryActionService(db: Db) {
               : input.maxAttempts,
           timeoutAt: input.preserveExistingOwner
             ? asDatabaseDate(existing.timeoutAt)
-            : input.timeoutAt ?? null,
+            : defaultTimeoutAt(input.timeoutAt, now),
           lastAttemptAt: input.preserveExistingOwner
             ? asDatabaseDate(existing.lastAttemptAt)
             : input.lastAttemptAt ?? now,
