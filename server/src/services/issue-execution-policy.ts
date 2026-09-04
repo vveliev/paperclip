@@ -899,6 +899,36 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
           workflowControlledAssignment: true,
         };
       }
+
+      // Neutral hand-back: the active participant reassigns the stage to a
+      // different eligible participant without recording approve or
+      // changes_requested. Without this, the only way to hand a stage to a
+      // co-reviewer (out sick, wrong specialty, etc.) is to fabricate an
+      // opinion the reassigning participant doesn't hold, or hit the 422
+      // below. Scoped to the stage's own participant pool so this can't be
+      // used to dump the review on an outsider -- that still requires board
+      // override.
+      if (
+        (requestedStatus === undefined || requestedStatus === "in_review") &&
+        requestedAssigneePatchProvided &&
+        explicitAssignee &&
+        !principalsEqual(explicitAssignee, currentParticipant) &&
+        stageHasParticipant(activeStage, explicitAssignee)
+      ) {
+        buildPendingStagePatch({
+          patch,
+          previous: existingState,
+          policy: input.policy,
+          stage: activeStage,
+          participant: explicitAssignee,
+          returnAssignee: existingState?.returnAssignee ?? currentAssignee ?? actor,
+          reviewRequest: effectiveReviewRequest,
+        });
+        return {
+          patch,
+          workflowControlledAssignment: true,
+        };
+      }
     }
 
     const attemptedStageAdvance =
