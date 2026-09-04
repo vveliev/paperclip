@@ -4615,6 +4615,88 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     ]);
   });
 
+  it("clears the workspace-finalize barrier when a later failed finalize follows an earlier success on a still-active workspace (BLA-1034)", async () => {
+    const {
+      companyId,
+      executionWorkspaceId,
+      blockerId,
+      dependentId,
+      assigneeAgentId,
+    } = await seedSharedWorkspaceDependency();
+
+    // The blocker finalized successfully and its issue was merged/done.
+    await db.insert(workspaceOperations).values({
+      companyId,
+      executionWorkspaceId,
+      issueId: blockerId,
+      phase: "workspace_finalize",
+      status: "succeeded",
+      startedAt: new Date("2026-05-23T22:05:00.000Z"),
+    });
+
+    // A stray retry/reconcile attempt runs later and fails, but the workspace
+    // is never archived (still `active`). The earlier success already proved
+    // the sync-back landed, so this must not wedge the dependent forever.
+    await db.insert(workspaceOperations).values({
+      companyId,
+      executionWorkspaceId,
+      issueId: blockerId,
+      phase: "workspace_finalize",
+      status: "failed",
+      startedAt: new Date("2026-05-23T22:10:00.000Z"),
+    });
+
+    await expect(
+      db.select({ status: executionWorkspaces.status })
+        .from(executionWorkspaces)
+        .where(eq(executionWorkspaces.id, executionWorkspaceId)),
+    ).resolves.toEqual([{ status: "active" }]);
+
+    await expect(svc.getDependencyReadiness(dependentId)).resolves.toMatchObject({
+      isDependencyReady: true,
+      pendingFinalizeBlockerIssueIds: [],
+      unresolvedBlockerIssueIds: [],
+    });
+    await expect(svc.listWakeableBlockedDependents(blockerId)).resolves.toEqual([
+      expect.objectContaining({
+        id: dependentId,
+        assigneeAgentId,
+        blockerIssueIds: [blockerId],
+      }),
+    ]);
+  });
+
+  it("keeps the workspace-finalize barrier closed while a retry after an earlier success is still running", async () => {
+    const {
+      companyId,
+      executionWorkspaceId,
+      blockerId,
+      dependentId,
+    } = await seedSharedWorkspaceDependency();
+
+    await db.insert(workspaceOperations).values({
+      companyId,
+      executionWorkspaceId,
+      issueId: blockerId,
+      phase: "workspace_finalize",
+      status: "succeeded",
+      startedAt: new Date("2026-05-23T22:05:00.000Z"),
+    });
+    await db.insert(workspaceOperations).values({
+      companyId,
+      executionWorkspaceId,
+      issueId: blockerId,
+      phase: "workspace_finalize",
+      status: "running",
+      startedAt: new Date("2026-05-23T22:10:00.000Z"),
+    });
+
+    await expect(svc.getDependencyReadiness(dependentId)).resolves.toMatchObject({
+      isDependencyReady: false,
+      pendingFinalizeBlockerIssueIds: [blockerId],
+    });
+  });
+
   it("treats blockers with no executionWorkspaceId as not subject to the workspace-finalize barrier", async () => {
     const companyId = randomUUID();
     const assigneeAgentId = randomUUID();
