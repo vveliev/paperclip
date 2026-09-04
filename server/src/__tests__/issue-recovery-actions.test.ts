@@ -2371,4 +2371,59 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       .where(eq(issueRecoveryActions.id, action.id));
     expect(actionRow?.status).toBe("active");
   });
+
+  it("keeps reconciling remaining candidates after one candidate's dispatch throws", async () => {
+    const { companyId, managerId, coderId, prefix } = await seedCompany();
+    // The seeded source issue (in_progress, no run history) is also a
+    // candidate and is expected to be reached and skipped alongside these two.
+    const willThrowIssueId = randomUUID();
+    const willSucceedIssueId = randomUUID();
+    await db.insert(issues).values([
+      {
+        id: willThrowIssueId,
+        companyId,
+        title: "Throws during recovery dispatch",
+        status: "todo",
+        priority: "medium",
+        assigneeAgentId: coderId,
+        issueNumber: 2,
+        identifier: `${prefix}-2`,
+      },
+      {
+        id: willSucceedIssueId,
+        companyId,
+        title: "Recovers normally",
+        status: "todo",
+        priority: "medium",
+        assigneeAgentId: managerId,
+        issueNumber: 3,
+        identifier: `${prefix}-3`,
+      },
+    ]);
+
+    const enqueueWakeup = vi.fn(async (_agentId: string, opts: { payload?: { issueId?: string } }) => {
+      if (opts.payload?.issueId === willThrowIssueId) {
+        throw new Error("simulated wakeup dispatch failure");
+      }
+      return { id: randomUUID() } as never;
+    });
+    const recovery = recoveryService(db, { enqueueWakeup });
+
+    const result = await recovery.reconcileStrandedAssignedIssues();
+
+    // The failing candidate is recorded as failed, not silently dropped...
+    expect(result.failed).toBe(1);
+    expect(result.failedIssueIds).toEqual([willThrowIssueId]);
+    // ...and the sweep still reached and dispatched the other candidate instead
+    // of aborting the whole pass on the first error (the pre-fix behavior).
+    expect(result.assignmentDispatched).toBe(1);
+    expect(result.issueIds).toContain(willSucceedIssueId);
+    expect(result.issueIds).not.toContain(willThrowIssueId);
+    expect(enqueueWakeup).toHaveBeenCalledWith(coderId, expect.objectContaining({
+      payload: expect.objectContaining({ issueId: willThrowIssueId }),
+    }));
+    expect(enqueueWakeup).toHaveBeenCalledWith(managerId, expect.objectContaining({
+      payload: expect.objectContaining({ issueId: willSucceedIssueId }),
+    }));
+  });
 });
