@@ -3046,7 +3046,9 @@ export function recoveryService(
       operatorCancelExempted: 0,
       onboardingFirstTaskExempted: 0,
       skipped: 0,
+      failed: 0,
       issueIds: [] as string[],
+      failedIssueIds: [] as string[],
     };
 
     const candidateIssueIds = candidates.map((issue) => issue.id);
@@ -3074,6 +3076,7 @@ export function recoveryService(
     }
 
     for (const issue of candidates) {
+     try {
       const executionState = issue.status === "in_review"
         ? parseIssueExecutionState(issue.executionState)
         : null;
@@ -3857,6 +3860,22 @@ export function recoveryService(
       } else {
         result.skipped += 1;
       }
+     } catch (err) {
+      // One candidate's recovery must never abort the whole sweep: a single
+      // unrepairable/unwritable row here used to propagate out of this loop,
+      // out of reconcileStrandedAssignedIssues(), and past the single .catch()
+      // wrapping the entire heartbeat recovery chain in index.ts — silently
+      // skipping every later issue, plus dependency-wake, task-watchdog,
+      // silent-active-run, stale-lock, and productivity-review reconciliation
+      // for that whole tick — this is what happened in production on
+      // 2026-09-03.
+      logger.error(
+        { err, issueId: issue.id, identifier: issue.identifier },
+        "reconcileStrandedAssignedIssues: per-issue reconciliation failed, continuing with remaining candidates",
+      );
+      result.failed += 1;
+      result.failedIssueIds.push(issue.id);
+     }
     }
 
     const orphanBlockerRecovery = await reconcileUnassignedBlockingIssues();
