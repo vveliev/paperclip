@@ -1947,13 +1947,6 @@
       "when": 1789390281190,
       "tag": "0279_tired_deathstrike",
       "breakpoints": true
-    },
-    {
-      "idx": 280,
-      "version": "7",
-      "when": 1789754236741,
-      "tag": "0280_blocked_requires_unblock_descriptor",
-      "breakpoints": true
     }
   ]
 }
