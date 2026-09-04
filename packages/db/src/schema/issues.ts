@@ -89,23 +89,19 @@ export const issues = pgTable(
     // including raw SQL, or upstream code this fork doesn't control) that
     // the service layer doesn't.
     //
-    // Enforced by the issues_blocked_descriptor_autofill trigger (migration
-    // 0239), NOT by a CHECK constraint. 0238 used a CHECK; it was replaced
-    // because rejecting the write turned a metadata gap into an outage: on
-    // 2026-09-03 a recovery write parked a stranded issue as blocked without
-    // a descriptor (server/src/services/recovery/service.ts still has at
-    // least one such path -- ensureIssueBlockedByEscalation()), the CHECK
-    // rejected it 63 times over six hours, and because index.ts chains the
-    // recovery stages with a single terminal .catch(), each rejection
-    // aborted the entire pass: no stranded-run recovery, stale-lock sweep,
-    // or productivity reconciliation ran board-wide, with nothing alerting.
+    // Enforced by the issues_blocked_descriptor_autofill trigger, installed by
+    // applyDatabaseInvariants() in packages/db/src/invariants.ts rather than by a
+    // numbered migration. Upstream adds migrations constantly, so a migration this
+    // fork carries collides on its number at nearly every sync; the trigger is
+    // invisible to drizzle snapshots, so the chain never described it anyway.
     //
-    // The trigger keeps the guarantee (no blocked row without a descriptor)
-    // and removes the failure mode (no write can fail because of it). A
-    // brittleness like this can recur at any call site upstream or
-    // downstream adds later, which is exactly what the trigger is for — do
-    // not restore the CHECK without also making it impossible to add a new
-    // descriptor-less write path.
+    // It is a trigger and not a CHECK constraint on purpose. A CHECK rejected the
+    // write, which turned a metadata gap into an outage: a recovery write parked a
+    // stranded issue as blocked without a descriptor, the CHECK rejected it, and
+    // because the recovery stages were chained with a single terminal catch, every
+    // later stage was skipped for that whole tick. Filling the descriptor in keeps
+    // the guarantee and removes the failure mode -- do not restore the CHECK
+    // without also making it impossible to add a descriptor-less write path.
     companyStatusIdx: index("issues_company_status_idx").on(table.companyId, table.status),
     companyHarnessKindIdx: index("issues_company_harness_kind_idx").on(table.companyId, table.harnessKind),
     assigneeStatusIdx: index("issues_company_assignee_status_idx").on(
