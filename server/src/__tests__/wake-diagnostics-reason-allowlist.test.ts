@@ -32,6 +32,12 @@ const KNOWN_DYNAMIC_REASON_SOURCES = new Set([
   // getHeartbeatDailyCapBlock() only ever returns "heartbeat.daily_run_limit" or
   // "heartbeat.daily_cost_limit", both already in the allow-list.
   "dailyCapBlock.reason",
+  // enqueueWake(input) in server/src/services/native-runtime/status-decision-committer.ts
+  // is a file-local helper; every one of its six call sites passes a literal, and all four
+  // distinct values are in the allow-list: "issue_status_changed", "monitor_due",
+  // "issue_children_completed", "issue_blockers_resolved". Traced by hand when upstream's
+  // native status-decision committer landed.
+  "input.reason",
 ]);
 
 function walkTsFiles(dir: string, out: string[] = []): string[] {
