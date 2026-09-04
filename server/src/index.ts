@@ -1535,10 +1535,20 @@ export async function startServer(): Promise<StartedServer> {
         if (!(await heartbeat.resolveSchedulingSuppression()).suppressed) {
           // Periodically reap orphaned runs (5-min staleness threshold) and make sure
           // persisted queued work is still being driven forward.
-          trackHeartbeatSchedulerWork(heartbeat
-            .reapOrphanedRuns({ staleThresholdMs: 5 * 60 * 1000 })
-            .then(() => heartbeat.promoteDueScheduledRetries())
-            .then(async (promotion) => {
+          //
+          // Each stage below is independent of the others, so each runs inside its
+          // own try/catch instead of one shared .then() chain. Before this, a thrown
+          // error at any stage (e.g. one unrepairable issue inside
+          // reconcileStrandedAssignedIssues) propagated straight to the single
+          // .catch() at the end, silently skipping every later stage for the rest
+          // of the tick — issue-graph liveness, task watchdogs, silent-active-run
+          // scanning, stale-lock sweeping, and productivity reviews included —
+          // this is what happened in production on 2026-09-03. A stage failing
+          // now is logged and the sweep still moves on.
+          trackHeartbeatSchedulerWork((async () => {
+            try {
+              await heartbeat.reapOrphanedRuns({ staleThresholdMs: 5 * 60 * 1000 });
+              const promotion = await heartbeat.promoteDueScheduledRetries();
               await heartbeat.resumeQueuedRuns();
               const reconciled = await heartbeat.reconcileStrandedAssignedIssues();
               if (
@@ -1547,47 +1557,63 @@ export async function startServer(): Promise<StartedServer> {
                 reconciled.dispatchRequeued > 0 ||
                 reconciled.continuationRequeued > 0 ||
                 reconciled.successfulRunHandoffEscalated > 0 ||
-                reconciled.escalated > 0
+                reconciled.escalated > 0 ||
+                reconciled.failed > 0
               ) {
                 logger.warn(
                   { promotedScheduledRetries: promotion.promoted, promotedScheduledRetryRunIds: promotion.runIds, ...reconciled },
                   "periodic heartbeat recovery changed assigned issue state",
                 );
               }
-            })
-            .then(async () => {
+            } catch (err) {
+              logger.error({ err }, "periodic heartbeat recovery failed");
+            }
+
+            try {
               const reconciled = await heartbeat.reconcileIssueGraphLiveness();
               if (reconciled.escalationsCreated > 0 || reconciled.dependencyWakesHealed > 0) {
                 logger.warn({ ...reconciled }, "periodic issue-graph liveness reconciliation changed issue graph state");
               }
-            })
-            .then(async () => {
+            } catch (err) {
+              logger.error({ err }, "periodic issue-graph liveness reconciliation failed");
+            }
+
+            try {
               const reconciled = await heartbeat.reconcileTaskWatchdogs();
               if (reconciled.triggered > 0) {
                 logger.warn({ ...reconciled }, "periodic task-watchdog reconciliation triggered watchdog work");
               }
-            })
-            .then(async () => {
+            } catch (err) {
+              logger.error({ err }, "periodic task-watchdog reconciliation failed");
+            }
+
+            try {
               const scanned = await heartbeat.scanSilentActiveRuns();
               if (scanned.created > 0 || scanned.escalated > 0) {
                 logger.warn({ ...scanned }, "periodic active-run output watchdog created review work");
               }
-            })
-            .then(async () => {
+            } catch (err) {
+              logger.error({ err }, "periodic active-run output watchdog failed");
+            }
+
+            try {
               const swept = await heartbeat.sweepStaleIssueLocks();
               if (swept.cleared > 0) {
                 logger.warn({ ...swept }, "periodic stale-lock sweeper cleared issue locks");
               }
-            })
-            .then(async () => {
+            } catch (err) {
+              logger.error({ err }, "periodic stale-lock sweep failed");
+            }
+
+            try {
               const reviewed = await heartbeat.reconcileProductivityReviews();
               if (reviewed.created > 0 || reviewed.updated > 0 || reviewed.failed > 0) {
                 logger.warn({ ...reviewed }, "periodic productivity reconciliation created or updated review work");
               }
-            })
-            .catch((err) => {
-              logger.error({ err }, "periodic heartbeat recovery failed");
-            }));
+            } catch (err) {
+              logger.error({ err }, "periodic productivity reconciliation failed");
+            }
+          })());
         }
       })().catch((err) => {
         logger.error({ err }, "heartbeat scheduler tick failed");
