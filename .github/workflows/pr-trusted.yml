@@ -276,8 +276,19 @@ jobs:
           # do not masquerade as changes made by the PR itself.
           changed="$(git diff --name-only "${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}")"
           if printf '%s\n' "$changed" | grep -qx 'pnpm-lock.yaml'; then
-            echo "Do not commit pnpm-lock.yaml in pull requests. CI owns lockfile updates."
-            exit 1
+            # A merge commit (e.g. syncing in an upstream/base branch) can legitimately
+            # carry lockfile changes that were already reviewed on the branch being
+            # merged in. Only block when a *non-merge* commit on the PR's own
+            # first-parent line touches pnpm-lock.yaml directly -- that is a hand
+            # edit made on this branch, not one inherited via a merge.
+            manual_edits="$(git rev-list --first-parent --no-merges "${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}" -- pnpm-lock.yaml)"
+            if [[ -n "$manual_edits" ]]; then
+              echo "Do not commit pnpm-lock.yaml in pull requests. CI owns lockfile updates."
+              echo "Commits that directly modified pnpm-lock.yaml:"
+              echo "$manual_edits"
+              exit 1
+            fi
+            echo "pnpm-lock.yaml changed only via merge commit(s) inherited from another branch - allowing."
           fi
 
       - name: Setup Node.js for pnpm bootstrap
