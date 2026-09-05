@@ -90,7 +90,16 @@ audit_interval_days="${PAPERCLIP_OWNERSHIP_AUDIT_INTERVAL_DAYS:-7}"
         case "$last" in ''|*[!0-9]*) last=0 ;; esac
         age_days=$(( (now - last) / 86400 ))
         if [ "$age_days" -ge "$audit_interval_days" ]; then
-            mismatches=$(nice -n 19 find "$home_dir" \( ! -user node -o ! -group node \) -print 2>/dev/null)
+            # `|| true` is load-bearing. This script runs under `set -e`, and a bare
+            # `var=$(cmd)` assignment propagates the command's exit status. `find`
+            # exits 1 when it cannot read any single path -- a lost+found, a
+            # directory left behind by another container -- even with stderr
+            # discarded. Without this, the first unreadable path anywhere under
+            # $home_dir kills this subshell before it logs, repairs, or writes the
+            # marker, silently disabling the audit forever. A partial scan that
+            # repairs what it can see is the correct outcome here; the whole point
+            # of this block is to be the backstop that still runs.
+            mismatches=$(nice -n 19 find "$home_dir" \( ! -user node -o ! -group node \) -print 2>/dev/null || true)
             if [ -n "$mismatches" ]; then
                 echo "ownership-audit: mismatched paths found under $home_dir, repairing:" >&2
                 echo "$mismatches" >&2
