@@ -1368,6 +1368,11 @@ export async function startServer(): Promise<StartedServer> {
           logger.warn({ ...swept }, "startup stale-lock sweeper cleared issue locks");
         }
 
+        const recoveryCausesSwept = await heartbeat.sweepRecoveryActionsForResolvedPlatformCauses();
+        if (recoveryCausesSwept.cleared > 0) {
+          logger.warn({ ...recoveryCausesSwept }, "startup recovery-cause sweeper cleared recovery actions");
+        }
+
         const reviewed = await heartbeat.reconcileProductivityReviews();
         if (reviewed.created > 0 || reviewed.updated > 0 || reviewed.failed > 0) {
           logger.warn({ ...reviewed }, "startup productivity reconciliation created or updated review work");
@@ -1630,6 +1635,15 @@ export async function startServer(): Promise<StartedServer> {
               }
             } catch (err) {
               logger.error({ err }, "periodic stale-lock sweep failed");
+            }
+
+            try {
+              const recoveryCausesSwept = await heartbeat.sweepRecoveryActionsForResolvedPlatformCauses();
+              if (recoveryCausesSwept.cleared > 0) {
+                logger.warn({ ...recoveryCausesSwept }, "periodic recovery-cause sweeper cleared recovery actions");
+              }
+            } catch (err) {
+              logger.error({ err }, "periodic recovery-cause sweep failed");
             }
 
             try {
