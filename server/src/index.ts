@@ -1591,6 +1591,17 @@ async function startServerWithDatabaseTeardown(
         } catch (err) {
           logger.error({ err }, "startup stale-lock sweep failed");
         }
+
+        // #37's new stage, written before startup stages were individually
+        // isolated. Wrapped to match: one stage failing must not skip the rest.
+        try {
+          const recoveryCausesSwept = await heartbeat.sweepRecoveryActionsForResolvedPlatformCauses();
+          if (recoveryCausesSwept.cleared > 0) {
+            logger.warn({ ...recoveryCausesSwept }, "startup recovery-cause sweeper cleared recovery actions");
+          }
+        } catch (err) {
+          logger.error({ err }, "startup recovery-cause sweep failed");
+        }
       })().catch((err) => {
         // Each stage above catches its own failure, so anything reaching here is a
         // setup error rather than one stage misbehaving -- hence the narrower name.
@@ -1858,6 +1869,15 @@ async function startServerWithDatabaseTeardown(
               }
             } catch (err) {
               logger.error({ err }, "periodic stale-lock sweep failed");
+            }
+
+            try {
+              const recoveryCausesSwept = await heartbeat.sweepRecoveryActionsForResolvedPlatformCauses();
+              if (recoveryCausesSwept.cleared > 0) {
+                logger.warn({ ...recoveryCausesSwept }, "periodic recovery-cause sweeper cleared recovery actions");
+              }
+            } catch (err) {
+              logger.error({ err }, "periodic recovery-cause sweep failed");
             }
           })());
         }
