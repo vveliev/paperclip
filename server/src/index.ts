@@ -1485,6 +1485,17 @@ export async function startServer(): Promise<StartedServer> {
           logger.error({ err }, "startup stale-lock sweep failed");
         }
 
+        // #37's new stage, written before startup stages were individually
+        // isolated. Wrapped to match: one stage failing must not skip the rest.
+        try {
+          const recoveryCausesSwept = await heartbeat.sweepRecoveryActionsForResolvedPlatformCauses();
+          if (recoveryCausesSwept.cleared > 0) {
+            logger.warn({ ...recoveryCausesSwept }, "startup recovery-cause sweeper cleared recovery actions");
+          }
+        } catch (err) {
+          logger.error({ err }, "startup recovery-cause sweep failed");
+        }
+
         try {
           const reviewed = await heartbeat.reconcileProductivityReviews();
           if (reviewed.created > 0 || reviewed.updated > 0 || reviewed.failed > 0) {
@@ -1758,6 +1769,15 @@ export async function startServer(): Promise<StartedServer> {
               }
             } catch (err) {
               logger.error({ err }, "periodic stale-lock sweep failed");
+            }
+
+            try {
+              const recoveryCausesSwept = await heartbeat.sweepRecoveryActionsForResolvedPlatformCauses();
+              if (recoveryCausesSwept.cleared > 0) {
+                logger.warn({ ...recoveryCausesSwept }, "periodic recovery-cause sweeper cleared recovery actions");
+              }
+            } catch (err) {
+              logger.error({ err }, "periodic recovery-cause sweep failed");
             }
 
             try {
