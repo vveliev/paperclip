@@ -446,13 +446,23 @@ export function issueRecoveryActionService(db: Db) {
         }
         return toReadModel(exhausted);
       }
+      // `preserveExistingOwner` exists to stop a repeat escalation from
+      // clobbering an owner a human already reassigned. It must not also
+      // freeze the *diagnosis* of an issue whose underlying cause has
+      // genuinely changed since the active action was created — e.g. a
+      // `stranded_assigned_issue` row that later gets re-escalated as
+      // `missing_disposition` (BLA-1084). When the cause changes, refresh
+      // the classification fields even under `preserveExistingOwner`; owner
+      // routing still preserves.
+      const causeChanged = existing.cause !== input.cause;
+      const preserveClassification = input.preserveExistingOwner && !causeChanged;
       const [updated] = await db
         .update(issueRecoveryActions)
         .set({
           recoveryIssueId: input.preserveExistingOwner
             ? existing.recoveryIssueId
             : input.recoveryIssueId ?? null,
-          kind: input.preserveExistingOwner ? existing.kind : input.kind,
+          kind: preserveClassification ? existing.kind : input.kind,
           status: input.preserveExistingOwner ? existing.status : "active",
           ownerType: input.preserveExistingOwner ? existing.ownerType : ownerType,
           ownerAgentId: input.preserveExistingOwner
@@ -467,19 +477,19 @@ export function issueRecoveryActionService(db: Db) {
           returnOwnerAgentId: input.preserveExistingOwner
             ? existing.returnOwnerAgentId
             : input.returnOwnerAgentId ?? existing.returnOwnerAgentId,
-          cause: input.preserveExistingOwner ? existing.cause : input.cause,
-          fingerprint: input.preserveExistingOwner ? existing.fingerprint : input.fingerprint,
+          cause: preserveClassification ? existing.cause : input.cause,
+          fingerprint: preserveClassification ? existing.fingerprint : input.fingerprint,
           evidence: input.preserveExistingOwner
             ? {
               ...(existing.evidence ?? {}),
               ...(input.evidence ?? {}),
             }
             : input.evidence ?? existing.evidence,
-          nextAction: input.preserveExistingOwner ? existing.nextAction : input.nextAction,
-          wakePolicy: input.preserveExistingOwner
+          nextAction: preserveClassification ? existing.nextAction : input.nextAction,
+          wakePolicy: preserveClassification
             ? existing.wakePolicy
             : input.wakePolicy ?? null,
-          monitorPolicy: input.preserveExistingOwner
+          monitorPolicy: preserveClassification
             ? existing.monitorPolicy
             : input.monitorPolicy ?? null,
           attemptCount: nextAttemptCount,

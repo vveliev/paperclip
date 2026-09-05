@@ -549,6 +549,60 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(updated.evidence).not.toHaveProperty("routingPolicy");
   });
 
+  it("refreshes kind/nextAction/cause when the recovery cause changes, even under preserveExistingOwner (BLA-1084)", async () => {
+    const { companyId, managerId, coderId, sourceIssueId } = await seedCompany();
+    const svc = issueRecoveryActionService(db);
+    const original = await svc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "stranded_assigned_issue",
+      ownerType: "board",
+      ownerAgentId: null,
+      previousOwnerAgentId: coderId,
+      returnOwnerAgentId: coderId,
+      cause: "stranded_assigned_issue",
+      fingerprint: "source_scoped_recovery:stranded_assigned_issue",
+      evidence: { latestRunId: "run-1" },
+      nextAction: "Board operator: inspect the evidence, repair the runtime if appropriate, then explicitly retry the original owner, reassign, or intentionally resolve the task.",
+      attemptCount: 1,
+    });
+    expect(original.ownerAgentId).toBeNull();
+
+    // A human reassigns the escalation to themselves before the cause is
+    // reclassified, so ownerAgentId on the row diverges from `board`.
+    await db
+      .update(issueRecoveryActions)
+      .set({ ownerType: "agent", ownerAgentId: managerId })
+      .where(eq(issueRecoveryActions.id, original.id));
+
+    const reescalated = await svc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "missing_disposition",
+      ownerType: "board",
+      ownerAgentId: null,
+      previousOwnerAgentId: coderId,
+      returnOwnerAgentId: coderId,
+      cause: "successful_run_missing_issue_disposition",
+      fingerprint: "source_scoped_recovery:successful_run_missing_issue_disposition",
+      evidence: { latestRunId: "run-2" },
+      nextAction: "Board operator: inspect the run evidence, then explicitly choose a valid issue disposition, retry the original owner, reassign, or intentionally resolve the task.",
+      preserveExistingOwner: true,
+    });
+
+    expect(reescalated).toMatchObject({
+      id: original.id,
+      // Classification reflects the newly detected cause...
+      kind: "missing_disposition",
+      cause: "successful_run_missing_issue_disposition",
+      fingerprint: "source_scoped_recovery:successful_run_missing_issue_disposition",
+      nextAction: "Board operator: inspect the run evidence, then explicitly choose a valid issue disposition, retry the original owner, reassign, or intentionally resolve the task.",
+      // ...while the owner a human already set is left alone.
+      ownerType: "agent",
+      ownerAgentId: managerId,
+    });
+  });
+
   it("escalates stranded assigned work into a source action instead of a recovery issue", async () => {
     const { companyId, coderId, sourceIssue } = await seedCompany();
     const enqueueWakeup = vi.fn(async () => null);
