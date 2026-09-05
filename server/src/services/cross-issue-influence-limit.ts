@@ -27,10 +27,10 @@ export type CrossIssueInfluenceDecision = {
   enforceAt: string;
 };
 
-export function crossIssueInfluenceRunContextError() {
+export function crossIssueInfluenceRunContextError(runId?: string | null) {
   // Copy comes from the shared issue-write denial contract (the open cross-task write design (failure UX))
   // so the agent reading this 403 is told the fix, not just the refusal.
-  const { body } = issueWriteDenialResponse("cross_issue_influence_run_context_required");
+  const { body } = issueWriteDenialResponse("cross_issue_influence_run_context_required", { runId });
   return forbidden(body.error, body.details);
 }
 
@@ -82,7 +82,7 @@ export async function observeCrossIssueInfluence(
 ): Promise<CrossIssueInfluenceDecision | null> {
   // API-key callers control the run header. Reject malformed UUIDs before the
   // database can turn an untrusted identifier into a PostgreSQL cast error.
-  if (!isUuidLike(input.runId)) throw crossIssueInfluenceRunContextError();
+  if (!isUuidLike(input.runId)) throw crossIssueInfluenceRunContextError(input.runId);
 
   return db.transaction(async (tx) => {
     const run = await tx
@@ -106,7 +106,7 @@ export async function observeCrossIssueInfluence(
       run.companyId !== input.companyId ||
       run.agentId !== input.agentId
     ) {
-      throw crossIssueInfluenceRunContextError();
+      throw crossIssueInfluenceRunContextError(input.runId);
     }
 
     const sourceIssueId = readRunSourceIssueId(run.contextSnapshot);

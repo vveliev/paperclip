@@ -3938,7 +3938,7 @@ export function issueRoutes(
   ) {
     if (req.actor.type !== "agent") return true;
     if (!req.actor.agentId || !req.actor.runId)
-      throw crossIssueInfluenceRunContextError();
+      throw crossIssueInfluenceRunContextError(req.actor.runId);
 
     // The counter transaction locks and validates the persisted run before it
     // derives the source issue. Never trust the API-key run header by itself.
