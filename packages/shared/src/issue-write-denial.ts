@@ -75,6 +75,8 @@ export interface IssueWriteDenialContext {
   count?: number | null;
   /** ISO timestamp at which log-only rollout becomes enforcement. */
   enforceAt?: string | null;
+  /** The requesting heartbeat run's own id, when one is known. */
+  runId?: string | null;
 }
 
 export function isIssueWriteDenialCode(
@@ -244,7 +246,11 @@ export function describeIssueWriteDenial(
       };
     }
 
-    case "cross_issue_influence_run_context_required":
+    case "cross_issue_influence_run_context_required": {
+      const trimmedRunId = context.runId?.trim();
+      const runIdHint = trimmedRunId
+        ? `\`${trimmedRunId}\``
+        : "the `$PAPERCLIP_RUN_ID` value from your run environment";
       return {
         code,
         status: 403,
@@ -257,10 +263,10 @@ export function describeIssueWriteDenial(
           `This request arrived without a valid run, so it could not be contained.`,
         whoCanAct: `${actor}, once the request carries its own run id.`,
         sanctionedPath:
-          `Send the \`X-Paperclip-Run-Id\` header with your current run (\`$PAPERCLIP_RUN_ID\`) ` +
+          `Send the \`X-Paperclip-Run-Id\` header with your current run (${runIdHint}) ` +
           `and retry.`,
-
       };
+    }
 
     case "issue_write_attribution_spoof_rejected":
       return {
