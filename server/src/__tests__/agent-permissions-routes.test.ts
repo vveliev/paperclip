@@ -429,6 +429,49 @@ describe.sequential("agent permission routes", () => {
     expect(res.body.runtimeConfig).toEqual({});
   }, 20_000);
 
+  it("redacts peer agent detail for an agent actor without an agent_config:read grant", async () => {
+    const peerAgentId = "55555555-5555-4555-8555-555555555555";
+    const peerAgent = {
+      ...baseAgent,
+      id: peerAgentId,
+      adapterConfig: {
+        command: "pnpm agent:run",
+        env: { PAPERCLIP_API_KEY: "secret-test-key" },
+      },
+      runtimeConfig: {
+        modelProfiles: {
+          default: { enabled: true, adapterConfig: { model: "openai/gpt-5.4-mini" } },
+        },
+      },
+    };
+    mockAgentService.getById.mockImplementation(async (id: string) => {
+      if (id === peerAgentId) return peerAgent;
+      if (id === agentId) return { ...baseAgent, permissions: { canCreateAgents: false } };
+      return null;
+    });
+    mockAccessService.decide.mockImplementation(async (input: { action?: string }) => ({
+      allowed: input.action === "agent:read",
+      reason: input.action === "agent:read" ? "allow_test_read" : "deny_missing_grant",
+      explanation: input.action === "agent:read" ? "Allowed by test read grant." : "Missing agent_config:read grant.",
+    }));
+
+    const app = await createApp({
+      type: "agent",
+      agentId,
+      companyId,
+      runId: "run-1",
+      source: "agent_key",
+    });
+
+    const res = await requestApp(app, (baseUrl) => request(baseUrl).get(`/api/agents/${peerAgentId}`));
+
+    expect(res.status).toBe(200);
+    expect(res.body.adapterConfig).toEqual({});
+    expect(res.body.runtimeConfig).toEqual({});
+    expect(res.body.adapterConfigRedacted).toBe(true);
+    expect(res.body.runtimeConfigRedacted).toBe(true);
+  }, 20_000);
+
   it("redacts env values in board agent detail responses", async () => {
     const plaintextValue = "plain-value-must-not-leak";
     mockAgentService.getById.mockResolvedValue({
@@ -482,6 +525,8 @@ describe.sequential("agent permission routes", () => {
       heartbeat: { enabled: false },
     });
     expect(res.body.permissions).toMatchObject({ trustPreset: LOW_TRUST_REVIEW_PRESET });
+    expect(res.body.adapterConfigRedacted).toBeUndefined();
+    expect(res.body.runtimeConfigRedacted).toBeUndefined();
   }, 20_000);
 
   // TEC-7032 reported the leak against the company agent-list endpoint, which
@@ -675,6 +720,42 @@ describe.sequential("agent permission routes", () => {
         id: agentId,
         adapterConfig: {},
         runtimeConfig: {},
+      }),
+    ]);
+  });
+
+  it("redacts company agent list for an agent actor without an agent_config:read grant", async () => {
+    mockAgentService.list.mockResolvedValue([
+      {
+        ...baseAgent,
+        adapterConfig: { command: "pnpm agent:run" },
+        runtimeConfig: { modelProfiles: { default: { enabled: true } } },
+      },
+    ]);
+    mockAccessService.decide.mockImplementation(async (input: { action?: string }) => ({
+      allowed: input.action === "agent:read",
+      reason: input.action === "agent:read" ? "allow_test_read" : "deny_missing_grant",
+      explanation: input.action === "agent:read" ? "Allowed by test read grant." : "Missing agent_config:read grant.",
+    }));
+
+    const app = await createApp({
+      type: "agent",
+      agentId,
+      companyId,
+      runId: "run-1",
+      source: "agent_key",
+    });
+
+    const res = await requestApp(app, (baseUrl) => request(baseUrl).get(`/api/companies/${companyId}/agents`));
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual([
+      expect.objectContaining({
+        id: agentId,
+        adapterConfig: {},
+        runtimeConfig: {},
+        adapterConfigRedacted: true,
+        runtimeConfigRedacted: true,
       }),
     ]);
   });
