@@ -7544,8 +7544,9 @@ export function issueService(db: Db) {
         if (values.status === "cancelled") {
           values.cancelledAt = new Date();
         }
-        // The DB check constraint (issues_blocked_requires_unblock_descriptor_check)
-        // requires a non-null unblockDescriptor on every blocked row unconditionally.
+        // The issues_blocked_descriptor_autofill trigger (packages/db/src/invariants.ts)
+        // guarantees a non-null unblockDescriptor on every blocked row. Set one here so
+        // the value is the caller's intent rather than the trigger's generic fallback.
         // update() already synthesizes one when a caller relies on blockedByIssueIds
         // instead of an explicit descriptor; mirror that here so creating an issue
         // directly in "blocked" status doesn't fail the insert with a raw Postgres
@@ -7993,14 +7994,29 @@ export function issueService(db: Db) {
                 )).limit(1).then((rows: Array<{ approvalId: string }>) => rows[0] ?? null),
             ]);
           if (!hasUnresolvedBlocker && !pendingInteraction && !pendingApproval) {
-            throw unprocessable(
-              "status=blocked requires a non-null unblockDescriptor with an owner and a non-empty action, "
-              + "or an unresolved blocker/pending interaction/approval to justify the block",
+            // This used to throw. Rejecting the write is the wrong response to a
+            // missing premise, and it has cost an outage once already: a recovery
+            // sweep parked a stranded issue as blocked with no descriptor, the
+            // rejection propagated, and every later recovery stage was skipped for
+            // the rest of that tick. See packages/db/src/invariants.ts.
+            //
+            // It also does not stay fixed. Upstream keeps adding paths that block
+            // without a descriptor -- the agent.task_run telemetry work is the most
+            // recent -- and this fork re-inherits each one on the next sync. Patching
+            // call sites one at a time is divergence a future merge silently undoes.
+            //
+            // The database trigger already fills the gap rather than rejecting. This
+            // makes the application layer agree, so both guarantee the same thing: a
+            // blocked issue always carries an owner and an action. The synthesized
+            // descriptor is honest that nobody supplied one.
+            logger.warn(
+              { issueId: id, companyId: existing.companyId },
+              "issue moved to blocked with no unblock premise; descriptor auto-filled",
             );
           }
-          // The DB check constraint (issues_blocked_requires_unblock_descriptor_check)
-          // requires a non-null unblockDescriptor on every blocked row unconditionally —
-          // it has no notion of "justified by a blocker/interaction/approval instead".
+          // The issues_blocked_descriptor_autofill trigger guarantees a non-null
+          // unblockDescriptor on every blocked row, but it has no notion of "justified by
+          // a blocker/interaction/approval instead".
           // Synthesize one here so a caller that relies on that alternate justification
           // (and never sets unblockDescriptor itself) doesn't fail the write with a raw
           // Postgres constraint violation instead of succeeding as this validation intends.
@@ -8010,7 +8026,15 @@ export function issueService(db: Db) {
               ? "Waiting on an unresolved blocker; this will continue automatically once it resolves."
               : pendingInteraction
                 ? "Waiting on a pending issue-thread interaction response."
-                : "Waiting on a pending approval decision.",
+                : pendingApproval
+                  ? "Waiting on a pending approval decision."
+                  // Nothing justified the block. Say so, rather than attributing it to
+                  // an approval that is not pending.
+                  : "Auto-filled: a write set this issue to blocked without recording an unblock "
+                    + "premise, and no blocker, interaction, or approval justified the block. "
+                    + "Nothing can re-check this automatically. Inspect the issue's run evidence "
+                    + "and comments, then either replace this descriptor with the real premise "
+                    + "and owner, or move the issue out of blocked.",
           };
         }
       }

@@ -1851,9 +1851,10 @@ export function recoveryService(
       {
         status: "blocked",
         blockedByIssueIds,
-        // BLA-687: the DB check constraint requires a non-null unblockDescriptor
-        // on every blocked row regardless of whether blockedByIssueIds also
-        // justifies the block at the app-validation layer.
+        // BLA-687: the issues_blocked_descriptor_autofill trigger guarantees a
+        // non-null unblockDescriptor on every blocked row regardless of whether
+        // blockedByIssueIds also justifies the block. Set a real one here so the
+        // reason is this call site's, not the trigger's generic fallback.
         unblockDescriptor: {
           owner: "board",
           action: `Waiting on ${waitingOn} to finish; this will continue automatically once they resolve.`,
@@ -2302,9 +2303,10 @@ export function recoveryService(
               ...blockerIds,
               ...healthyChildren.map((child) => child.id),
             ])],
-            // BLA-687: the DB check constraint requires a non-null unblockDescriptor
-            // on every blocked row regardless of whether blockedByIssueIds also
-            // justifies the block at the app-validation layer.
+            // BLA-687: the issues_blocked_descriptor_autofill trigger guarantees a
+            // non-null unblockDescriptor on every blocked row regardless of whether
+            // blockedByIssueIds also justifies the block. Set a real one here so the
+            // reason is this call site's, not the trigger's generic fallback.
             unblockDescriptor: {
               owner: "board",
               action: "Waiting on open sub-tasks to finish; this will continue automatically once they resolve.",
