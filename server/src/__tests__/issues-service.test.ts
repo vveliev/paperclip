@@ -6274,7 +6274,7 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
   });
 });
 
-describeEmbeddedPostgres("issueService.update blocked requires unblockDescriptor (BLA-687)", () => {
+describeEmbeddedPostgres("issueService.update guarantees an unblockDescriptor on blocked (BLA-687)", () => {
   let db!: ReturnType<typeof createDb>;
   let svc!: ReturnType<typeof issueService>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
@@ -6334,16 +6334,29 @@ describeEmbeddedPostgres("issueService.update blocked requires unblockDescriptor
     return issueId;
   }
 
-  it("rejects a bare PATCH to blocked with no unblockDescriptor and no blocker", async () => {
+  it("auto-fills the descriptor for a bare PATCH to blocked with no blocker", async () => {
+    // This used to reject. Rejecting cost an outage once -- a recovery sweep parked
+    // a stranded issue as blocked with no descriptor, the rejection propagated, and
+    // every later recovery stage was skipped for that tick -- and upstream keeps
+    // adding descriptor-less blocked writes that this fork re-inherits on each sync.
+    // The write now succeeds with a synthesized descriptor, matching what the
+    // database trigger already does, so the invariant holds without a single caller
+    // being able to wedge the recovery sweep.
     const issueId = await insertIssue("todo");
 
-    await expect(svc.update(issueId, { status: "blocked" })).rejects.toThrow(
-      /status=blocked requires a non-null unblockDescriptor/,
-    );
+    const updated = await svc.update(issueId, { status: "blocked" });
 
+    expect(updated?.status).toBe("blocked");
     const row = await db.select({ status: issues.status, unblockDescriptor: issues.unblockDescriptor })
       .from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]);
-    expect(row).toEqual({ status: "todo", unblockDescriptor: null });
+    expect(row?.status).toBe("blocked");
+    // The invariant still holds: never a blocked row without an owner and an action.
+    expect((row?.unblockDescriptor as { owner?: unknown })?.owner).toBe("board");
+    const action = String((row?.unblockDescriptor as { action?: unknown })?.action);
+    expect(action).toContain("Auto-filled");
+    // And it is honest that nothing justified the block, rather than naming an
+    // approval or blocker that does not exist.
+    expect(action).not.toContain("Waiting on a pending approval");
   });
 
   it("accepts entering blocked with a valid unblockDescriptor", async () => {
@@ -6411,11 +6424,16 @@ describeEmbeddedPostgres("issueService.update blocked requires unblockDescriptor
       blockedTransitionAt: new Date(),
     });
 
-    // Explicitly clearing the descriptor while re-asserting blocked with no
-    // other justification must be rejected, not silently accepted.
-    await expect(svc.update(issueId, { status: "blocked", unblockDescriptor: null })).rejects.toThrow(
-      /status=blocked requires a non-null unblockDescriptor/,
-    );
+    // Clearing the descriptor while re-asserting blocked leaves the issue with no
+    // premise. The write is accepted, but the invariant still holds: a descriptor is
+    // synthesized rather than the row being left bare or the write rejected.
+    const updated = await svc.update(issueId, { status: "blocked", unblockDescriptor: null });
+
+    expect(updated?.status).toBe("blocked");
+    const row = await db.select({ unblockDescriptor: issues.unblockDescriptor })
+      .from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]);
+    expect(row?.unblockDescriptor).not.toBeNull();
+    expect(String((row?.unblockDescriptor as { action?: unknown })?.action)).toContain("Auto-filled");
   });
 
   it("rejects a PATCH to blocked with a valid descriptor but no assignee (GIF-66)", async () => {
