@@ -18,10 +18,12 @@ import {
   issueAttachments,
   issueComments,
   issueApprovals,
+  issueLabels,
   issueRecoveryActions,
   issueRelations,
   issueThreadInteractions,
   issues,
+  labels,
   nativeRunFinalizations,
 } from "@paperclipai/db";
 import { parseObject, asBoolean, asNumber } from "../../adapters/utils.js";
@@ -90,6 +92,21 @@ export const ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS = 60 * 60 * 1000;
 export const ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS = 4 * 60 * 60 * 1000;
 export const ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS = 30 * 60 * 1000;
 const STRANDED_ISSUE_RECOVERY_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.strandedIssueRecovery;
+const STALE_ACTIVE_RUN_EVALUATION_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.staleActiveRunEvaluation;
+// BLA-1077: a label named "recovery-cause:<cause>" on a platform/tooling issue
+// declares that issue as a known producer of that recovery `cause`. When such
+// an issue closes `done`, the sweep below re-checks every active recovery
+// action with a matching cause instead of waiting for the lazy per-read
+// expiry (BLA-1074) to time it out.
+const RECOVERY_CAUSE_LABEL_PREFIX = "recovery-cause:";
+
+// Upstream removed this file's local copy of the predicate when it extracted the
+// active-run watchdog into its own module. The sweep below still needs it, and the
+// convention in this codebase is a small local copy per service (see issues.ts,
+// task-watchdogs.ts, issue-thread-interactions.ts) rather than a shared import.
+function isTerminalIssueStatus(status: string | null | undefined) {
+  return status === "done" || status === "cancelled";
+}
 const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
 const EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON = "execution_review_participant_recovery";
 const STRANDED_BOARD_ESCALATION_POLICY = "board_escalation_no_takeover_v1";
@@ -287,6 +304,28 @@ function resolveStrandedRecoveryCause(
   }
   return "stranded_assigned_issue";
 }
+
+export function recoveryCauseFromLabelName(name: string): string | null {
+  if (!name.startsWith(RECOVERY_CAUSE_LABEL_PREFIX)) return null;
+  const cause = name.slice(RECOVERY_CAUSE_LABEL_PREFIX.length).trim();
+  return cause.length > 0 ? cause : null;
+}
+
+export type RecoveryCauseSweepCandidate = {
+  recoveryActionId: string;
+  sourceIssueId: string;
+  sourceIssueIdentifier: string | null;
+  cause: string;
+  resolvedByIssueId: string;
+  resolvedByIssueIdentifier: string | null;
+};
+
+export type RecoveryCauseSweepResult = {
+  candidates: RecoveryCauseSweepCandidate[];
+  cleared: number;
+  woken: number;
+  failed: number;
+};
 
 function readWorkspaceValidationPayload(latestRun: LatestIssueRun): Record<string, unknown> | null {
   const payload = parseObject(parseObject(latestRun?.resultJson).workspaceValidation);
@@ -4345,6 +4384,207 @@ export function recoveryService(
     return result;
   }
 
+  // BLA-1077: when a platform/tooling issue that produces a recovery `cause`
+  // closes `done`, re-check every active recovery action with that cause
+  // right away instead of waiting on the lazy per-read expiry (BLA-1074) or a
+  // fresh read of that specific issue. Only plain `active` rows with no
+  // `maxAttempts` are eligible — the same exemptions `isExpiredActiveRow`
+  // applies: `escalated` means a human already owns the flag (auto-clearing
+  // would silently take back a deliberate hand-off), and a non-null
+  // `maxAttempts` means a bounded retry loop already owns re-evaluation.
+  // Reports the full candidate list (and logs it) before clearing anything,
+  // so a bad cause/label match is visible before it unsticks issues that may
+  // be legitimately held.
+  async function sweepRecoveryActionsForResolvedPlatformCauses(): Promise<RecoveryCauseSweepResult> {
+    const eligibleRows = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(and(eq(issueRecoveryActions.status, "active"), isNull(issueRecoveryActions.maxAttempts)));
+
+    if (eligibleRows.length === 0) {
+      return { candidates: [], cleared: 0, woken: 0, failed: 0 };
+    }
+
+    const causesByCompany = new Map<string, Set<string>>();
+    for (const row of eligibleRows) {
+      const set = causesByCompany.get(row.companyId) ?? new Set<string>();
+      set.add(row.cause);
+      causesByCompany.set(row.companyId, set);
+    }
+
+    // companyId -> cause -> the (most recently completed) resolving issue.
+    const resolvedCauseIssues = new Map<string, Map<string, { id: string; identifier: string | null }>>();
+    for (const [companyId, causes] of causesByCompany) {
+      const rows = await db
+        .select({
+          issueId: issues.id,
+          identifier: issues.identifier,
+          completedAt: issues.completedAt,
+          labelName: labels.name,
+        })
+        .from(issueLabels)
+        .innerJoin(labels, eq(issueLabels.labelId, labels.id))
+        .innerJoin(issues, eq(issueLabels.issueId, issues.id))
+        .where(
+          and(
+            eq(issues.companyId, companyId),
+            eq(issues.status, "done"),
+            sql`${labels.name} LIKE ${`${RECOVERY_CAUSE_LABEL_PREFIX}%`}`,
+          ),
+        )
+        .orderBy(desc(issues.completedAt));
+
+      const byCause = new Map<string, { id: string; identifier: string | null }>();
+      for (const row of rows) {
+        const cause = recoveryCauseFromLabelName(row.labelName);
+        if (!cause || !causes.has(cause) || byCause.has(cause)) continue;
+        byCause.set(cause, { id: row.issueId, identifier: row.identifier });
+      }
+      if (byCause.size > 0) resolvedCauseIssues.set(companyId, byCause);
+    }
+
+    const candidates: RecoveryCauseSweepCandidate[] = [];
+    for (const row of eligibleRows) {
+      const resolved = resolvedCauseIssues.get(row.companyId)?.get(row.cause);
+      if (!resolved) continue;
+      candidates.push({
+        recoveryActionId: row.id,
+        sourceIssueId: row.sourceIssueId,
+        sourceIssueIdentifier: null,
+        cause: row.cause,
+        resolvedByIssueId: resolved.id,
+        resolvedByIssueIdentifier: resolved.identifier,
+      });
+    }
+
+    if (candidates.length === 0) {
+      return { candidates: [], cleared: 0, woken: 0, failed: 0 };
+    }
+
+    const sourceIssues = await db
+      .select({
+        id: issues.id,
+        identifier: issues.identifier,
+        companyId: issues.companyId,
+        status: issues.status,
+        assigneeAgentId: issues.assigneeAgentId,
+      })
+      .from(issues)
+      .where(inArray(issues.id, candidates.map((candidate) => candidate.sourceIssueId)));
+    const sourceIssueById = new Map(sourceIssues.map((issue) => [issue.id, issue]));
+    for (const candidate of candidates) {
+      candidate.sourceIssueIdentifier = sourceIssueById.get(candidate.sourceIssueId)?.identifier ?? null;
+    }
+
+    // Report before mutating: the full candidate list is logged in one shot,
+    // before the loop below resolves or comments on a single row.
+    logger.warn(
+      {
+        candidateCount: candidates.length,
+        candidates: candidates.map((candidate) => ({
+          recoveryActionId: candidate.recoveryActionId,
+          sourceIssue: candidate.sourceIssueIdentifier ?? candidate.sourceIssueId,
+          cause: candidate.cause,
+          resolvedBy: candidate.resolvedByIssueIdentifier ?? candidate.resolvedByIssueId,
+        })),
+      },
+      "recovery-cause sweep: clearing recovery actions whose platform cause just closed done",
+    );
+
+    let cleared = 0;
+    let woken = 0;
+    let failed = 0;
+    for (const candidate of candidates) {
+      const sourceIssue = sourceIssueById.get(candidate.sourceIssueId);
+      if (!sourceIssue) {
+        failed += 1;
+        continue;
+      }
+      try {
+        const resolvedAction = await recoveryActionsSvc.resolveActiveForIssue({
+          companyId: sourceIssue.companyId,
+          sourceIssueId: candidate.sourceIssueId,
+          actionId: candidate.recoveryActionId,
+          cause: candidate.cause,
+          status: "resolved",
+          outcome: "restored",
+          resolutionNote:
+            `Cleared by the recovery-cause sweep: ${candidate.resolvedByIssueIdentifier ?? candidate.resolvedByIssueId} ` +
+            `closed done and is labeled "${RECOVERY_CAUSE_LABEL_PREFIX}${candidate.cause}", the known cause of this action.`,
+        });
+        // Another writer already resolved this row between the report and
+        // this write (e.g. a natural lazy expiry raced it) — not a failure.
+        if (!resolvedAction) continue;
+        cleared += 1;
+
+        await logActivity(db, {
+          companyId: sourceIssue.companyId,
+          actorType: "system",
+          actorId: "recovery",
+          agentId: null,
+          runId: null,
+          action: "issue.recovery_cause_swept",
+          entityType: "issue_recovery_action",
+          entityId: candidate.recoveryActionId,
+          details: {
+            sourceIssueId: candidate.sourceIssueId,
+            sourceIdentifier: candidate.sourceIssueIdentifier,
+            cause: candidate.cause,
+            resolvedByIssueId: candidate.resolvedByIssueId,
+            resolvedByIssueIdentifier: candidate.resolvedByIssueIdentifier,
+          },
+        });
+
+        const prefix = await getCompanyIssuePrefix(sourceIssue.companyId);
+        await issuesSvc.addComment(
+          candidate.sourceIssueId,
+          [
+            "## Recovery flag cleared",
+            "",
+            `${issueUiLink({ identifier: candidate.resolvedByIssueIdentifier, id: candidate.resolvedByIssueId }, prefix)} closed \`done\` and is labeled as the known cause of this issue's \`${candidate.cause}\` recovery flag.`,
+            "",
+            "Cleared it immediately instead of waiting out the expiry window; re-checking now.",
+          ].join("\n"),
+          {},
+        );
+
+        if (sourceIssue.assigneeAgentId && !isTerminalIssueStatus(sourceIssue.status)) {
+          const agent = await getAgent(sourceIssue.assigneeAgentId);
+          if (agent && agent.companyId === sourceIssue.companyId && (await isAgentInvokable(agent))) {
+            const queued = await deps.enqueueWakeup(agent.id, {
+              source: "automation",
+              triggerDetail: "system",
+              reason: "issue_recovery_cause_resolved",
+              payload: withRecoveryContext({
+                issueId: candidate.sourceIssueId,
+                mutation: "recovery_cause_sweep",
+                cause: candidate.cause,
+                resolvedByIssueId: candidate.resolvedByIssueId,
+              }, "normal_model"),
+              requestedByActorType: "system",
+              requestedByActorId: null,
+              contextSnapshot: withRecoveryContext({
+                issueId: candidate.sourceIssueId,
+                taskId: candidate.sourceIssueId,
+                wakeReason: "issue_recovery_cause_resolved",
+                source: "recovery.sweep_resolved_platform_cause",
+              }, "normal_model"),
+            });
+            if (queued) woken += 1;
+          }
+        }
+      } catch (err) {
+        failed += 1;
+        logger.error(
+          { err, recoveryActionId: candidate.recoveryActionId },
+          "recovery-cause sweep failed to clear an action",
+        );
+      }
+    }
+
+    return { candidates, cleared, woken, failed };
+  }
+
   return {
     buildRunOutputSilence,
     escalateStrandedRecoveryIssueInPlace,
@@ -4353,6 +4593,7 @@ export function recoveryService(
     scanSilentActiveRuns,
     reconcileStrandedAssignedIssues,
     sweepStaleIssueLocks,
+    sweepRecoveryActionsForResolvedPlatformCauses,
     reconcileResolvedDependencyWakeBackstop,
     readRecoveryTimerIntervalMs,
   };
