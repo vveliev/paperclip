@@ -608,6 +608,15 @@ export const updateIssueSchema = objectWithoutDefaults(
   resume: z.boolean().optional(),
   interrupt: z.boolean().optional(),
   hiddenAt: z.string().datetime().nullable().optional(),
+  // Shorthand for re-arming/clearing an issue monitor without restating the
+  // full executionPolicy.monitor object (kind/serviceName/externalRef/etc).
+  // `monitorNextCheckAt: null` explicitly clears the monitor; a datetime
+  // (re)schedules it, preserving whatever monitor metadata the issue already
+  // carries. See BLA-933: these previously round-tripped as a silent no-op
+  // because they weren't declared on this schema, so Zod stripped them
+  // before the route handler ever saw them.
+  monitorNextCheckAt: z.string().datetime().nullable().optional(),
+  monitorNotes: z.string().max(500).nullable().optional(),
 });
 
 export type UpdateIssue = z.infer<typeof updateIssueSchema>;

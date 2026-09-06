@@ -698,6 +698,108 @@ describe("issue execution policy routes", () => {
     );
   });
 
+  // BLA-933: a PATCH sent with the monitorNextCheckAt/monitorNotes shorthand
+  // (mirroring the real column/state field names) used to validate as HTTP 200
+  // but silently drop both fields -- they weren't declared on the update
+  // schema, so Zod stripped them before the route handler ever saw them, and
+  // the monitor stayed stuck at status "triggered" forever after its first
+  // fire. This reproduces that exact repro shape (BLA-879: status=triggered,
+  // attemptCount=2, lastTriggeredAt set) and asserts the monitor is actually
+  // re-armed: status back to "scheduled", the new nextCheckAt/notes applied,
+  // and prior monitor metadata (kind/serviceName/externalRef/scheduledBy)
+  // and attemptCount preserved rather than reset.
+  it("re-arms a triggered monitor via the monitorNextCheckAt/monitorNotes shorthand", async () => {
+    const triggeredAt = "2026-08-31T13:50:00.686Z";
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      status: "in_progress",
+      assigneeAgentId: "33333333-3333-4333-8333-333333333333",
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "PAP-1055",
+      title: "External review monitor",
+      executionPolicy: null,
+      executionState: {
+        status: "idle",
+        currentStageId: null,
+        currentStageIndex: null,
+        currentStageType: null,
+        currentParticipant: null,
+        returnAssignee: null,
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+        monitor: {
+          status: "triggered",
+          nextCheckAt: null,
+          lastTriggeredAt: triggeredAt,
+          attemptCount: 2,
+          notes: "Waiting on CI to go green.",
+          scheduledBy: "assignee",
+          kind: "external_service",
+          serviceName: "github-actions",
+          externalRef: "[redacted]",
+          timeoutAt: null,
+          maxAttempts: null,
+          recoveryPolicy: null,
+          clearedAt: null,
+          clearReason: null,
+        },
+      },
+      monitorAttemptCount: 2,
+      monitorNextCheckAt: null,
+      monitorLastTriggeredAt: new Date(triggeredAt),
+      monitorNotes: "Waiting on CI to go green.",
+      monitorScheduledBy: "assignee",
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+      updatedAt: new Date(),
+    }));
+
+    const res = await request(await createApp({
+      type: "agent",
+      agentId: "33333333-3333-4333-8333-333333333333",
+      companyId: "company-1",
+      runId: "55555555-5555-4555-8555-555555555555",
+    }))
+      .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+      .send({
+        monitorNextCheckAt: "2026-09-07T18:00:00.000Z",
+        monitorNotes: "Re-armed: check the PR status again.",
+      });
+
+    expect(res.status).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      expect.objectContaining({
+        monitorNextCheckAt: new Date("2026-09-07T18:00:00.000Z"),
+        monitorNotes: "Re-armed: check the PR status again.",
+        executionState: expect.objectContaining({
+          monitor: expect.objectContaining({
+            status: "scheduled",
+            nextCheckAt: "2026-09-07T18:00:00.000Z",
+            notes: "Re-armed: check the PR status again.",
+            attemptCount: 2,
+            lastTriggeredAt: triggeredAt,
+            scheduledBy: "assignee",
+            kind: "external_service",
+            serviceName: "github-actions",
+          }),
+        }),
+      }),
+    );
+    // The raw shorthand fields must never leak straight onto the update
+    // patch as literal columns (they aren't Date objects and bypass the
+    // policy transition) -- they're translated into executionPolicy /
+    // executionState above instead.
+    const patchArg = mockIssueService.update.mock.calls[0][1] as Record<string, unknown>;
+    expect(patchArg.monitorNextCheckAt).toBeInstanceOf(Date);
+  });
+
   it("allows board-authored in_review repair updates without a review path", async () => {
     const issue = {
       id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",

@@ -226,6 +226,7 @@ import {
 } from "../services/company-search-rate-limit.js";
 import {
   applyIssueExecutionPolicyTransition,
+  buildIssueExecutionPolicyFromRawMonitorFields,
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
   redactIssueMonitorExternalRef,
@@ -10102,12 +10103,20 @@ export function issueRoutes(
     const requestedAssigneeAgentId =
       normalizedAssigneeAgentId === undefined ? existing.assigneeAgentId : normalizedAssigneeAgentId;
     const explicitMoveToTodoRequested = reopenRequested || resumeRequested === true;
+    // The monitorNextCheckAt/monitorNotes shorthand (BLA-933) is translated into an
+    // executionPolicy update further down; every gate that keys off "did this request
+    // touch the monitor" needs to treat that shorthand the same as an explicit
+    // executionPolicy so it isn't silently exempted from authorization/recovery checks.
+    const monitorRequestBodyTouched =
+      req.body.executionPolicy !== undefined ||
+      req.body.monitorNextCheckAt !== undefined ||
+      req.body.monitorNotes !== undefined;
     const recoveryRelevantSourceMutationRequested =
       req.body.status !== undefined ||
       normalizedAssigneeAgentId !== undefined ||
       req.body.assigneeUserId !== undefined ||
       Array.isArray(req.body.blockedByIssueIds) ||
-      req.body.executionPolicy !== undefined ||
+      monitorRequestBodyTouched ||
       explicitMoveToTodoRequested;
     const activeRecoveryActionBeforeUpdate = recoveryRelevantSourceMutationRequested
       ? await recoveryActionsSvc.getActiveForIssue(existing.companyId, existing.id)
@@ -10290,7 +10299,32 @@ export function issueRoutes(
         normalizeIssueExecutionPolicy(req.body.executionPolicy),
         actor.actorType,
       );
+    } else if (req.body.monitorNextCheckAt !== undefined || req.body.monitorNotes !== undefined) {
+      // BLA-933: monitorNextCheckAt/monitorNotes are a shorthand for
+      // rescheduling/clearing the issue monitor without restating the full
+      // executionPolicy.monitor object. Translate them into the same
+      // normalized-policy shape the executionPolicy branch above produces so
+      // they drive the identical transition logic (status reset off
+      // "triggered", exhaustion checks, clearing rules) instead of silently
+      // updating nothing.
+      const rawMonitorUpdate = buildIssueExecutionPolicyFromRawMonitorFields({
+        existing,
+        monitorNextCheckAt: req.body.monitorNextCheckAt as string | null | undefined,
+        monitorNotes: req.body.monitorNotes as string | null | undefined,
+      });
+      if (rawMonitorUpdate.changed) {
+        updateFields.executionPolicy = applyActorMonitorScheduledBy(
+          rawMonitorUpdate.policy,
+          actor.actorType,
+        );
+      }
     }
+    // monitorNextCheckAt/monitorNotes on the wire are shorthand inputs only
+    // (translated above); never let them fall through as a raw column write.
+    // The policy transition below derives the persisted monitorNextCheckAt /
+    // monitorNotes / monitorScheduledBy columns and executionState.monitor.
+    delete updateFields.monitorNextCheckAt;
+    delete updateFields.monitorNotes;
     const previousExecutionPolicy = normalizeIssueExecutionPolicy(existing.executionPolicy ?? null);
     const nextExecutionPolicy =
       updateFields.executionPolicy !== undefined
@@ -10305,7 +10339,7 @@ export function issueRoutes(
       req,
       existing.companyId,
       existing.assigneeAgentId,
-      req.body.executionPolicy !== undefined && monitorChanged,
+      monitorRequestBodyTouched && monitorChanged,
     );
 
     const transition = applyIssueExecutionPolicyTransition({
@@ -10325,7 +10359,7 @@ export function issueRoutes(
       allowBoardOverride: req.actor.type === "board",
       commentBody,
       reviewRequest: reviewRequest === undefined ? undefined : reviewRequest,
-      monitorExplicitlyUpdated: req.body.executionPolicy !== undefined && monitorChanged,
+      monitorExplicitlyUpdated: monitorRequestBodyTouched && monitorChanged,
     });
     const decisionId = transition.decision ? randomUUID() : null;
     if (decisionId) {
@@ -10815,7 +10849,7 @@ export function issueRoutes(
         existing.assigneeAgentId !== issue.assigneeAgentId ||
         existing.assigneeUserId !== issue.assigneeUserId,
       blockersChanged: Array.isArray(req.body.blockedByIssueIds),
-      executionPolicyChanged: req.body.executionPolicy !== undefined,
+      executionPolicyChanged: monitorRequestBodyTouched,
       monitorChanged,
       resumeRequested: resumeRequested === true,
       reopened,
