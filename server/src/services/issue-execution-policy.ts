@@ -152,7 +152,7 @@ function executionStateWithMonitor(
   };
 }
 
-function derivePersistedMonitorState(input: {
+export function derivePersistedMonitorState(input: {
   issue: IssueLike;
   state: IssueExecutionState | null;
   policy: IssueExecutionPolicy | null;
@@ -419,6 +419,80 @@ export function parseIssueExecutionState(input: unknown): IssueExecutionState | 
   const parsed = issueExecutionStateSchema.safeParse(input);
   if (!parsed.success) return null;
   return parsed.data;
+}
+
+/**
+ * Translates the PATCH /api/issues/{id} shorthand fields `monitorNextCheckAt`
+ * / `monitorNotes` into a full executionPolicy so they flow through the same
+ * scheduling/clearing/exhaustion logic as an explicit `executionPolicy.monitor`
+ * update (applyMonitorTransition below).
+ *
+ * BLA-933: once a monitor fires, `executionPolicy.monitor` is stripped
+ * (buildIssueMonitorTriggeredPatch) and `executionState.monitor.status`
+ * becomes "triggered". Nothing re-arms it from there other than a caller
+ * resending a full `executionPolicy.monitor` object. Callers reasonably
+ * expect the shorthand fields — which mirror real column/state names — to
+ * work the same way a create-time schedule does; this reconstructs the
+ * monitor's prior kind/serviceName/externalRef/timeoutAt/maxAttempts from
+ * whatever is still on the issue (persisted state survives triggering) so a
+ * caller only has to say *when* to check again and *why*, not restate the
+ * whole monitor.
+ *
+ * - `monitorNextCheckAt` explicitly `null` clears the monitor outright.
+ * - `monitorNextCheckAt` a datetime (re)schedules it for that time.
+ * - `monitorNextCheckAt` omitted but `monitorNotes` provided updates notes
+ *   in place if a schedule (or a not-yet-triggered one) already exists;
+ *   otherwise there is nothing to attach the notes to and this is a no-op
+ *   (mirrors "notes alone can't create a schedule").
+ */
+export function buildIssueExecutionPolicyFromRawMonitorFields(input: {
+  existing: IssueLike;
+  monitorNextCheckAt: string | null | undefined;
+  monitorNotes: string | null | undefined;
+}): { policy: IssueExecutionPolicy | null; changed: boolean } {
+  const previousPolicy = normalizeIssueExecutionPolicy(input.existing.executionPolicy ?? null);
+  if (input.monitorNextCheckAt === undefined && input.monitorNotes === undefined) {
+    return { policy: previousPolicy, changed: false };
+  }
+
+  const persisted = derivePersistedMonitorState({
+    issue: input.existing,
+    state: parseIssueExecutionState(input.existing.executionState),
+    policy: previousPolicy,
+  });
+  const effectiveNextCheckAt = input.monitorNextCheckAt !== undefined
+    ? input.monitorNextCheckAt
+    : persisted?.nextCheckAt ?? null;
+
+  const basePolicyFields = {
+    mode: previousPolicy?.mode,
+    commentRequired: previousPolicy?.commentRequired,
+    stages: previousPolicy?.stages ?? [],
+    reviewPreset: previousPolicy?.reviewPreset,
+    authorizationPolicy: previousPolicy?.authorizationPolicy,
+    maxReviewRounds: previousPolicy?.maxReviewRounds,
+  };
+
+  if (!effectiveNextCheckAt) {
+    const cleared = normalizeIssueExecutionPolicy({ ...basePolicyFields, monitor: null });
+    return { policy: cleared, changed: Boolean(previousPolicy?.monitor) };
+  }
+
+  const rescheduled = normalizeIssueExecutionPolicy({
+    ...basePolicyFields,
+    monitor: {
+      nextCheckAt: effectiveNextCheckAt,
+      notes: input.monitorNotes !== undefined ? input.monitorNotes : persisted?.notes ?? null,
+      scheduledBy: persisted?.scheduledBy ?? undefined,
+      kind: persisted?.kind ?? null,
+      serviceName: persisted?.serviceName ?? null,
+      externalRef: persisted?.externalRef ?? null,
+      timeoutAt: persisted?.timeoutAt ?? null,
+      maxAttempts: persisted?.maxAttempts ?? null,
+      recoveryPolicy: persisted?.recoveryPolicy ?? null,
+    },
+  });
+  return { policy: rescheduled, changed: true };
 }
 
 export function assigneePrincipal(input: AssigneeLike): IssueExecutionStagePrincipal | null {
