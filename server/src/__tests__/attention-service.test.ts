@@ -192,7 +192,11 @@ describeEmbeddedPostgres("attention service", () => {
       originId: input.originId ?? null,
       originFingerprint: input.originFingerprint ?? "default",
       executionState: input.executionState ?? null,
-      unblockDescriptor: input.unblockDescriptor ?? null,
+      unblockDescriptor: input.unblockDescriptor !== undefined
+        ? input.unblockDescriptor
+        : input.status === "blocked"
+          ? { owner: "board", action: "Test fixture: pre-existing blocked issue." }
+          : null,
       blockedTransitionAt: input.blockedTransitionAt ?? null,
       harnessKind: input.harnessKind ?? null,
       createdAt: input.createdAt,
@@ -302,6 +306,13 @@ describeEmbeddedPostgres("attention service", () => {
       assigneeAgentId: workerId,
       updatedAt: baseTime,
     });
+    // This fixture used to omit unblockDescriptor entirely to exercise the
+    // BLA-687 "missing descriptor" attention path (the `!descriptor` branch in
+    // attention.ts). issues_blocked_requires_unblock_descriptor_check now makes
+    // that state impossible to insert — there is no non-null value that both
+    // satisfies the constraint and reads as falsy there — so insertIssue's
+    // default board-owned descriptor applies instead, and the assertions below
+    // check the "human-owned descriptor" branch it now takes.
     const blockerParentId = await insertIssue({
       companyId,
       identifier: "ATN-4",
@@ -616,14 +627,19 @@ describeEmbeddedPostgres("attention service", () => {
 
     const feed = await attentionService(db).list(companyId, { userId: "board-user" });
 
-    expect(feed.totalCount).toBe(12);
+    expect(feed.totalCount).toBe(13);
     expect(feed.countsBySourceKind).toMatchObject({
       approval: 1,
       issue_thread_interaction: 1,
       join_request: 1,
       recovery_action: 1,
       productivity_review: 1,
-      blocker_attention: 1,
+      // 2: the pre-existing terminal-blocker item for blockerLeafId, plus the
+      // board-owned-descriptor item for blockerParentId itself (blockerParentId
+      // is blocked with a board-owned unblockDescriptor — see the fixture note
+      // above the seed for why this is no longer the BLA-687 "missing
+      // descriptor" case it originally was).
+      blocker_attention: 2,
       review: 2,
       failed_run: 1,
       budget_alert: 2,
@@ -665,12 +681,21 @@ describeEmbeddedPostgres("attention service", () => {
       kind: "questions",
       questionCount: 0,
     });
-    expect(feed.items.find((item) => item.sourceKind === "blocker_attention")?.detail).toMatchObject({
+    expect(feed.items.find((item) =>
+      item.sourceKind === "blocker_attention" && item.subject.id === blockerLeafId
+    )?.detail).toMatchObject({
       kind: "blocker",
       blockingIssue: null,
       blockedTaskCount: 1,
     });
-    expect(feed.items.find((item) => item.sourceKind === "blocker_attention")?.subject.id).toBe(blockerLeafId);
+    // blockerParentId is itself blocked with a board-owned unblockDescriptor —
+    // it must surface too, not just the terminal-blocker item above.
+    const boardOwnedDescriptorItem = feed.items.find((item) =>
+      item.sourceKind === "blocker_attention" && item.subject.id === blockerParentId
+    );
+    expect(boardOwnedDescriptorItem).toBeTruthy();
+    expect(boardOwnedDescriptorItem?.entryRule).toBe("blocked issue has a human-owned unblockDescriptor");
+    expect(boardOwnedDescriptorItem?.severity).toBe("high");
     expect(feed.items.find((item) =>
       item.sourceKind === "review" && item.subject.title === "Stalled review blocker"
     )).toMatchObject({
@@ -860,9 +885,23 @@ describeEmbeddedPostgres("attention service", () => {
       addresseeAgentId: reviewerId,
       payload: { version: 1, questions: [] },
     });
+    await db.insert(issueThreadInteractions).values({
+      id: randomUUID(),
+      companyId,
+      issueId,
+      kind: "ask_user_questions",
+      status: "pending",
+      title: "User-addressed question",
+      createdByAgentId: workerId,
+      addresseeUserId: "board-user",
+      requestedResolverPolicy: "human_only",
+      effectiveResolverPolicy: "human_only",
+      payload: { version: 1, questions: [] },
+    });
     await agentService(db).pause(reviewerId);
 
     const feed = await attentionService(db).list(companyId, { userId: "board-user" });
+    const otherUserFeed = await attentionService(db).list(companyId, { userId: "other-user" });
     const audienceByTitle = new Map(feed.items
       .filter((item) => item.sourceKind === "issue_thread_interaction")
       .map((item) => [item.subject.title, item.resolverAudience]));
@@ -888,6 +927,11 @@ describeEmbeddedPostgres("attention service", () => {
       addresseeAgentId: reviewerId,
       addresseeName: "Reviewer",
     });
+    expect(audienceByTitle.get("User-addressed question")).toMatchObject({
+      addresseeUserId: "board-user",
+      effectiveResolverPolicy: "human_only",
+    });
+    expect(otherUserFeed.items.some((item) => item.subject.title === "User-addressed question")).toBe(false);
     // Non-interaction rows carry no resolver policy at all.
     expect(feed.items.find((item) => item.sourceKind !== "issue_thread_interaction")?.resolverAudience)
       .toBeNull();

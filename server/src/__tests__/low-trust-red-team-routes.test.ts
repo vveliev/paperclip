@@ -1039,6 +1039,8 @@ describeEmbeddedPostgres("low-trust red-team HTTP route regression suite", () =>
     expect(lowTrustRes.body).not.toHaveProperty("runtimeConfig");
     expect(lowTrustRes.body).not.toHaveProperty("permissions");
     expect(lowTrustRes.body).not.toHaveProperty("access");
+    expect(lowTrustRes.body.adapterConfigRedacted).toBe(true);
+    expect(lowTrustRes.body.runtimeConfigRedacted).toBe(true);
     expectNoCanary(lowTrustRes.body, fixture.canaries.agentConfig);
 
     const lowTrustSelfByIdRes = await request(createApp(db, agentActor(fixture)))
@@ -1053,6 +1055,8 @@ describeEmbeddedPostgres("low-trust red-team HTTP route regression suite", () =>
     expect(lowTrustSelfByIdRes.body).not.toHaveProperty("runtimeConfig");
     expect(lowTrustSelfByIdRes.body).not.toHaveProperty("permissions");
     expect(lowTrustSelfByIdRes.body).not.toHaveProperty("access");
+    expect(lowTrustSelfByIdRes.body.adapterConfigRedacted).toBe(true);
+    expect(lowTrustSelfByIdRes.body.runtimeConfigRedacted).toBe(true);
     expectNoCanary(lowTrustSelfByIdRes.body, fixture.canaries.agentConfig);
 
     const lowTrustPeerConfigRes = await request(createApp(db, agentActor(fixture)))
@@ -1079,7 +1083,34 @@ describeEmbeddedPostgres("low-trust red-team HTTP route regression suite", () =>
     });
     expect(issueScopedLowTrustRes.body).not.toHaveProperty("adapterConfig");
     expect(issueScopedLowTrustRes.body).not.toHaveProperty("runtimeConfig");
+    expect(issueScopedLowTrustRes.body.adapterConfigRedacted).toBe(true);
+    expect(issueScopedLowTrustRes.body.runtimeConfigRedacted).toBe(true);
     expectNoCanary(issueScopedLowTrustRes.body, fixture.canaries.agentConfig);
+
+    for (const restrictedActor of [
+      skillTestActor(fixture),
+      {
+        ...standardActor,
+        source: "agent_key" as const,
+        keyScope: {
+          kind: "task_bridge" as const,
+          parentIssueId: fixture.issues.assignedReview.id,
+        },
+      },
+    ]) {
+      const restrictedRes = await request(createApp(db, restrictedActor)).get("/api/agents/me");
+      expect(restrictedRes.status, JSON.stringify(restrictedRes.body)).toBe(200);
+      expect(restrictedRes.body).toMatchObject({
+        id: fixture.agents.standard.id,
+        companyId: fixture.company.id,
+        keyScope: restrictedActor.keyScope,
+      });
+      expect(restrictedRes.body).not.toHaveProperty("adapterConfig");
+      expect(restrictedRes.body).not.toHaveProperty("runtimeConfig");
+      expect(restrictedRes.body).not.toHaveProperty("permissions");
+      expect(restrictedRes.body).not.toHaveProperty("access");
+      expectNoCanary(restrictedRes.body, fixture.canaries.agentConfig);
+    }
 
     await db.update(issues).set({ executionPolicy: null }).where(eq(issues.id, fixture.issues.assignedReview.id));
 
@@ -1104,6 +1135,8 @@ describeEmbeddedPostgres("low-trust red-team HTTP route regression suite", () =>
     });
     expect(projectScopedLowTrustRes.body).not.toHaveProperty("adapterConfig");
     expect(projectScopedLowTrustRes.body).not.toHaveProperty("runtimeConfig");
+    expect(projectScopedLowTrustRes.body.adapterConfigRedacted).toBe(true);
+    expect(projectScopedLowTrustRes.body.runtimeConfigRedacted).toBe(true);
     expectNoCanary(projectScopedLowTrustRes.body, fixture.canaries.agentConfig);
   });
 
@@ -1324,6 +1357,7 @@ describeEmbeddedPostgres("low-trust red-team HTTP route regression suite", () =>
         parentId: fixture.issues.reviewRoot.id,
         title: "Visible blocked vendor wait",
         status: "blocked",
+        unblockDescriptor: { owner: "board", action: "Test fixture: pre-existing blocked issue." },
         priority: "medium",
         description: "external owner: Visible vendor\nexternal action: Finish visible review",
       },
@@ -1332,6 +1366,7 @@ describeEmbeddedPostgres("low-trust red-team HTTP route regression suite", () =>
         projectId: fixture.projects.outOfScope.id,
         title: "Hidden blocked vendor wait",
         status: "blocked",
+        unblockDescriptor: { owner: "board", action: "Test fixture: pre-existing blocked issue." },
         priority: "medium",
         description: "external owner: Hidden vendor\nexternal action: Finish hidden review",
       },

@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { asc, eq } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { sql } from "drizzle-orm";
 import {
   activityLog,
@@ -21,6 +21,7 @@ import {
   issueReadStates,
   issueRelations,
   issueThreadInteractions,
+  issueWorkProducts,
   issues,
   projectWorkspaces,
   projects,
@@ -63,6 +64,85 @@ describe("issue list limit helpers", () => {
     expect(clampIssueListLimit(25.9)).toBe(25);
     expect(clampIssueListLimit(ISSUE_LIST_MAX_LIMIT + 10)).toBe(ISSUE_LIST_MAX_LIMIT);
   });
+});
+
+describeEmbeddedPostgres("issueService run attachment artifacts", () => {
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+  });
+
+  it("registers a run-produced attachment as an attachment-backed artifact work product", async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-run-attachment-artifact-");
+    const db = createDb(tempDb.connectionString);
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const runId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: "ART",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "ArtifactAgent",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Artifact registration",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: agentId,
+    });
+    await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, status: "running" });
+
+    const attachment = await issueService(db).createAttachment({
+      issueId,
+      issueCommentId: null,
+      provider: "local_disk",
+      objectKey: "issues/artifact/screenshot.png",
+      contentType: "image/png",
+      byteSize: 128,
+      sha256: "a".repeat(64),
+      originalFilename: "screenshot.png",
+      createdByAgentId: agentId,
+      createdByRunId: runId,
+    });
+
+    const artifact = await db
+      .select()
+      .from(issueWorkProducts)
+      .where(eq(issueWorkProducts.externalId, attachment.id))
+      .then((rows) => rows[0]);
+    expect(artifact).toMatchObject({
+      companyId,
+      issueId,
+      type: "artifact",
+      provider: "paperclip",
+      title: "screenshot.png",
+      createdByRunId: runId,
+      metadata: {
+        attachmentId: attachment.id,
+        contentType: "image/png",
+        byteSize: 128,
+        contentPath: `/api/attachments/${attachment.id}/content`,
+        openPath: `/api/attachments/${attachment.id}/content`,
+        downloadPath: `/api/attachments/${attachment.id}/content?download=1`,
+        originalFilename: "screenshot.png",
+      },
+    });
+  }, 20_000);
 });
 
 describe("deriveIssueCommentRunLogAttribution", () => {
@@ -2371,6 +2451,44 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
     expect(comments.map((comment) => comment.id)).toEqual([latestCommentId]);
   });
 
+  it("returns no comments for an anchor cursor that is not a UUID", async () => {
+    const companyId = randomUUID();
+    const issueId = randomUUID();
+    const commentId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Malformed cursor issue",
+      status: "todo",
+      priority: "medium",
+    });
+
+    await db.insert(issueComments).values({
+      id: commentId,
+      companyId,
+      issueId,
+      body: "Only comment",
+      createdAt: new Date("2026-03-26T10:00:00.000Z"),
+      updatedAt: new Date("2026-03-26T10:00:00.000Z"),
+    });
+
+    const comments = await svc.listComments(issueId, {
+      afterCommentId: commentId.slice(0, 8),
+      order: "asc",
+      limit: 50,
+    });
+
+    expect(comments).toEqual([]);
+  });
+
   it("lists user comments when derived run attribution scans a timestamp window", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();
@@ -2525,6 +2643,7 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
         companyId,
         title: "Blocked issue",
         status: "blocked",
+        unblockDescriptor: { owner: "board", action: "Test fixture: pre-existing blocked issue." },
         priority: "medium",
       },
       {
@@ -3683,6 +3802,71 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
     });
   });
 
+  it("createChild targeting another project does not forward the parent project workspace", async () => {
+    const companyId = randomUUID();
+    const parentProjectId = randomUUID();
+    const targetProjectId = randomUUID();
+    const parentIssueId = randomUUID();
+    const parentProjectWorkspaceId = randomUUID();
+    const targetProjectWorkspaceId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
+
+    await db.insert(projects).values([
+      { id: parentProjectId, companyId, name: "Paperclip App", status: "in_progress" },
+      { id: targetProjectId, companyId, name: "Paperclip ID", status: "in_progress" },
+    ]);
+
+    await db.insert(projectWorkspaces).values([
+      {
+        id: parentProjectWorkspaceId,
+        companyId,
+        projectId: parentProjectId,
+        name: "paperclip",
+        isPrimary: true,
+      },
+      {
+        id: targetProjectWorkspaceId,
+        companyId,
+        projectId: targetProjectId,
+        name: "paperclip-id",
+        isPrimary: true,
+      },
+    ]);
+
+    await db.insert(issues).values({
+      id: parentIssueId,
+      companyId,
+      projectId: parentProjectId,
+      projectWorkspaceId: parentProjectWorkspaceId,
+      title: "Google Workspace MCP",
+      status: "in_progress",
+      priority: "medium",
+      executionWorkspaceSettings: {
+        mode: "isolated_workspace",
+        workspaceStrategy: { type: "git_worktree", baseRef: "origin/master" },
+      },
+    });
+
+    const { issue: child } = await svc.createChild(parentIssueId, {
+      title: "Implement the Paperclip ID connect broker",
+      status: "todo",
+      priority: "medium",
+      projectId: targetProjectId,
+      executionWorkspaceInheritanceMode: "strategy_only",
+    });
+
+    expect(child.parentId).toBe(parentIssueId);
+    expect(child.projectId).toBe(targetProjectId);
+    expect(child.projectWorkspaceId).toBe(targetProjectWorkspaceId);
+  });
+
   it("clamps helper-created child requestDepth to the safe maximum", async () => {
     const companyId = randomUUID();
     const projectId = randomUUID();
@@ -3836,6 +4020,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
         identifier: "PAP-15046",
         title: "Dependent",
         status: "blocked",
+        unblockDescriptor: { owner: "board", action: "Test fixture: pre-existing blocked issue." },
         priority: "medium",
         assigneeAgentId,
       },
@@ -3950,6 +4135,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
         companyId,
         title: "Blocked issue",
         status: "blocked",
+        unblockDescriptor: { owner: "board", action: "Test fixture: pre-existing blocked issue." },
         priority: "medium",
       },
     ]);
@@ -3967,11 +4153,23 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
 
   it("returns blocked-by summaries on newly created issues", async () => {
     const companyId = randomUUID();
+    const assigneeAgentId = randomUUID();
     await db.insert(companies).values({
       id: companyId,
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: assigneeAgentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
     });
 
     const blockerId = randomUUID();
@@ -3988,6 +4186,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
       status: "blocked",
       priority: "medium",
       blockedByIssueIds: [blockerId],
+      assigneeAgentId,
     });
 
     expect(created.blockedBy.map((relation) => relation.id)).toEqual([blockerId]);
@@ -4001,11 +4200,23 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
 
   it("returns blocked-by summaries on newly created child issues", async () => {
     const companyId = randomUUID();
+    const assigneeAgentId = randomUUID();
     await db.insert(companies).values({
       id: companyId,
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: assigneeAgentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
     });
 
     const parentId = randomUUID();
@@ -4032,6 +4243,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
       status: "blocked",
       priority: "medium",
       blockedByIssueIds: [blockerId],
+      assigneeAgentId,
     });
 
     expect(child.parentId).toBe(parentId);
@@ -4087,9 +4299,9 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     const issueC = randomUUID();
     const issueD = randomUUID();
     await db.insert(issues).values([
-      { id: issueA, companyId, identifier: "PAP-1", title: "Issue A", status: "blocked", priority: "medium" },
-      { id: issueB, companyId, identifier: "PAP-2", title: "Issue B", status: "blocked", priority: "medium" },
-      { id: issueC, companyId, identifier: "PAP-3", title: "Issue C", status: "blocked", priority: "medium" },
+      { id: issueA, companyId, identifier: "PAP-1", title: "Issue A", status: "blocked", unblockDescriptor: { owner: "board", action: "Test fixture: pre-existing blocked issue." }, priority: "medium" },
+      { id: issueB, companyId, identifier: "PAP-2", title: "Issue B", status: "blocked", unblockDescriptor: { owner: "board", action: "Test fixture: pre-existing blocked issue." }, priority: "medium" },
+      { id: issueC, companyId, identifier: "PAP-3", title: "Issue C", status: "blocked", unblockDescriptor: { owner: "board", action: "Test fixture: pre-existing blocked issue." }, priority: "medium" },
       { id: issueD, companyId, identifier: "PAP-4", title: "Issue D", status: "todo", priority: "high" },
     ]);
 
@@ -4171,6 +4383,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
         companyId,
         title: "Blocked issue",
         status: "blocked",
+        unblockDescriptor: { owner: "board", action: "Test fixture: pre-existing blocked issue." },
         priority: "medium",
         assigneeAgentId,
       },
@@ -4362,6 +4575,128 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     });
   });
 
+  it("clears the workspace-finalize barrier when a failed finalize's workspace is already closed and can never retry", async () => {
+    const {
+      companyId,
+      executionWorkspaceId,
+      blockerId,
+      dependentId,
+      assigneeAgentId,
+    } = await seedSharedWorkspaceDependency();
+
+    // The blocker's isolated workspace was torn down (worktree already removed by
+    // the reaper) before its workspace_finalize op ran, so finalize failed and
+    // nothing will ever retry it on this workspace again.
+    await db
+      .update(executionWorkspaces)
+      .set({ status: "archived", closedAt: new Date("2026-05-23T22:04:00.000Z"), cleanupReason: "issue_terminal" })
+      .where(eq(executionWorkspaces.id, executionWorkspaceId));
+
+    await db.insert(workspaceOperations).values({
+      companyId,
+      executionWorkspaceId,
+      issueId: blockerId,
+      phase: "workspace_finalize",
+      status: "failed",
+      startedAt: new Date("2026-05-23T22:05:00.000Z"),
+    });
+
+    await expect(svc.getDependencyReadiness(dependentId)).resolves.toMatchObject({
+      isDependencyReady: true,
+      pendingFinalizeBlockerIssueIds: [],
+      unresolvedBlockerIssueIds: [],
+    });
+    await expect(svc.listWakeableBlockedDependents(blockerId)).resolves.toEqual([
+      expect.objectContaining({
+        id: dependentId,
+        assigneeAgentId,
+        blockerIssueIds: [blockerId],
+      }),
+    ]);
+  });
+
+  it("clears the workspace-finalize barrier when a later failed finalize follows an earlier success on a still-active workspace (BLA-1034)", async () => {
+    const {
+      companyId,
+      executionWorkspaceId,
+      blockerId,
+      dependentId,
+      assigneeAgentId,
+    } = await seedSharedWorkspaceDependency();
+
+    // The blocker finalized successfully and its issue was merged/done.
+    await db.insert(workspaceOperations).values({
+      companyId,
+      executionWorkspaceId,
+      issueId: blockerId,
+      phase: "workspace_finalize",
+      status: "succeeded",
+      startedAt: new Date("2026-05-23T22:05:00.000Z"),
+    });
+
+    // A stray retry/reconcile attempt runs later and fails, but the workspace
+    // is never archived (still `active`). The earlier success already proved
+    // the sync-back landed, so this must not wedge the dependent forever.
+    await db.insert(workspaceOperations).values({
+      companyId,
+      executionWorkspaceId,
+      issueId: blockerId,
+      phase: "workspace_finalize",
+      status: "failed",
+      startedAt: new Date("2026-05-23T22:10:00.000Z"),
+    });
+
+    await expect(
+      db.select({ status: executionWorkspaces.status })
+        .from(executionWorkspaces)
+        .where(eq(executionWorkspaces.id, executionWorkspaceId)),
+    ).resolves.toEqual([{ status: "active" }]);
+
+    await expect(svc.getDependencyReadiness(dependentId)).resolves.toMatchObject({
+      isDependencyReady: true,
+      pendingFinalizeBlockerIssueIds: [],
+      unresolvedBlockerIssueIds: [],
+    });
+    await expect(svc.listWakeableBlockedDependents(blockerId)).resolves.toEqual([
+      expect.objectContaining({
+        id: dependentId,
+        assigneeAgentId,
+        blockerIssueIds: [blockerId],
+      }),
+    ]);
+  });
+
+  it("keeps the workspace-finalize barrier closed while a retry after an earlier success is still running", async () => {
+    const {
+      companyId,
+      executionWorkspaceId,
+      blockerId,
+      dependentId,
+    } = await seedSharedWorkspaceDependency();
+
+    await db.insert(workspaceOperations).values({
+      companyId,
+      executionWorkspaceId,
+      issueId: blockerId,
+      phase: "workspace_finalize",
+      status: "succeeded",
+      startedAt: new Date("2026-05-23T22:05:00.000Z"),
+    });
+    await db.insert(workspaceOperations).values({
+      companyId,
+      executionWorkspaceId,
+      issueId: blockerId,
+      phase: "workspace_finalize",
+      status: "running",
+      startedAt: new Date("2026-05-23T22:10:00.000Z"),
+    });
+
+    await expect(svc.getDependencyReadiness(dependentId)).resolves.toMatchObject({
+      isDependencyReady: false,
+      pendingFinalizeBlockerIssueIds: [blockerId],
+    });
+  });
+
   it("treats blockers with no executionWorkspaceId as not subject to the workspace-finalize barrier", async () => {
     const companyId = randomUUID();
     const assigneeAgentId = randomUUID();
@@ -4394,6 +4729,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
         companyId,
         title: "Dependent",
         status: "blocked",
+        unblockDescriptor: { owner: "board", action: "Test fixture: pre-existing blocked issue." },
         priority: "medium",
         assigneeAgentId,
       },
@@ -4465,6 +4801,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
         companyId,
         title: "Source issue",
         status: "blocked",
+        unblockDescriptor: { owner: "board", action: "Test fixture: pre-existing blocked issue." },
         priority: "medium",
       },
       {
@@ -4590,6 +4927,13 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
         title: "Child A",
         status: "done",
         priority: "medium",
+        // Give the children distinct, ordered issue numbers. The service
+        // sorts direct children by issueNumber, then createdAt. A batched
+        // insert gives every row in the statement the same defaultNow()
+        // createdAt, so without a distinct issueNumber the two children
+        // tie on both sort keys and the database is free to return them
+        // in either order.
+        issueNumber: 1,
       },
       {
         id: childB,
@@ -4597,7 +4941,9 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
         parentId,
         title: "Child B",
         status: "blocked",
+        unblockDescriptor: { owner: "board", action: "Test fixture: pre-existing blocked issue." },
         priority: "medium",
+        issueNumber: 2,
       },
     ]);
 
@@ -4790,6 +5136,82 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
     expect(child.projectId).toBe(projectId);
     expect(child.projectWorkspaceId).toBe(projectWorkspaceId);
     expect(child.executionWorkspaceId).toBe(executionWorkspaceId);
+  });
+
+  it("uses the target project's own workspaces for a cross-project child instead of inheriting the parent's", async () => {
+    const companyId = randomUUID();
+    const parentProjectId = randomUUID();
+    const targetProjectId = randomUUID();
+    const parentIssueId = randomUUID();
+    const parentProjectWorkspaceId = randomUUID();
+    const targetProjectWorkspaceId = randomUUID();
+    const executionWorkspaceId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
+
+    await db.insert(projects).values([
+      { id: parentProjectId, companyId, name: "Paperclip App", status: "in_progress" },
+      { id: targetProjectId, companyId, name: "Paperclip ID", status: "in_progress" },
+    ]);
+
+    await db.insert(projectWorkspaces).values([
+      {
+        id: parentProjectWorkspaceId,
+        companyId,
+        projectId: parentProjectId,
+        name: "paperclip",
+        isPrimary: true,
+      },
+      {
+        id: targetProjectWorkspaceId,
+        companyId,
+        projectId: targetProjectId,
+        name: "paperclip-id",
+        isPrimary: true,
+      },
+    ]);
+
+    await db.insert(executionWorkspaces).values({
+      id: executionWorkspaceId,
+      companyId,
+      projectId: parentProjectId,
+      projectWorkspaceId: parentProjectWorkspaceId,
+      mode: "isolated_workspace",
+      strategyType: "git_worktree",
+      name: "Issue worktree",
+      status: "active",
+      providerType: "git_worktree",
+    });
+
+    await db.insert(issues).values({
+      id: parentIssueId,
+      companyId,
+      projectId: parentProjectId,
+      projectWorkspaceId: parentProjectWorkspaceId,
+      title: "Google Workspace MCP",
+      status: "in_progress",
+      priority: "medium",
+      executionWorkspaceId,
+      executionWorkspacePreference: "reuse_existing",
+      executionWorkspaceSettings: { mode: "isolated_workspace" },
+    });
+
+    const child = await svc.create(companyId, {
+      parentId: parentIssueId,
+      projectId: targetProjectId,
+      title: "Implement the Paperclip ID connect broker",
+    });
+
+    expect(child.parentId).toBe(parentIssueId);
+    expect(child.projectId).toBe(targetProjectId);
+    expect(child.projectWorkspaceId).toBe(targetProjectWorkspaceId);
+    expect(child.executionWorkspaceId).not.toBe(executionWorkspaceId);
   });
 
   it("rejects explicitly pinned isolated git worktrees without a project or reusable workspace", async () => {
@@ -5852,6 +6274,269 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
   });
 });
 
+describeEmbeddedPostgres("issueService.update guarantees an unblockDescriptor on blocked (BLA-687)", () => {
+  let db!: ReturnType<typeof createDb>;
+  let svc!: ReturnType<typeof issueService>;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+  let companyId!: string;
+  let agentId!: string;
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-issues-blocked-descriptor-");
+    db = createDb(tempDb.connectionString);
+    svc = issueService(db);
+  }, 20_000);
+
+  beforeEach(async () => {
+    companyId = randomUUID();
+    agentId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+  });
+
+  afterEach(async () => {
+    await db.delete(issueRelations);
+    await db.delete(issues);
+    await db.delete(agents);
+    await db.delete(companies);
+  });
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+  });
+
+  async function insertIssue(status: string, extra: Partial<typeof issues.$inferInsert> = {}) {
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "T",
+      status,
+      priority: "medium",
+      assigneeAgentId: agentId,
+      ...extra,
+    });
+    return issueId;
+  }
+
+  it("auto-fills the descriptor for a bare PATCH to blocked with no blocker", async () => {
+    // This used to reject. Rejecting cost an outage once -- a recovery sweep parked
+    // a stranded issue as blocked with no descriptor, the rejection propagated, and
+    // every later recovery stage was skipped for that tick -- and upstream keeps
+    // adding descriptor-less blocked writes that this fork re-inherits on each sync.
+    // The write now succeeds with a synthesized descriptor, matching what the
+    // database trigger already does, so the invariant holds without a single caller
+    // being able to wedge the recovery sweep.
+    const issueId = await insertIssue("todo");
+
+    const updated = await svc.update(issueId, { status: "blocked" });
+
+    expect(updated?.status).toBe("blocked");
+    const row = await db.select({ status: issues.status, unblockDescriptor: issues.unblockDescriptor })
+      .from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]);
+    expect(row?.status).toBe("blocked");
+    // The invariant still holds: never a blocked row without an owner and an action.
+    expect((row?.unblockDescriptor as { owner?: unknown })?.owner).toBe("board");
+    const action = String((row?.unblockDescriptor as { action?: unknown })?.action);
+    expect(action).toContain("Auto-filled");
+    // And it is honest that nothing justified the block, rather than naming an
+    // approval or blocker that does not exist.
+    expect(action).not.toContain("Waiting on a pending approval");
+  });
+
+  it("accepts entering blocked with a valid unblockDescriptor", async () => {
+    const issueId = await insertIssue("todo");
+
+    const updated = await svc.update(issueId, {
+      status: "blocked",
+      unblockDescriptor: { owner: "board", action: "Inspect the evidence and decide." },
+    });
+
+    expect(updated?.status).toBe("blocked");
+    expect(updated?.unblockDescriptor).toEqual({ owner: "board", action: "Inspect the evidence and decide." });
+  });
+
+  it("accepts entering blocked with an unresolved first-class blocker and no descriptor, synthesizing one", async () => {
+    const blockerId = await insertIssue("todo");
+    const issueId = await insertIssue("todo");
+
+    const updated = await svc.update(issueId, {
+      status: "blocked",
+      blockedByIssueIds: [blockerId],
+    });
+
+    expect(updated?.status).toBe("blocked");
+    // issues_blocked_requires_unblock_descriptor_check requires a non-null
+    // descriptor on every blocked row unconditionally — leaving it null here
+    // (as this test originally asserted) would fail that DB check constraint.
+    // update() synthesizes a board-owned one instead of leaving it unset.
+    expect(updated?.unblockDescriptor).toEqual({
+      owner: "board",
+      action: expect.stringContaining("unresolved blocker"),
+    });
+  });
+
+  it("preserves the unblockDescriptor across an automation transition out of blocked (BLA-687 Path 2)", async () => {
+    const issueId = await insertIssue("blocked", {
+      unblockDescriptor: { owner: "board", action: "Board operator: inspect and decide." },
+      blockedTransitionAt: new Date(),
+    });
+
+    // Mirrors the implicit-reopen dispatch path: a plain comment on a
+    // blocked, agent-assigned issue moves status to "todo" without ever
+    // touching unblockDescriptor.
+    const updated = await svc.update(issueId, { status: "todo" });
+
+    expect(updated?.status).toBe("todo");
+    expect(updated?.unblockDescriptor).toEqual({ owner: "board", action: "Board operator: inspect and decide." });
+  });
+
+  it("clears the unblockDescriptor when the caller explicitly asks to", async () => {
+    const issueId = await insertIssue("blocked", {
+      unblockDescriptor: { owner: "board", action: "Board operator: inspect and decide." },
+      blockedTransitionAt: new Date(),
+    });
+
+    const updated = await svc.update(issueId, { status: "todo", unblockDescriptor: null });
+
+    expect(updated?.status).toBe("todo");
+    expect(updated?.unblockDescriptor).toBeNull();
+  });
+
+  it("re-validates when a call reaffirms blocked without a descriptor and no blocker justifies it", async () => {
+    const issueId = await insertIssue("blocked", {
+      unblockDescriptor: { owner: "board", action: "Board operator: inspect and decide." },
+      blockedTransitionAt: new Date(),
+    });
+
+    // Clearing the descriptor while re-asserting blocked leaves the issue with no
+    // premise. The write is accepted, but the invariant still holds: a descriptor is
+    // synthesized rather than the row being left bare or the write rejected.
+    const updated = await svc.update(issueId, { status: "blocked", unblockDescriptor: null });
+
+    expect(updated?.status).toBe("blocked");
+    const row = await db.select({ unblockDescriptor: issues.unblockDescriptor })
+      .from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]);
+    expect(row?.unblockDescriptor).not.toBeNull();
+    expect(String((row?.unblockDescriptor as { action?: unknown })?.action)).toContain("Auto-filled");
+  });
+
+  it("rejects a PATCH to blocked with a valid descriptor but no assignee (GIF-66)", async () => {
+    const issueId = await insertIssue("todo", { assigneeAgentId: null });
+
+    await expect(svc.update(issueId, {
+      status: "blocked",
+      unblockDescriptor: { owner: "board", action: "Inspect the evidence and decide." },
+    })).rejects.toThrow(/status=blocked requires a named owner/);
+
+    const row = await db.select({ status: issues.status, assigneeAgentId: issues.assigneeAgentId })
+      .from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]);
+    expect(row).toEqual({ status: "todo", assigneeAgentId: null });
+  });
+
+  it("rejects unassigning an already-blocked issue via the same PATCH (GIF-66)", async () => {
+    const issueId = await insertIssue("blocked", {
+      unblockDescriptor: { owner: "board", action: "Board operator: inspect and decide." },
+      blockedTransitionAt: new Date(),
+    });
+
+    await expect(svc.update(issueId, {
+      status: "blocked",
+      assigneeAgentId: null,
+    })).rejects.toThrow(/status=blocked requires a named owner/);
+  });
+
+  it("accepts entering blocked with an existing user assignee and no agent assignee (GIF-66)", async () => {
+    const issueId = await insertIssue("todo", { assigneeAgentId: null, assigneeUserId: "board-user-1" });
+
+    const updated = await svc.update(issueId, {
+      status: "blocked",
+      unblockDescriptor: { owner: "board", action: "Inspect the evidence and decide." },
+    });
+
+    expect(updated?.status).toBe("blocked");
+    expect(updated?.assigneeUserId).toBe("board-user-1");
+  });
+
+  it("rejects creating an issue directly into blocked with no assignee (GIF-66)", async () => {
+    await expect(svc.create(companyId, {
+      title: "Dead letter from birth",
+      description: null,
+      status: "blocked",
+      priority: "medium",
+    })).rejects.toThrow(/status=blocked requires a named owner/);
+  });
+
+  it("accepts creating an issue directly into blocked with an assignee (GIF-66)", async () => {
+    const issue = await svc.create(companyId, {
+      title: "Blocked with an owner from birth",
+      description: null,
+      status: "blocked",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      unblockDescriptor: { owner: "board", action: "Inspect the evidence and decide." },
+    });
+
+    expect(issue?.status).toBe("blocked");
+    expect(issue?.assigneeAgentId).toBe(agentId);
+  });
+
+  it("GIF-49: rejects reverting a done issue to blocked, and completedAt survives the rejected write", async () => {
+    const issueId = await insertIssue("todo");
+    const done = await svc.update(issueId, { status: "done" });
+    expect(done?.status).toBe("done");
+    expect(done?.completedAt).not.toBeNull();
+
+    // This mirrors the exact shape reported in GIF-49: a continuation/
+    // recovery sweep calling update() with status: "blocked" against an
+    // issue that has already reached a terminal status. It must be
+    // rejected outright rather than silently reverting the issue and
+    // clearing completedAt.
+    await expect(svc.update(issueId, {
+      status: "blocked",
+      unblockDescriptor: { owner: "board", action: "Investigate." },
+    })).rejects.toThrow(/Cannot move issue from terminal status "done" directly to "blocked"/);
+
+    const row = await db.select({ status: issues.status, completedAt: issues.completedAt })
+      .from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]);
+    expect(row?.status).toBe("done");
+    expect(row?.completedAt).not.toBeNull();
+  });
+
+  it("GIF-49: rejects reverting a cancelled issue to blocked", async () => {
+    const issueId = await insertIssue("todo");
+    await svc.update(issueId, { status: "cancelled" });
+
+    await expect(svc.update(issueId, {
+      status: "blocked",
+      unblockDescriptor: { owner: "board", action: "Investigate." },
+    })).rejects.toThrow(/Cannot move issue from terminal status "cancelled" directly to "blocked"/);
+  });
+
+  it("GIF-49: still allows reopening a done issue to todo directly", async () => {
+    const issueId = await insertIssue("todo");
+    await svc.update(issueId, { status: "done" });
+
+    const reopened = await svc.update(issueId, { status: "todo" });
+    expect(reopened?.status).toBe("todo");
+  });
+});
+
 describeEmbeddedPostgres("accepted plan decomposition", () => {
   let db!: ReturnType<typeof createDb>;
   let svc!: ReturnType<typeof issueService>;
@@ -6862,5 +7547,27 @@ describeEmbeddedPostgres("issueService.addComment createdByRunId", () => {
     const comment = await svc.addComment(issueId, "hello from a live run", { runId });
 
     expect(await createdByRunIdFor(comment.id)).toBe(runId);
+  });
+
+  it("deduplicates concurrent identical comments from the same run", async () => {
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      status: "running",
+    });
+
+    const [first, second] = await Promise.all([
+      svc.addComment(issueId, "one durable result", { agentId, runId }),
+      svc.addComment(issueId, "one durable result", { agentId, runId }),
+    ]);
+
+    expect(second.id).toBe(first.id);
+    const duplicates = await db
+      .select({ id: issueComments.id })
+      .from(issueComments)
+      .where(eq(issueComments.createdByRunId, runId));
+    expect(duplicates).toHaveLength(1);
   });
 });

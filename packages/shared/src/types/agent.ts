@@ -1,6 +1,5 @@
 import type {
   AgentAdapterType,
-  ModelProfileKey,
   PauseReason,
   AgentRole,
   AgentStatus,
@@ -23,15 +22,7 @@ export interface AgentPermissions extends Record<string, unknown> {
   authorizationPolicy?: TrustAuthorizationPolicy;
 }
 
-export interface AgentModelProfileConfig {
-  enabled?: boolean;
-  label?: string;
-  adapterConfig: Record<string, unknown>;
-}
-
-export interface AgentRuntimeConfig extends Record<string, unknown> {
-  modelProfiles?: Partial<Record<ModelProfileKey, AgentModelProfileConfig>>;
-}
+export type AgentRuntimeConfig = Record<string, unknown>;
 
 export type AgentInstructionsBundleMode = "managed" | "external";
 
@@ -93,6 +84,14 @@ export interface Agent {
   adapterType: AgentAdapterType;
   adapterConfig: Record<string, unknown>;
   runtimeConfig: AgentRuntimeConfig;
+  /**
+   * True when `adapterConfig` above is `{}` because the viewer lacks
+   * `agent_config:read` for this agent, not because the stored config is
+   * actually empty. Absent (not `false`) when the viewer has full access.
+   */
+  adapterConfigRedacted?: boolean;
+  /** Same redaction signal as {@link adapterConfigRedacted}, for `runtimeConfig`. */
+  runtimeConfigRedacted?: boolean;
   defaultEnvironmentId?: string | null;
   budgetMonthlyCents: number;
   spentMonthlyCents: number;
@@ -309,4 +308,16 @@ export interface AdapterEnvironmentTestResult {
   status: AdapterEnvironmentTestStatus;
   checks: AdapterEnvironmentCheck[];
   testedAt: string;
+}
+
+// The cheap tri-state authentication signal for one adapter type. "present"
+// means the host already has a usable credential. "absent" means the host has
+// no usable credential yet, but the caller can add one. "unknown" means the
+// route could not check, or the adapter type has no cheap signal. The route
+// that returns this value reads host-local state only; it never leases a
+// sandbox and never runs a shell command or a model request.
+export type AdapterAuthSignal = "present" | "absent" | "unknown";
+
+export interface AdapterAuthSignalResponse {
+  status: AdapterAuthSignal;
 }

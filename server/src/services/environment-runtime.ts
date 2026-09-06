@@ -1,19 +1,24 @@
 import { createHash, randomUUID } from "node:crypto";
-import { and, eq, inArray } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { companySecrets, companySecretVersions, environmentLeases } from "@paperclipai/db";
+import { companySecrets, companySecretVersions, environmentLeases, heartbeatRuns } from "@paperclipai/db";
 import type {
   Environment,
   EnvironmentLease,
   EnvironmentLeaseStatus,
   ExecutionWorkspace,
+  InstanceExperimentalSettings,
   IssueExecutionWorkspaceSettings,
   PluginEnvironmentConfig,
   SandboxEnvironmentConfig,
   SandboxProviderCapabilities,
 } from "@paperclipai/shared";
 import { resolveDeclaredSandboxCapabilities } from "@paperclipai/shared";
-import type { EffectiveSandboxCapabilities } from "@paperclipai/adapter-utils/execution-target";
+import type { EffectiveExecutionCapabilities } from "@paperclipai/adapter-utils/execution-target";
+import type { RunnerIngressEndpoint } from "@paperclipai/adapter-utils/runner-connectivity";
+import type {
+  CommandManagedDuplexChannel,
+} from "@paperclipai/adapter-utils/command-managed-runtime";
 import type {
   PluginEnvironmentAcquireLeaseParams,
   PluginEnvironmentExecuteResult,
@@ -29,6 +34,8 @@ import {
   type StartupSpanContext,
 } from "@paperclipai/adapter-utils/acpx-engine/startup-timing";
 import { environmentService } from "./environments.js";
+import { instanceSettingsService } from "./instance-settings.js";
+import { verifyNativeHarnessBackupStamp } from "./native-runtime/native-harness-backup-stamp.js";
 import {
   collectEnvironmentSecretRefs,
   parseEnvironmentDriverConfig,
@@ -52,7 +59,12 @@ import {
   sandboxConfigFromLeaseMetadataLoose,
 } from "./sandbox-provider-runtime.js";
 import { pluginRegistryService } from "./plugin-registry.js";
-import type { ExecuteLogSink, PluginWorkerManager } from "./plugin-worker-manager.js";
+import type {
+  ExecuteLogSink,
+  PluginWorkerManager,
+  DuplexChannelHostSession,
+  DuplexChannelOpenInput as WorkerManagerDuplexChannelOpenInput,
+} from "./plugin-worker-manager.js";
 import {
   REUSABLE_LEASE_WORKER_METHODS,
   destroyPluginEnvironmentLease,
@@ -78,6 +90,12 @@ import { logger } from "../middleware/logger.js";
 // this constant and the plain provider identifiers only.
 const SANDBOX_ORPHAN_CLEANUP_WRITE_ERROR_KIND = "sandbox_orphan_cleanup_write_failed";
 
+// The fixed non-secret refusal a duplex channel open returns when the lease does
+// not grant the opt-in `duplexCommandStream` capability. The service resolves the
+// exact lease capability snapshot and throws this before it reaches any driver.
+const DUPLEX_CHANNEL_CAPABILITY_DENIED =
+  "Sandbox lease does not grant the duplex command stream capability.";
+
 // ---------------------------------------------------------------------------
 // Sandbox capability contract — one normalizer for both branches
 // ---------------------------------------------------------------------------
@@ -89,6 +107,9 @@ export const SANDBOX_CAPABILITY_KEYS = [
   "persistentProcessSessions",
   "independentControlCommands",
   "incrementalSessionOutput",
+  "concurrentSyncOperations",
+  "duplexCommandStream",
+  "runnerWebSocketIngress",
 ] as const;
 
 export type SandboxCapabilityKey = (typeof SANDBOX_CAPABILITY_KEYS)[number];
@@ -104,6 +125,9 @@ export type SandboxCapabilityKey = (typeof SANDBOX_CAPABILITY_KEYS)[number];
  */
 const SANDBOX_CAPABILITY_OPT_IN_KEYS: ReadonlySet<SandboxCapabilityKey> = new Set([
   "incrementalSessionOutput",
+  "concurrentSyncOperations",
+  "duplexCommandStream",
+  "runnerWebSocketIngress",
 ]);
 
 /**
@@ -134,6 +158,17 @@ const SANDBOX_CAPABILITY_OPT_IN_KEYS: ReadonlySet<SandboxCapabilityKey> = new Se
  *   provider tails the session log through it. The verified verb is necessary
  *   but not sufficient: this key is opt-in, so the declaration is the real gate
  *   (see {@link SANDBOX_CAPABILITY_OPT_IN_KEYS}).
+ * - `concurrentSyncOperations` requires BOTH sync verbs, because parallel
+ *   bidirectional transfer runs an inbound and an outbound transfer at the same
+ *   time. The two verbs are separate required groups, so a provider that
+ *   verifies only one direction cannot get the capability. The verbs are
+ *   necessary but not sufficient: this key is opt-in, so the declaration is the
+ *   real gate (see {@link SANDBOX_CAPABILITY_OPT_IN_KEYS}).
+ * - `duplexCommandStream` requires `duplexChannelOpen`, the worker verb that
+ *   opens the persistent duplex channel. The verified verb is necessary but not
+ *   sufficient: this key is opt-in, so the declaration is the real gate. A
+ *   provider that does not implement the duplex open verb resolves `false` and
+ *   keeps the file bridge.
  */
 const SANDBOX_CAPABILITY_PREREQUISITE_METHODS: Record<SandboxCapabilityKey, readonly (readonly string[])[]> = {
   // Reusable leases require ALL reuse verbs. Each verb is its own required
@@ -147,6 +182,9 @@ const SANDBOX_CAPABILITY_PREREQUISITE_METHODS: Record<SandboxCapabilityKey, read
   persistentProcessSessions: [["environmentExecute"]],
   independentControlCommands: [["environmentExecute"]],
   incrementalSessionOutput: [["environmentExecute"]],
+  concurrentSyncOperations: [["environmentSyncIn"], ["environmentSyncOut"]],
+  duplexCommandStream: [["duplexChannelOpen"]],
+  runnerWebSocketIngress: [["environmentRunnerIngressEndpoint"]],
 };
 
 function capabilityIsVerified(
@@ -185,33 +223,58 @@ export function builtinSandboxProviderVerifiedMethods(
   return methods;
 }
 
+// `EnvironmentDriverCapabilitySupport` and `ENVIRONMENT_DRIVER_CAPABILITY_SUPPORT`
+// now live in the dependency-leaf module `environment-driver-traits.ts`, next to
+// the other static per-driver traits. Re-export both names here so an existing
+// import of this module keeps resolving.
+export {
+  ENVIRONMENT_DRIVER_CAPABILITY_SUPPORT,
+  type EnvironmentDriverCapabilitySupport,
+} from "./environment-driver-traits.js";
+import { ENVIRONMENT_DRIVER_CAPABILITY_SUPPORT } from "./environment-driver-traits.js";
+
 /**
- * The one normalizer for the sandbox capability contract. It resolves the
- * effective capability as verified ∩ declared ∩ narrowing.
+ * The one general capability classifier. It resolves each of the eight effective
+ * capabilities as static support ∩ verified ∩ declared ∩ narrowing, and returns
+ * the read-only eight-field snapshot. Every driver reads the same classifier, so
+ * the runtime no longer branches on the driver name.
  *
+ * - `supportedCapabilities` is the driver's static support definition (see
+ *   {@link ENVIRONMENT_DRIVER_CAPABILITY_SUPPORT}). A capability not in the set
+ *   resolves `false` regardless of the other inputs. An absent set applies no
+ *   static gate, so the classifier behaves as the pure declaration ∩ verified ∩
+ *   narrowing normalizer.
  * - `verifiedMethods` is the runtime's verified worker verb list (the plug-in
  *   worker's `supportedMethods`, or a built-in provider mapped through
  *   {@link builtinSandboxProviderVerifiedMethods}). A missing or empty list
  *   verifies nothing, so every capability resolves `false` (fail closed).
  * - `declared` is the provider's declaration. An absent flag defers to the
- *   verified discovery baseline; it never grants a capability. A present flag
- *   can only remove a verified capability, never add one.
- * - `narrowing` is the per-target restriction from the config or lease. An
- *   absent key applies no restriction; a `false` value removes the capability.
+ *   verified discovery baseline for a worker-property capability; it never grants
+ *   an opt-in capability. A present flag can only remove a capability.
+ * - `narrowing` is the per-target restriction from the config or lease. An absent
+ *   key applies no restriction; a `false` value removes the capability.
  *
- * A declaration never grants a capability the runtime did not verify, so a
- * declared capability whose worker lacks a prerequisite verb resolves `false`.
+ * The two default rules stay intact. An absent declaration defers to the
+ * verified baseline for a worker-property capability. The three opt-in
+ * capabilities deny by default (see {@link SANDBOX_CAPABILITY_OPT_IN_KEYS}). A
+ * declaration never grants a capability the runtime did not verify.
  */
-export function resolveEffectiveSandboxCapabilities(input: {
+export function classifyEnvironmentCapabilities(input: {
   verifiedMethods?: readonly string[] | null;
   declared?: Partial<SandboxProviderCapabilities> | null;
   narrowing?: Partial<Record<SandboxCapabilityKey, boolean>> | null;
-}): EffectiveSandboxCapabilities {
+  supportedCapabilities?: ReadonlySet<SandboxCapabilityKey> | null;
+}): EffectiveExecutionCapabilities {
   const verifiedMethods = new Set(input.verifiedMethods ?? []);
   const declared = input.declared ?? {};
   const narrowing = input.narrowing ?? {};
+  const supportedCapabilities = input.supportedCapabilities ?? null;
 
   const resolve = (key: SandboxCapabilityKey): boolean => {
+    // The static support definition is the first gate. A capability the driver
+    // family cannot support resolves false, whatever the other inputs say. An
+    // absent set applies no static gate.
+    if (supportedCapabilities && !supportedCapabilities.has(key)) return false;
     const verified = capabilityIsVerified(key, verifiedMethods);
     // An absent declaration defers to the verified baseline for a worker-property
     // capability (true = no extra restriction), but denies an opt-in capability
@@ -230,6 +293,9 @@ export function resolveEffectiveSandboxCapabilities(input: {
     persistentProcessSessions: resolve("persistentProcessSessions"),
     independentControlCommands: resolve("independentControlCommands"),
     incrementalSessionOutput: resolve("incrementalSessionOutput"),
+    concurrentSyncOperations: resolve("concurrentSyncOperations"),
+    duplexCommandStream: resolve("duplexCommandStream"),
+    runnerWebSocketIngress: resolve("runnerWebSocketIngress"),
   };
 }
 
@@ -244,9 +310,9 @@ export function resolveEffectiveSandboxCapabilities(input: {
  *   which falls back for a `job` backend or a `nativeFileSyncUnsupported` lease).
  * - `configResolutionFailed` marks that the runtime could not resolve the
  *   provider config. A provider whose config cannot be resolved is untrusted, so
- *   the runtime fails closed and narrows `persistentProcessSessions` and
- *   `incrementalSessionOutput` to false. An empty config alone does not fail
- *   closed; only a resolution error does.
+ *   the runtime fails closed and narrows `persistentProcessSessions`,
+ *   `incrementalSessionOutput`, and `duplexCommandStream` to false. An empty
+ *   config alone does not fail closed; only a resolution error does.
  */
 export function buildSandboxCapabilityNarrowing(input: {
   leasePolicy?: EnvironmentLease["leasePolicy"] | null;
@@ -265,11 +331,15 @@ export function buildSandboxCapabilityNarrowing(input: {
 
   if (input.configResolutionFailed === true) {
     // The runtime could not resolve the provider config, so it fails closed and
-    // denies persistent process sessions and incremental session output. The
-    // session-output streaming gate reads `incrementalSessionOutput`, so it must
-    // narrow with the persistent-session gate to keep the fail-closed behavior.
+    // denies persistent process sessions, incremental session output, and the
+    // duplex command stream. The session-output streaming gate reads
+    // `incrementalSessionOutput`, so it must narrow with the persistent-session
+    // gate to keep the fail-closed behavior. The duplex command stream opens a
+    // host-owned bidirectional channel, so an untrusted provider must not keep
+    // it either.
     narrowing.persistentProcessSessions = false;
     narrowing.incrementalSessionOutput = false;
+    narrowing.duplexCommandStream = false;
   }
 
   return narrowing;
@@ -282,6 +352,29 @@ export function buildEnvironmentLeaseContext(input: {
     executionWorkspaceId: input.persistedExecutionWorkspace?.id ?? null,
     executionWorkspaceMode: input.persistedExecutionWorkspace?.mode ?? null,
   };
+}
+
+/**
+ * The per-run duplex bridge input. The host resolves it for each new run before
+ * it selects the sandbox callback bridge transport. When `enableDuplexBridge` is
+ * false the host keeps the file bridge with no manifest change and no redeploy.
+ * The transport selection reads this input in a later phase; this phase only
+ * delivers the setting and the per-run read.
+ */
+export interface ResolvedSandboxDuplexBridgeInput {
+  /** True only when the instance opts in to the sandbox duplex command stream. */
+  enableDuplexBridge: boolean;
+}
+
+/**
+ * Map the experimental instance setting `enableSandboxDuplexBridge` into the
+ * per-run duplex bridge input. The setting is the kill switch. It defaults off,
+ * so an absent or false setting keeps the file bridge.
+ */
+export function resolveSandboxDuplexBridgeInput(
+  experimental: Pick<InstanceExperimentalSettings, "enableSandboxDuplexBridge">,
+): ResolvedSandboxDuplexBridgeInput {
+  return { enableDuplexBridge: experimental.enableSandboxDuplexBridge === true };
 }
 
 function stripSecretRefValuesFromPluginLeaseMetadata(input: {
@@ -460,6 +553,21 @@ export interface EnvironmentDriverSyncInput extends EnvironmentDriverLeaseInput 
   operations: PluginSyncOperation[];
 }
 
+export interface EnvironmentDriverOpenDuplexChannelInput extends EnvironmentDriverLeaseInput {
+  /**
+   * The command argument vector the sandbox runs as the duplex channel child
+   * process. Element 0 is the program. The worker runs the vector with no
+   * shell, so a shell metacharacter in an element cannot inject a command.
+   */
+  command: readonly string[];
+}
+
+export interface EnvironmentDriverRunnerIngressInput
+  extends EnvironmentDriverLeaseInput {
+  port: number;
+  path: string;
+}
+
 export interface EnvironmentRuntimeDriver {
   readonly driver: string;
   acquireRunLease(input: EnvironmentDriverAcquireInput): Promise<EnvironmentLease>;
@@ -476,13 +584,46 @@ export interface EnvironmentRuntimeDriver {
    */
   syncIn?(input: EnvironmentDriverSyncInput): Promise<PluginEnvironmentSyncResult>;
   syncOut?(input: EnvironmentDriverSyncInput): Promise<PluginEnvironmentSyncResult>;
+  /**
+   * Optional persistent duplex channel. Present only for a plugin-backed sandbox
+   * driver whose lease grants the `duplexCommandStream` capability. The driver
+   * opens the host-owned duplex route on the plugin worker and adapts it to the
+   * cross-layer {@link CommandManagedDuplexChannel}. Other drivers omit it.
+   *
+   * HTTP/2 is the preferred transport. `queue_v1` is the soft-deprecated fallback.
+   */
+  openDuplexChannel?(
+    input: EnvironmentDriverOpenDuplexChannelInput,
+  ): Promise<CommandManagedDuplexChannel>;
+  getRunnerIngressEndpoint?(
+    input: EnvironmentDriverRunnerIngressInput,
+  ): Promise<RunnerIngressEndpoint>;
   /** True when the lease's plugin worker advertises both sync verbs. */
   supportsSync?(input: EnvironmentDriverLeaseInput): boolean;
   /**
-   * Resolve the read-only effective sandbox capability snapshot for a lease.
-   * Only the sandbox driver implements it; other drivers omit it.
+   * Resolve the effective eight-field capability snapshot for this driver and
+   * lease. Every driver implements this general method, so a caller never
+   * needs to branch on the driver name to read a capability.
+   *
+   * - `local` and `ssh` resolve every capability `false`: their static support
+   *   definition names none of the eight capabilities (see
+   *   {@link ENVIRONMENT_DRIVER_CAPABILITY_SUPPORT}).
+   * - `sandbox` resolves through the general classifier with its static
+   *   support definition, the per-lease declaration and verified worker
+   *   methods, and the per-lease narrowing.
+   * - `plugin` resolves through the general classifier with its static
+   *   support definition, the live plugin worker method list, exact-plugin
+   *   pinning for the plugin that acquired the lease, and per-lease
+   *   narrowing.
+   *
+   * The method always returns a full snapshot, never `null`. A driver that
+   * cannot verify a prerequisite (a missing worker, a stale plugin pin, an
+   * unresolvable config) fails closed and resolves the affected fields
+   * `false`; it does not throw for that case. A caller that needs to tell
+   * "this driver has no capability model" apart from "this driver is not
+   * registered" reads {@link ENVIRONMENT_DRIVER_CAPABILITY_SUPPORT} directly.
    */
-  effectiveSandboxCapabilities?(input: EnvironmentDriverLeaseInput): Promise<EffectiveSandboxCapabilities>;
+  resolveCapabilities(input: EnvironmentDriverLeaseInput): Promise<EffectiveExecutionCapabilities>;
   /**
    * Retry the provider teardown for an orphan sandbox that an earlier acquire
    * provisioned but could not tear down. The pending-cleanup lease row carries
@@ -552,11 +693,56 @@ export class SandboxOrphanCleanupWriteError extends Error {
   }
 }
 
+/** A reusable sandbox could not be resumed, but has not been proven lost. */
+export class ReusableSandboxResumeError extends Error {
+  readonly provider: string;
+  readonly providerLeaseId: string;
+
+  constructor(input: {
+    provider: string;
+    providerLeaseId: string;
+    cause?: unknown;
+  }) {
+    super(
+      `Reusable sandbox lease "${input.providerLeaseId}" could not be resumed; ` +
+        "the lease was preserved and no replacement was created.",
+      input.cause === undefined ? undefined : { cause: input.cause },
+    );
+    this.name = "ReusableSandboxResumeError";
+    this.provider = input.provider;
+    this.providerLeaseId = input.providerLeaseId;
+  }
+}
+
+export class RunnerHarnessBackupUnavailableError extends Error {
+  readonly providerLeaseId: string;
+
+  constructor(providerLeaseId: string) {
+    super(
+      `runner_harness_backup_unavailable: reusable sandbox "${providerLeaseId}" ` +
+        "was confirmed lost, but no complete verified failover backup is available",
+    );
+    this.name = "RunnerHarnessBackupUnavailableError";
+    this.providerLeaseId = providerLeaseId;
+  }
+}
+
 export interface EnvironmentRuntimeLeaseRecord {
   environment: Environment;
   lease: EnvironmentLease;
   leaseContext: ReturnType<typeof buildEnvironmentLeaseContext>;
 }
+
+/**
+ * Host-side decision for the provider resource after a run. This is kept
+ * separate from heartbeat status: a failed turn can still leave a reusable
+ * sandbox resumable, while a disposable successful turn must destroy it.
+ * An omitted disposition preserves the legacy adapter behavior.
+ */
+export type ProviderResourceDisposition =
+  | "keep_running"
+  | "stop_and_retain"
+  | "destroy";
 
 const DEFAULT_PLUGIN_SANDBOX_WORKER_READY_TIMEOUT_MS = 5_000;
 const DEFAULT_PLUGIN_SANDBOX_WORKER_READY_POLL_MS = 100;
@@ -576,6 +762,24 @@ const DEFAULT_DEFERRED_ORPHAN_CLEANUP_BUFFER_LIMIT = 256;
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function transientSandboxResumeFailure(error: unknown): boolean {
+  const candidate = error && typeof error === "object"
+    ? error as Record<string, unknown>
+    : {};
+  const status = typeof candidate.status === "number"
+    ? candidate.status
+    : typeof candidate.statusCode === "number"
+      ? candidate.statusCode
+      : null;
+  if (status === 429 || (status !== null && status >= 500)) return true;
+  const code = typeof candidate.code === "string" ? candidate.code.toUpperCase() : "";
+  if (["ETIMEDOUT", "ECONNRESET", "ECONNREFUSED", "EAI_AGAIN", "ENETUNREACH"].includes(code)) {
+    return true;
+  }
+  const message = error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
+  return /\b(timeout|timed out|rate limit|temporar|network|connection reset|service unavailable)\b/.test(message);
 }
 
 function getLeaseDriverKey(
@@ -873,7 +1077,16 @@ export function findReusableSandboxLeaseId(input: {
   config: SandboxEnvironmentConfig;
   leases: Array<Pick<EnvironmentLease, "providerLeaseId" | "metadata">>;
 }): string | null {
-  return findReusableSandboxProviderLeaseId(input);
+  // Host-only run behavior (for example streamRunLogs) is intentionally not
+  // echoed by a sandbox provider in lease metadata and must not invalidate an
+  // otherwise identical reusable provider lease.
+  return findReusableSandboxProviderLeaseId({
+    config: {
+      provider: input.config.provider,
+      ...stripSandboxProviderEnvelope(input.config),
+    } as SandboxEnvironmentConfig,
+    leases: input.leases,
+  });
 }
 
 function createLocalEnvironmentDriver(db: Db): EnvironmentRuntimeDriver {
@@ -916,6 +1129,16 @@ function createLocalEnvironmentDriver(db: Db): EnvironmentRuntimeDriver {
           workspaceRealization: record,
         },
       };
+    },
+
+    async resolveCapabilities() {
+      // The local driver runs commands on the host file system with no
+      // provider capability model, so its static support definition names
+      // none of the eight capabilities. The classifier resolves every field
+      // `false` regardless of the other inputs, so this method needs none.
+      return classifyEnvironmentCapabilities({
+        supportedCapabilities: ENVIRONMENT_DRIVER_CAPABILITY_SUPPORT.local.supportedCapabilities,
+      });
     },
   };
 }
@@ -979,6 +1202,49 @@ function createSshEnvironmentDriver(db: Db): EnvironmentRuntimeDriver {
           workspaceRealization: record,
         },
       };
+    },
+
+    async resolveCapabilities() {
+      // The SSH driver runs commands on a remote host through the SSH
+      // transport with no provider capability model, so it supports none of
+      // the eight capabilities either.
+      return classifyEnvironmentCapabilities({
+        supportedCapabilities: ENVIRONMENT_DRIVER_CAPABILITY_SUPPORT.ssh.supportedCapabilities,
+      });
+    },
+  };
+}
+
+/**
+ * Adapt the worker manager's duplex host session to the cross-layer channel. The
+ * two shapes differ in the exit and stop members: the host session resolves the
+ * exit one time from `wait()`, so the channel bridges it to a one-time `onExit`
+ * listener; `kill()` maps to `stop()`. The `write`, `onData`, and `close`
+ * members map one to one.
+ */
+function adaptDuplexChannelHostSession(
+  session: DuplexChannelHostSession,
+): CommandManagedDuplexChannel {
+  return {
+    write(data: Uint8Array): void {
+      session.write(data);
+    },
+    onData(listener: (chunk: Uint8Array) => void): void {
+      session.onData(listener);
+    },
+    onExit(listener: (exit: { exitCode: number | null; transportClosed?: boolean }) => void): void {
+      // `wait()` resolves one time with the exit and never rejects, so a single
+      // `then` bridges it to the one-time exit listener. The exit carries
+      // `transportClosed`, so the broker tells a real exit from a transport close.
+      void session.wait().then((exit) => {
+        listener(exit);
+      });
+    },
+    stop(): void {
+      session.kill();
+    },
+    close(): Promise<void> {
+      return session.close();
     },
   };
 }
@@ -1615,23 +1881,40 @@ function createSandboxEnvironmentDriver(
           : null;
 
         let providerLease: PluginEnvironmentLease | null = null;
+        let replacementReason:
+          | "not_found"
+          | "expired"
+          | "identity_mismatch"
+          | "resume_failed"
+          | undefined;
         if (reusableLease?.providerLeaseId) {
           // The `supportsReusableLeases` check above reads a snapshot of the
           // worker methods. The runtime then does asynchronous database work
           // (list, fingerprint, obsolete-lease cleanup) before this dispatch. A
           // worker restart in that window can drop `environmentResumeLease`
           // while the snapshot still marks the method verified. Re-check the
-          // live worker here and fail closed when the method is absent: skip the
-          // resume, destroy the stale reusable lease, and acquire a fresh lease
-          // below. The runtime never dispatches a resume the live worker cannot
-          // serve.
+          // live worker here and fail closed when the method is absent. The
+          // runtime preserves the recorded lease and never dispatches a resume
+          // the live worker cannot serve.
           const workerVerifiesResume = pluginWorkerVerifiesLifecycleMethod(
             pluginProvider.resolved.plugin.id,
             "environmentResumeLease",
           );
-          if (workerVerifiesResume) {
-            try {
-              const resumed = await pluginWorkerManager.call(
+          if (!workerVerifiesResume) {
+            throw new ReusableSandboxResumeError({
+              provider: parsed.config.provider,
+              providerLeaseId: reusableLease.providerLeaseId,
+            });
+          }
+          try {
+            const resumeDeadline = Date.now() + 60_000;
+            const configuredResumeTimeoutMs =
+              resolvePluginSandboxRpcTimeoutMs(workerConfig) ?? 60_000;
+            let retryDelayMs = 250;
+            let resumed: PluginEnvironmentLease;
+            while (true) {
+              try {
+                resumed = await pluginWorkerManager.call(
                   pluginProvider.resolved.plugin.id,
                   "environmentResumeLease",
                   {
@@ -1643,21 +1926,65 @@ function createSandboxEnvironmentDriver(
                     providerLeaseId: reusableLease.providerLeaseId,
                     leaseMetadata: reusableLease.metadata ?? undefined,
                   },
-                  resolvePluginSandboxRpcTimeoutMs(workerConfig),
+                  Math.min(
+                    configuredResumeTimeoutMs,
+                    Math.max(1, resumeDeadline - Date.now()),
+                  ),
                 );
-              providerLease =
-                typeof resumed.providerLeaseId === "string" && resumed.providerLeaseId.length > 0
-                  ? resumed
-                  : null;
-            } catch {
-              providerLease = null;
+                break;
+              } catch (error) {
+                if (
+                  !transientSandboxResumeFailure(error) ||
+                  Date.now() + retryDelayMs * 1.25 >= resumeDeadline
+                ) throw error;
+                const jitteredDelayMs = Math.max(
+                  1,
+                  Math.round(retryDelayMs * (0.75 + Math.random() * 0.5)),
+                );
+                await delay(jitteredDelayMs);
+                retryDelayMs = Math.min(retryDelayMs * 2, 5_000);
+              }
             }
+            providerLease =
+              typeof resumed.providerLeaseId === "string" && resumed.providerLeaseId.length > 0
+                ? resumed
+                : null;
+            if (!providerLease) {
+              const sentinel = isRecord(resumed.metadata?.workspaceSentinel)
+                ? resumed.metadata.workspaceSentinel
+                : null;
+              replacementReason = sentinel && sentinel.result !== "matched"
+                ? "identity_mismatch"
+                : resumed.metadata?.expired === true
+                  ? "not_found"
+                  : "expired";
+            }
+          } catch (error) {
+            throw new ReusableSandboxResumeError({
+              provider: parsed.config.provider,
+              providerLeaseId: reusableLease.providerLeaseId,
+              cause: error,
+            });
           }
           if (!providerLease) {
+            if (
+              input.adapterType === "paperclip_runner" &&
+              !verifyNativeHarnessBackupStamp(
+                reusableLease.metadata?.nativeHarnessBackup,
+                reusableLease.providerLeaseId,
+              )
+            ) {
+              throw new RunnerHarnessBackupUnavailableError(
+                reusableLease.providerLeaseId,
+              );
+            }
+            // The verified, lease-bound backup authorizes destructive
+            // replacement. Keep the existing sandbox intact when validation
+            // fails so the only recoverable provider state is not lost.
             await destroyReusableSandboxLease({
               environment: input.environment,
               lease: reusableLease,
-              failureReason: workerVerifiesResume ? "resume_failed" : "resume_capability_lost",
+              failureReason: replacementReason ?? "resume_failed",
             });
           }
         }
@@ -1727,6 +2054,26 @@ function createSandboxEnvironmentDriver(
           sandboxProviderPlugin: true,
           ...sandboxConfigForLeaseMetadata(storedConfig),
           ...sanitizedProviderMetadata,
+          sandboxLeaseAcquisition: providerLease
+            ? {
+                outcome: "resumed",
+              }
+            : reusableLease?.providerLeaseId
+              ? {
+                  outcome: "replacement",
+                  reason: replacementReason ?? "resume_failed",
+                }
+              : {
+                  outcome: "created",
+                },
+          ...(reusableLease?.metadata?.nativeHarnessBackup
+            ? { nativeHarnessBackup: reusableLease.metadata.nativeHarnessBackup }
+            : {}),
+          ...(providerLease && reusableLease?.metadata?.nativeWorkspaceSync
+            ? {
+                nativeWorkspaceSync: reusableLease.metadata.nativeWorkspaceSync,
+              }
+            : {}),
           ...(reusableScope ? { reusableSandboxLease: reusableScope } : {}),
         };
         try {
@@ -1745,6 +2092,16 @@ function createSandboxEnvironmentDriver(
               acquiredLease.expiresAt ? new Date(acquiredLease.expiresAt) : undefined,
             ),
             metadata: pluginLeaseMetadata,
+            reusesReusableLeaseId:
+              providerLease &&
+              reusableLease?.heartbeatRunId === input.heartbeatRunId
+                ? reusableLease.id
+                : null,
+            replacesReusableLeaseId:
+              providerLease &&
+              reusableLease?.heartbeatRunId !== input.heartbeatRunId
+                ? reusableLease?.id
+                : null,
           });
         } catch (error) {
           // The conditional lease insert rejected, so no lease row exists. A
@@ -1893,10 +2250,10 @@ function createSandboxEnvironmentDriver(
         });
       } catch (error) {
         if (reusableLease) {
-          await destroyReusableSandboxLease({
-            environment: input.environment,
-            lease: reusableLease,
-            failureReason: "resume_failed",
+          throw new ReusableSandboxResumeError({
+            provider: parsed.config.provider,
+            providerLeaseId: reusableLease.providerLeaseId!,
+            cause: error,
           });
         }
         throw error;
@@ -1933,6 +2290,29 @@ function createSandboxEnvironmentDriver(
         driver: input.environment.driver,
         executionWorkspaceMode: input.executionWorkspaceMode,
         ...providerLease.metadata,
+        sandboxLeaseAcquisition:
+          reusableLease && providerLease.providerLeaseId === reusableLease.providerLeaseId
+            ? {
+                outcome: "resumed",
+              }
+            : reusableLease?.providerLeaseId
+              ? {
+                  outcome: "replacement",
+                  reason: "resume_failed",
+                }
+              : {
+                  outcome: "created",
+                },
+        ...(reusableLease?.metadata?.nativeHarnessBackup
+          ? { nativeHarnessBackup: reusableLease.metadata.nativeHarnessBackup }
+          : {}),
+        ...(reusableLease &&
+        providerLease.providerLeaseId === reusableLease.providerLeaseId &&
+        reusableLease.metadata?.nativeWorkspaceSync
+          ? {
+              nativeWorkspaceSync: reusableLease.metadata.nativeWorkspaceSync,
+            }
+          : {}),
         ...(reusableScope ? { reusableSandboxLease: reusableScope } : {}),
       };
       try {
@@ -1951,6 +2331,18 @@ function createSandboxEnvironmentDriver(
             providerLease.expiresAt ? new Date(providerLease.expiresAt) : undefined,
           ),
           metadata: builtinLeaseMetadata,
+          reusesReusableLeaseId:
+            reusableLease &&
+            providerLease.providerLeaseId === reusableLease.providerLeaseId &&
+            reusableLease.heartbeatRunId === input.heartbeatRunId
+              ? reusableLease.id
+              : null,
+          replacesReusableLeaseId:
+            reusableLease &&
+            providerLease.providerLeaseId === reusableLease.providerLeaseId &&
+            reusableLease.heartbeatRunId !== input.heartbeatRunId
+              ? reusableLease.id
+              : null,
         });
       } catch (error) {
         // The conditional lease insert rejected, so no lease row exists. A managed
@@ -2359,83 +2751,124 @@ function createSandboxEnvironmentDriver(
       return await callPluginEnvironmentSync("environmentSyncOut", input);
     },
 
-    async effectiveSandboxCapabilities(input) {
-      const metadata = input.lease.metadata ?? {};
-      const providerKey =
-        readString(metadata.provider) ??
-        (input.environment.driver === "sandbox"
-          ? readString((parseEnvironmentDriverConfig(input.environment).config as SandboxEnvironmentConfig).provider)
-          : null);
-      if (!providerKey) {
-        return resolveEffectiveSandboxCapabilities({ verifiedMethods: [], declared: null, narrowing: null });
+    async openDuplexChannel(input) {
+      // Plugin-backed sandbox providers only: open the host-owned duplex route on
+      // the plugin worker. The lease scope mirrors the sandbox execute path — the
+      // provider driver key, the company, the environment, and the provider lease
+      // id — so the route binds to the same worker session the runner streams.
+      if (!input.lease.metadata?.sandboxProviderPlugin || !pluginWorkerManager) {
+        throw new Error("Sandbox driver does not support duplex channels for this lease.");
       }
-
-      let declared: SandboxProviderCapabilities | null = null;
-      let verifiedMethods: readonly string[] = [];
-      let configResolutionFailed = false;
-
-      if (metadata.sandboxProviderPlugin) {
-        const pluginId = readString(metadata.pluginId);
-        // Read the declaration from the exact plugin that acquired the lease,
-        // not the first installed plugin with this driver key. A driver key is
-        // only unique inside one manifest, so two plugins can share it. The
-        // by-key resolver could intersect this lease's verified methods with a
-        // different plugin's declaration. This resolver fails closed: it returns
-        // null when the pinned plugin id is absent, or when that exact plugin no
-        // longer declares this provider key with the `sandbox_provider` kind.
-        const resolvedDriver = pluginId
-          ? await resolvePluginSandboxProviderDriverById({
-              db,
-              pluginId,
-              driverKey: providerKey,
-            })
-          : null;
-        if (!pluginId || !resolvedDriver) {
-          // Exact-plugin identity failure. The lease pins a plugin id, but the
-          // id is missing, that plugin is absent, or it no longer declares this
-          // provider key. Fail closed: resolve every effective capability to
-          // false, no matter what methods a stale or running worker still
-          // advertises. Do not read the worker methods here; passing them would
-          // let an identity-less lease keep a verified baseline. This differs
-          // from a valid plugin whose manifest merely omits
-          // `sandboxCapabilities`: that case keeps `declared` null below and
-          // defers to verified worker discovery.
-          return resolveEffectiveSandboxCapabilities({
-            verifiedMethods: [],
-            declared: null,
-            narrowing: null,
-          });
-        }
-        verifiedMethods = pluginWorkerManager?.getWorker(pluginId)?.supportedMethods ?? [];
-        declared = resolveDeclaredSandboxCapabilities(resolvedDriver.driver);
-        try {
-          // Resolve the provider config to confirm it is readable. A provider
-          // whose config cannot be resolved is untrusted, so a resolution error
-          // fails closed on persistent process sessions below. The resolved
-          // value itself is no longer read for the narrowing decision.
-          await resolvePluginSandboxRuntimeConfig({
-            environment: input.environment,
-            lease: input.lease,
-            provider: providerKey,
-          });
-        } catch {
-          configResolutionFailed = true;
-        }
-      } else {
-        const builtin = getBuiltinSandboxProvider(providerKey);
-        verifiedMethods = builtinSandboxProviderVerifiedMethods(builtin);
-        declared = resolveDeclaredSandboxCapabilities({
-          supportsReusableLeases: builtin?.supportsReusableLeases,
-        });
+      const pluginId = readString(input.lease.metadata?.pluginId);
+      const providerKey = readString(input.lease.metadata?.provider);
+      const providerLeaseId = readString(input.lease.providerLeaseId);
+      if (!pluginId || !providerKey || !providerLeaseId) {
+        throw new Error(
+          "Sandbox duplex channel needs a plugin id, a provider key, and a provider lease id on the lease.",
+        );
       }
+      const worker = pluginWorkerManager.getWorker(pluginId);
+      if (!worker) {
+        throw new Error(`Plugin worker "${pluginId}" is not running for the duplex channel.`);
+      }
+      const managerInput: WorkerManagerDuplexChannelOpenInput = {
+        driverKey: providerKey,
+        companyId: input.lease.companyId,
+        environmentId: input.environment.id,
+        providerLeaseId,
+        command: input.command,
+      };
+      const session = await worker.openDuplexChannel(managerInput);
+      return adaptDuplexChannelHostSession(session);
+    },
 
-      const narrowing = buildSandboxCapabilityNarrowing({
-        leasePolicy: input.lease.leasePolicy,
-        leaseMetadata: metadata,
-        configResolutionFailed,
+    async resolveCapabilities(input) {
+      return await resolveSandboxCapabilitiesForLease(input);
+    },
+
+    async getRunnerIngressEndpoint(input) {
+      if (!input.lease.metadata?.sandboxProviderPlugin || !pluginWorkerManager) {
+        throw new Error("Sandbox driver does not support runner ingress for this lease.");
+      }
+      const pluginId = readString(input.lease.metadata.pluginId);
+      const providerKey = readString(input.lease.metadata.provider);
+      if (!pluginId || !providerKey || !input.lease.providerLeaseId) {
+        throw new Error("Sandbox runner ingress is missing its provider identity.");
+      }
+      const config = await resolvePluginSandboxRuntimeConfig({
+        environment: input.environment,
+        lease: input.lease,
+        provider: providerKey,
       });
-
-      return resolveEffectiveSandboxCapabilities({ verifiedMethods, declared, narrowing });
+      const sanitizedConfig = stripSandboxProviderEnvelope(
+        config as SandboxEnvironmentConfig,
+      );
+      const acquire = async (): Promise<RunnerIngressEndpoint> => {
+        const result = await pluginWorkerManager.call(
+          pluginId,
+          "environmentRunnerIngressEndpoint",
+          {
+            driverKey: providerKey,
+            companyId: input.lease.companyId,
+            environmentId: input.environment.id,
+            issueId: input.lease.issueId,
+            config: sanitizedConfig,
+            lease: {
+              providerLeaseId: input.lease.providerLeaseId,
+              metadata: input.lease.metadata ?? undefined,
+              expiresAt: input.lease.expiresAt?.toISOString() ?? null,
+            },
+            port: input.port,
+            path: input.path,
+          },
+          resolvePluginSandboxRpcTimeoutMs(sanitizedConfig),
+        );
+        const endpointUrl = new URL(result.websocketUrl);
+        if (
+          result.kind !== "authenticated_websocket" ||
+          endpointUrl.protocol !== "wss:" ||
+          endpointUrl.username ||
+          endpointUrl.password ||
+          endpointUrl.search ||
+          endpointUrl.hash ||
+          endpointUrl.pathname !== input.path ||
+          !result.generation
+        ) {
+          throw new Error("Sandbox provider returned an invalid runner ingress endpoint.");
+        }
+        const secretHeaders = result.secretHeaders.map((header) => {
+          if (!/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(header.name) || !header.value) {
+            throw new Error("Sandbox provider returned an invalid runner ingress secret header.");
+          }
+          const secretHeader = { name: header.name } as {
+            name: string;
+            readonly value: string;
+            toJSON(): { name: string; value: "[REDACTED]" };
+          };
+          Object.defineProperty(secretHeader, "value", {
+            enumerable: false,
+            configurable: false,
+            writable: false,
+            value: header.value,
+          });
+          Object.defineProperty(secretHeader, "toJSON", {
+            enumerable: false,
+            configurable: false,
+            writable: false,
+            value: () => ({ name: header.name, value: "[REDACTED]" as const }),
+          });
+          return Object.freeze(secretHeader);
+        });
+        return {
+          kind: "authenticated_websocket",
+          websocketUrl: endpointUrl.toString(),
+          secretHeaders: Object.freeze(secretHeaders),
+          generation: result.generation,
+          refresh: acquire,
+          close: async () => undefined,
+        };
+      };
+      return await acquire();
     },
 
     async destroyRunLease(input) {
@@ -2446,6 +2879,108 @@ function createSandboxEnvironmentDriver(
       });
     },
   };
+
+  /**
+   * Resolve the effective capability snapshot for one sandbox lease. This is
+   * the sandbox driver's implementation of the general capability-resolution
+   * method: it gates through {@link ENVIRONMENT_DRIVER_CAPABILITY_SUPPORT}'s
+   * `sandbox` support (the whole set, so this gate adds no restriction beyond
+   * declaration, verification, and narrowing), then reads the per-lease
+   * declaration, the live verified worker methods, and the per-lease
+   * narrowing, exactly as the runtime resolved them before this method
+   * existed.
+   */
+  async function resolveSandboxCapabilitiesForLease(
+    input: EnvironmentDriverLeaseInput,
+  ): Promise<EffectiveExecutionCapabilities> {
+    const metadata = input.lease.metadata ?? {};
+    const providerKey =
+      readString(metadata.provider) ??
+      (input.environment.driver === "sandbox"
+        ? readString((parseEnvironmentDriverConfig(input.environment).config as SandboxEnvironmentConfig).provider)
+        : null);
+    if (!providerKey) {
+      return classifyEnvironmentCapabilities({
+        verifiedMethods: [],
+        declared: null,
+        narrowing: null,
+        supportedCapabilities: ENVIRONMENT_DRIVER_CAPABILITY_SUPPORT.sandbox.supportedCapabilities,
+      });
+    }
+
+    let declared: SandboxProviderCapabilities | null = null;
+    let verifiedMethods: readonly string[] = [];
+    let configResolutionFailed = false;
+
+    if (metadata.sandboxProviderPlugin) {
+      const pluginId = readString(metadata.pluginId);
+      // Read the declaration from the exact plugin that acquired the lease,
+      // not the first installed plugin with this driver key. A driver key is
+      // only unique inside one manifest, so two plugins can share it. The
+      // by-key resolver could intersect this lease's verified methods with a
+      // different plugin's declaration. This resolver fails closed: it returns
+      // null when the pinned plugin id is absent, or when that exact plugin no
+      // longer declares this provider key with the `sandbox_provider` kind.
+      const resolvedDriver = pluginId
+        ? await resolvePluginSandboxProviderDriverById({
+            db,
+            pluginId,
+            driverKey: providerKey,
+          })
+        : null;
+      if (!pluginId || !resolvedDriver) {
+        // Exact-plugin identity failure. The lease pins a plugin id, but the
+        // id is missing, that plugin is absent, or it no longer declares this
+        // provider key. Fail closed: resolve every effective capability to
+        // false, no matter what methods a stale or running worker still
+        // advertises. Do not read the worker methods here; passing them would
+        // let an identity-less lease keep a verified baseline. This differs
+        // from a valid plugin whose manifest merely omits
+        // `sandboxCapabilities`: that case keeps `declared` null below and
+        // defers to verified worker discovery.
+        return classifyEnvironmentCapabilities({
+          verifiedMethods: [],
+          declared: null,
+          narrowing: null,
+          supportedCapabilities: ENVIRONMENT_DRIVER_CAPABILITY_SUPPORT.sandbox.supportedCapabilities,
+        });
+      }
+      verifiedMethods = pluginWorkerManager?.getWorker(pluginId)?.supportedMethods ?? [];
+      declared = resolveDeclaredSandboxCapabilities(resolvedDriver.driver);
+      try {
+        // Resolve the provider config to confirm it is readable. A provider
+        // whose config cannot be resolved is untrusted, so a resolution error
+        // fails closed on persistent process sessions below. The resolved
+        // value itself is no longer read for the narrowing decision.
+        await resolvePluginSandboxRuntimeConfig({
+          environment: input.environment,
+          lease: input.lease,
+          provider: providerKey,
+        });
+      } catch {
+        configResolutionFailed = true;
+      }
+    } else {
+      const builtin = getBuiltinSandboxProvider(providerKey);
+      verifiedMethods = builtinSandboxProviderVerifiedMethods(builtin);
+      declared = resolveDeclaredSandboxCapabilities({
+        supportsReusableLeases: builtin?.supportsReusableLeases,
+      });
+    }
+
+    const narrowing = buildSandboxCapabilityNarrowing({
+      leasePolicy: input.lease.leasePolicy,
+      leaseMetadata: metadata,
+      configResolutionFailed,
+    });
+
+    return classifyEnvironmentCapabilities({
+      verifiedMethods,
+      declared,
+      narrowing,
+      supportedCapabilities: ENVIRONMENT_DRIVER_CAPABILITY_SUPPORT.sandbox.supportedCapabilities,
+    });
+  }
 
   /**
    * Verify that the live plugin worker still advertises a reusable-lease
@@ -2660,6 +3195,9 @@ const INTERNAL_PLUGIN_SANDBOX_CONFIG_KEYS = new Set([
   "remoteCwd",
   "shellCommand",
   "sandboxProviderPlugin",
+  "sandboxLeaseAcquisition",
+  "nativeHarnessBackup",
+  "nativeWorkspaceSync",
 ]);
 
 // Drop the host-internal and per-lease runtime keys from a sandbox config
@@ -2954,6 +3492,57 @@ function createPluginEnvironmentDriver(
         },
       });
     },
+
+    async resolveCapabilities(input) {
+      const metadata = input.lease.metadata ?? {};
+      const pluginId = readString(metadata.pluginId);
+      const driverKey = readString(metadata.driverKey);
+      const noCapabilities = () =>
+        classifyEnvironmentCapabilities({
+          verifiedMethods: [],
+          declared: null,
+          narrowing: null,
+          supportedCapabilities: ENVIRONMENT_DRIVER_CAPABILITY_SUPPORT.plugin.supportedCapabilities,
+        });
+
+      if (!pluginId || !driverKey) {
+        // The lease carries no plugin pin, so there is no exact plugin to read
+        // the declaration or the live worker methods from. Fail closed: resolve
+        // every capability false.
+        return noCapabilities();
+      }
+
+      // Read the declaration from the exact plugin that acquired the lease, not
+      // the plugin the environment's current config names. A plugin uninstall,
+      // a manifest change, or a config edit between the acquire and this call
+      // must not let a stale declaration or a different plugin's worker grant a
+      // capability this lease never verified.
+      const plugin = await pluginRegistry.getById(pluginId);
+      const declaredDriver =
+        plugin && plugin.status === "ready"
+          ? plugin.manifestJson.environmentDrivers?.find((candidate) => candidate.driverKey === driverKey)
+          : undefined;
+      if (!plugin || plugin.status !== "ready" || !declaredDriver) {
+        return noCapabilities();
+      }
+
+      // Read the live worker method list fresh on every call. A worker restart
+      // can drop or add a method between the acquire and this call, so the
+      // runtime never trusts a cached method list for a capability grant.
+      const verifiedMethods = workerManager.getWorker(plugin.id)?.supportedMethods ?? [];
+      const declared = resolveDeclaredSandboxCapabilities(declaredDriver);
+      const narrowing = buildSandboxCapabilityNarrowing({
+        leasePolicy: input.lease.leasePolicy,
+        leaseMetadata: metadata,
+      });
+
+      return classifyEnvironmentCapabilities({
+        verifiedMethods,
+        declared,
+        narrowing,
+        supportedCapabilities: ENVIRONMENT_DRIVER_CAPABILITY_SUPPORT.plugin.supportedCapabilities,
+      });
+    },
   };
 }
 
@@ -3023,6 +3612,17 @@ export function environmentRuntimeService(
   return {
     getDriver,
 
+    /**
+     * Read the sandbox duplex bridge kill switch for a new run. The host calls it
+     * per run before it selects the callback bridge transport. It reads the
+     * experimental instance setting `enableSandboxDuplexBridge` and maps it into
+     * the resolved bridge input. The default-off setting keeps the file bridge.
+     */
+    async readSandboxDuplexBridgeInput(): Promise<ResolvedSandboxDuplexBridgeInput> {
+      const experimental = await instanceSettingsService(db).getExperimental();
+      return resolveSandboxDuplexBridgeInput(experimental);
+    },
+
     async acquireRunLease(input: {
       companyId: string;
       environment: Environment;
@@ -3087,6 +3687,7 @@ export function environmentRuntimeService(
       heartbeatRunId: string,
       status: Extract<EnvironmentLeaseStatus, "released" | "expired" | "failed"> = "released",
       onLeaseReleaseError?: (leaseId: string, error: unknown) => void,
+      providerResourceDisposition?: ProviderResourceDisposition,
     ): Promise<EnvironmentRuntimeLeaseRecord[]> {
       const leaseRows = await db
         .select()
@@ -3114,14 +3715,75 @@ export function environmentRuntimeService(
           if (!environment) continue;
 
           const leaseSnapshot = toEnvironmentLeaseSnapshot(leaseRow);
+          if (
+            providerResourceDisposition === "keep_running" &&
+            leaseSnapshot.leasePolicy === "reuse_by_environment"
+          ) {
+            const lease = await environmentsSvc.releaseLease(
+              leaseRow.id,
+              "retained",
+              { cleanupStatus: "success" },
+            );
+            if (lease) {
+              released.push({
+                environment,
+                lease,
+                leaseContext: {
+                  executionWorkspaceId: lease.executionWorkspaceId,
+                  executionWorkspaceMode:
+                    (lease.metadata?.executionWorkspaceMode as ExecutionWorkspace["mode"] | null | undefined) ?? null,
+                },
+              });
+            }
+            continue;
+          }
           const driver = getDriver(getLeaseDriverKey(leaseSnapshot, environment));
-          const lease = driver
-            ? await driver.releaseRunLease({
+          if (
+            providerResourceDisposition === "keep_running" &&
+            leaseSnapshot.leasePolicy !== "reuse_by_environment"
+          ) {
+            throw new Error(
+              `Cannot keep non-reusable environment lease "${leaseSnapshot.id}" running.`,
+            );
+          }
+          if (
+            providerResourceDisposition === "destroy" &&
+            isRecord(leaseSnapshot.metadata?.reusableSandboxLease) &&
+            leaseSnapshot.metadata.reusableSandboxLease.adapterType ===
+              "paperclip_runner" &&
+            leaseSnapshot.metadata?.sandboxLeaseAcquisition &&
+            (!leaseSnapshot.providerLeaseId ||
+              !verifyNativeHarnessBackupStamp(
+                leaseSnapshot.metadata.nativeHarnessBackup,
+                leaseSnapshot.providerLeaseId,
+              ))
+          ) {
+            throw new RunnerHarnessBackupUnavailableError(
+              leaseSnapshot.providerLeaseId ?? leaseSnapshot.id,
+            );
+          }
+          const lease = providerResourceDisposition === "destroy" && driver?.destroyRunLease
+            ? await driver.destroyRunLease({
                 environment,
                 lease: leaseSnapshot,
-                status,
+                failureReason: "paperclip_runner_destroy_after_turn",
               })
-            : await environmentsSvc.releaseLease(leaseRow.id, status);
+            : driver
+              ? await driver.releaseRunLease({
+                  environment,
+                  lease: leaseSnapshot,
+                  // A stopped reusable provider resource must remain eligible
+                  // for exact-lease resume independently of turn outcome.
+                  status:
+                    providerResourceDisposition === "stop_and_retain" &&
+                    leaseSnapshot.leasePolicy === "reuse_by_environment"
+                      ? "released"
+                      : status,
+                })
+              : await environmentsSvc.releaseLease(
+                  leaseRow.id,
+                  providerResourceDisposition === "destroy" ? "expired" : status,
+                );
           if (!lease) continue;
 
           released.push({
@@ -3217,8 +3879,39 @@ export function environmentRuntimeService(
           ),
         );
 
+      const holdingRunIds = leaseRows
+        .map((row) => row.heartbeatRunId)
+        .filter((runId): runId is string => Boolean(runId));
+      const liveRunIds = new Set<string>();
+      if (holdingRunIds.length > 0) {
+        const liveRuns = await db
+          .select({ id: heartbeatRuns.id })
+          .from(heartbeatRuns)
+          .where(
+            and(
+              inArray(heartbeatRuns.id, holdingRunIds),
+              inArray(heartbeatRuns.status, [
+                "queued",
+                "scheduled_retry",
+                "running",
+              ]),
+            ),
+          );
+        for (const liveRun of liveRuns) liveRunIds.add(liveRun.id);
+      }
+
       const destroyed: EnvironmentRuntimeLeaseRecord[] = [];
       for (const leaseRow of leaseRows) {
+        // An issue may become terminal inside its provider turn. Do not tear
+        // down the sandbox while that run is still exporting its workspace or
+        // polling the callback bridge. The heartbeat finalizer observes the
+        // terminal issue and destroys the resource after those boundaries.
+        if (
+          leaseRow.heartbeatRunId &&
+          liveRunIds.has(leaseRow.heartbeatRunId)
+        ) {
+          continue;
+        }
         const environment = leaseRow.environmentId
           ? await environmentsSvc.getById(leaseRow.environmentId)
           : null;
@@ -3247,6 +3940,131 @@ export function environmentRuntimeService(
         });
       }
       return destroyed;
+    },
+
+    /**
+     * Destroy every reusable sandbox lease still owned by one environment, so a
+     * consented environment delete can proceed. This must run while the
+     * environment row still exists: the driver resolves provider credentials
+     * from the environment config, and after the delete the normal destroy path
+     * has no context left. A per-lease failure is contained — the driver routes
+     * a failed teardown to `pending_cleanup` for the sweep, and an unexpected
+     * throw leaves the lease in place — so the caller re-checks the blast
+     * radius instead of trusting these counts for the delete decision.
+     */
+    async destroyReusableSandboxLeasesForEnvironment(input: {
+      environmentId: string;
+      failureReason?: string;
+    }): Promise<{ destroyed: number; failed: number; skippedLiveRun: number }> {
+      const environment = await environmentsSvc.getById(input.environmentId);
+      if (!environment) return { destroyed: 0, failed: 0, skippedLiveRun: 0 };
+      const leaseRows = await db
+        .select()
+        .from(environmentLeases)
+        .where(
+          and(
+            eq(environmentLeases.environmentId, input.environmentId),
+            eq(environmentLeases.leasePolicy, "reuse_by_environment"),
+            inArray(environmentLeases.status, ["active", "released", "retained"]),
+          ),
+        );
+
+      // A lease whose holding run is still in flight keeps its sandbox: the
+      // consented delete must not tear a live run's environment out from under
+      // it. The skipped lease keeps blocking the delete, so the caller's
+      // blast-radius re-check rejects and the operator retries after the run
+      // finishes. A lease pointing at a finished run — or at no run — is a
+      // stale reservation and destroys normally.
+      const holdingRunIds = leaseRows
+        .map((row) => row.heartbeatRunId)
+        .filter((runId): runId is string => Boolean(runId));
+      const liveRunIds = new Set<string>();
+      if (holdingRunIds.length > 0) {
+        const liveRuns = await db
+          .select({ id: heartbeatRuns.id })
+          .from(heartbeatRuns)
+          .where(
+            and(
+              inArray(heartbeatRuns.id, holdingRunIds),
+              inArray(heartbeatRuns.status, ["queued", "scheduled_retry", "running"]),
+            ),
+          );
+        for (const run of liveRuns) liveRunIds.add(run.id);
+      }
+
+      let destroyed = 0;
+      let failed = 0;
+      let skippedLiveRun = 0;
+      const failureReason = input.failureReason ?? "environment_delete_requested";
+      const now = new Date();
+      for (const leaseRow of leaseRows) {
+        if (leaseRow.heartbeatRunId && liveRunIds.has(leaseRow.heartbeatRunId)) {
+          skippedLiveRun += 1;
+          continue;
+        }
+        // Claim the row BEFORE the provider call, mirroring the inline-teardown
+        // invariant used elsewhere in this file: no provider destroy without a
+        // durable `pending_cleanup` reference already on disk. The claim is one
+        // conditional UPDATE, so it is the fence against a racing resume: a
+        // resume that re-activates the lease first makes the status predicate
+        // (or the run-liveness predicate) fail and the claim loses — the live
+        // run keeps its sandbox. A claim that wins parks the lease where the
+        // cleanup sweep owns it, so a crash or thrown destroy after this point
+        // is recovered by the sweep's idempotent teardown, and a double write
+        // failure cannot strand the lease in a reusable status.
+        const claimedRow = await db
+          .update(environmentLeases)
+          .set({
+            status: "pending_cleanup",
+            failureReason,
+            cleanupStatus: "failed",
+            releasedAt: now,
+            lastUsedAt: now,
+            updatedAt: now,
+          })
+          .where(
+            and(
+              eq(environmentLeases.id, leaseRow.id),
+              inArray(environmentLeases.status, ["active", "released", "retained"]),
+              sql`NOT EXISTS (
+                SELECT 1 FROM ${heartbeatRuns}
+                WHERE ${heartbeatRuns.id} = ${environmentLeases.heartbeatRunId}
+                  AND ${heartbeatRuns.status} IN ('queued', 'scheduled_retry', 'running')
+              )`,
+            ),
+          )
+          .returning()
+          .then((rows) => rows[0] ?? null);
+        if (!claimedRow) {
+          // Lost to a racing resume or a concurrent terminal transition — the
+          // lease is no longer ours to destroy.
+          skippedLiveRun += 1;
+          continue;
+        }
+        const leaseSnapshot = toEnvironmentLeaseSnapshot(claimedRow);
+        try {
+          const driver = getDriver(getLeaseDriverKey(leaseSnapshot, environment));
+          if (!driver?.destroyRunLease) {
+            // No driver available: the claim already parked the lease for the
+            // sweep, which retries once the driver's plugin is back.
+            failed += 1;
+            continue;
+          }
+          const lease = await driver.destroyRunLease({
+            environment,
+            lease: leaseSnapshot,
+            failureReason,
+          });
+          if (lease && lease.status !== "pending_cleanup") destroyed += 1;
+          else failed += 1;
+        } catch {
+          // The claim above already parked the lease in `pending_cleanup`, so
+          // the sweep owns the retry; its teardown is idempotent, so a destroy
+          // that reached the provider before the throw resolves as success.
+          failed += 1;
+        }
+      }
+      return { destroyed, failed, skippedLiveRun };
     },
 
     async resumeRunLease(input: EnvironmentDriverLeaseInput): Promise<PluginEnvironmentLease | EnvironmentLease | null> {
@@ -3288,11 +4106,19 @@ export function environmentRuntimeService(
       return driver?.supportsSync?.(input) ?? false;
     },
 
-    async effectiveSandboxCapabilities(
+    /**
+     * Resolve the general per-lease capability snapshot through the driver's
+     * {@link EnvironmentRuntimeDriver.resolveCapabilities}. Every registered
+     * driver implements this method, so it returns a full snapshot for any
+     * registered driver. It returns `null` only when the lease's driver is
+     * not registered — never as a stand-in for "every capability denied".
+     */
+    async resolveCapabilities(
       input: EnvironmentDriverLeaseInput,
-    ): Promise<EffectiveSandboxCapabilities | null> {
+    ): Promise<EffectiveExecutionCapabilities | null> {
       const driver = getDriver(getLeaseDriverKey(input.lease, input.environment));
-      return (await driver?.effectiveSandboxCapabilities?.(input)) ?? null;
+      if (!driver) return null;
+      return await driver.resolveCapabilities(input);
     },
 
     async syncIn(input: EnvironmentDriverSyncInput): Promise<PluginEnvironmentSyncResult> {
@@ -3309,6 +4135,47 @@ export function environmentRuntimeService(
         throw new Error(`Environment driver "${driver.driver}" does not support native file sync.`);
       }
       return await driver.syncOut(input);
+    },
+
+    async openDuplexChannel(
+      input: EnvironmentDriverOpenDuplexChannelInput,
+    ): Promise<CommandManagedDuplexChannel> {
+      const driver = requireDriverKey(getLeaseDriverKey(input.lease, input.environment));
+      if (!driver.openDuplexChannel) {
+        throw new Error(`Environment driver "${driver.driver}" does not support duplex channels.`);
+      }
+      // Centralize the duplex channel authorization here. Resolve the exact lease
+      // capability snapshot through the general resolver and refuse unless the
+      // effective snapshot grants the opt-in `duplexCommandStream` capability.
+      // This gate runs before the driver call, so an unauthorized lease never
+      // reaches the worker. The execution-target member gate stays as defense
+      // in depth. A driver that cannot resolve the snapshot fails closed with
+      // the fixed refusal.
+      const effective = await driver.resolveCapabilities(input);
+      if (effective.duplexCommandStream !== true) {
+        throw new Error(DUPLEX_CHANNEL_CAPABILITY_DENIED);
+      }
+      return await driver.openDuplexChannel(input);
+    },
+
+    async getRunnerIngressEndpoint(
+      input: EnvironmentDriverRunnerIngressInput,
+    ): Promise<RunnerIngressEndpoint> {
+      const driver = requireDriverKey(
+        getLeaseDriverKey(input.lease, input.environment),
+      );
+      const effective = await driver.resolveCapabilities(input);
+      if (effective.runnerWebSocketIngress !== true) {
+        throw new Error(
+          "Sandbox lease does not grant runner WebSocket ingress.",
+        );
+      }
+      if (!driver.getRunnerIngressEndpoint) {
+        throw new Error(
+          `Environment driver "${driver.driver}" does not support runner ingress.`,
+        );
+      }
+      return await driver.getRunnerIngressEndpoint(input);
     },
   };
 }

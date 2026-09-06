@@ -733,6 +733,7 @@ function interactionVerbs(kind: string, payload: Record<string, unknown>) {
 export function interactionResolverAudience(
   row: {
     addresseeAgentId: string | null;
+    addresseeUserId?: string | null;
     createdByAgentId: string | null;
     requestedResolverPolicy: string;
     effectiveResolverPolicy: string;
@@ -752,6 +753,7 @@ export function interactionResolverAudience(
       (row.effectiveResolverPolicySource ?? "requested") as IssueThreadInteractionEffectiveResolverPolicySource,
     resolverPolicyProvenance: provenance,
     addresseeAgentId: row.addresseeAgentId,
+    addresseeUserId: row.addresseeUserId ?? null,
     addresseeName: row.addresseeAgentId ? agentName(row.addresseeAgentId) : null,
     createdByAgentId: row.createdByAgentId,
     createdByAgentName: row.createdByAgentId ? agentName(row.createdByAgentId) : null,
@@ -1172,6 +1174,7 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
           summary: issueThreadInteractions.summary,
           payload: issueThreadInteractions.payload,
           addresseeAgentId: issueThreadInteractions.addresseeAgentId,
+          addresseeUserId: issueThreadInteractions.addresseeUserId,
           createdByAgentId: issueThreadInteractions.createdByAgentId,
           requestedResolverPolicy: issueThreadInteractions.requestedResolverPolicy,
           effectiveResolverPolicy: issueThreadInteractions.effectiveResolverPolicy,
@@ -1207,8 +1210,9 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
         : [];
       const companyAgentMap = new Map(companyAgentRows.map((agent) => [agent.id, agent]));
       const boardInteractionRows = interactionRows.filter((row) =>
-        row.addresseeAgentId === null ||
-        !evaluateAgentInvokability(companyAgentMap.get(row.addresseeAgentId), companyAgentRows).invokable
+        (row.addresseeAgentId === null ||
+          !evaluateAgentInvokability(companyAgentMap.get(row.addresseeAgentId), companyAgentRows).invokable)
+        && (row.addresseeUserId === null || row.addresseeUserId === options.userId)
       );
       const visibleInteractionRows = collapsePendingConfirmationsToNewest(boardInteractionRows);
       const [interactionIssueMap, interactionImageMap, interactionPlanDocumentMap] = await Promise.all([
@@ -1543,6 +1547,42 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
 
       for (const issue of typedBlockedIssues) {
         const descriptor = issue.unblockDescriptor;
+        // BLA-687 recurring check (acceptance criterion 4): a blocked issue
+        // with no unblockDescriptor is invisible to the human-owner branch
+        // below (it requires a descriptor to even read `.action` from), so
+        // it would otherwise never surface here. Surface it to every board
+        // reader instead of silently skipping it — this is the mechanism
+        // that catches the invariant regressing, not just individual
+        // pre-existing violations.
+        if (!descriptor && isProspectiveBlockedTransition(issue)) {
+          const issueSummary = blockedIssueSummaries.get(issue.id) ?? null;
+          add(createItem({
+            companyId,
+            sourceKind: "blocker_attention",
+            subject: issueSubject(prefix, issueSummary ?? issue),
+            whyNow: "This issue is blocked with no unblockDescriptor recorded — no owner, no action, and "
+              + "invisible to any audit that reads that field (BLA-687).",
+            decisionVerbs: decisionVerbs(
+              { id: "unblock", label: "Backfill descriptor", description: "Record a real owner and action, or move the issue out of blocked." },
+              { id: "reassign", label: "Reassign", description: "Route this blocked issue to another owner." },
+            ),
+            inlineResolvable: false,
+            entryRule: "blocked issue is missing unblockDescriptor (BLA-687 invariant)",
+            exitRule: "Issue leaves blocked status, or unblockDescriptor is populated.",
+            dedupKey: `blocked-missing-descriptor:${issue.id}:${issue.blockedTransitionAt.toISOString()}`,
+            severity: "critical",
+            activityAt: toIso(issue.blockedTransitionAt),
+            createdAt: toIso(issue.createdAt),
+            updatedAt: toIso(issue.updatedAt),
+            relatedIssue: null,
+            ...issueContext(issueSummary),
+            detail: {
+              kind: "blocker",
+              blockingIssue: resolveBlockingIssue(issue, blockingIssues.get(issue.id)),
+              images: issueImages(blockerImageMap, issue.id),
+            },
+          }));
+        }
         const humanOwnerMatches = descriptor?.owner === "board"
           || (descriptor?.owner && "userId" in descriptor.owner && descriptor.owner.userId === options.userId);
         if (descriptor && humanOwnerMatches && isProspectiveBlockedTransition(issue)) {

@@ -1,6 +1,6 @@
 import { and, count, eq } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { activityLog, heartbeatRuns } from "@paperclipai/db";
+import { activityLog, heartbeatRuns, issues } from "@paperclipai/db";
 import { isUuidLike, issueWriteDenialResponse } from "@paperclipai/shared";
 import { forbidden } from "../errors.js";
 import { logger } from "../middleware/logger.js";
@@ -27,10 +27,10 @@ export type CrossIssueInfluenceDecision = {
   enforceAt: string;
 };
 
-export function crossIssueInfluenceRunContextError() {
+export function crossIssueInfluenceRunContextError(runId?: string | null) {
   // Copy comes from the shared issue-write denial contract (the open cross-task write design (failure UX))
   // so the agent reading this 403 is told the fix, not just the refusal.
-  const { body } = issueWriteDenialResponse("cross_issue_influence_run_context_required");
+  const { body } = issueWriteDenialResponse("cross_issue_influence_run_context_required", { runId });
   return forbidden(body.error, body.details);
 }
 
@@ -82,7 +82,7 @@ export async function observeCrossIssueInfluence(
 ): Promise<CrossIssueInfluenceDecision | null> {
   // API-key callers control the run header. Reject malformed UUIDs before the
   // database can turn an untrusted identifier into a PostgreSQL cast error.
-  if (!isUuidLike(input.runId)) throw crossIssueInfluenceRunContextError();
+  if (!isUuidLike(input.runId)) throw crossIssueInfluenceRunContextError(input.runId);
 
   return db.transaction(async (tx) => {
     const run = await tx
@@ -106,16 +106,37 @@ export async function observeCrossIssueInfluence(
       run.companyId !== input.companyId ||
       run.agentId !== input.agentId
     ) {
-      throw crossIssueInfluenceRunContextError();
+      throw crossIssueInfluenceRunContextError(input.runId);
     }
 
     const sourceIssueId = readRunSourceIssueId(run.contextSnapshot);
-    if (!sourceIssueId) throw crossIssueInfluenceRunContextError();
     if (
       sourceIssueId === input.targetIssueId ||
-      (input.targetIssueIdentifier && sourceIssueId.toUpperCase() === input.targetIssueIdentifier.toUpperCase())
+      (sourceIssueId && input.targetIssueIdentifier
+        && sourceIssueId.toUpperCase() === input.targetIssueIdentifier.toUpperCase())
     ) {
       return null;
+    }
+    if (!sourceIssueId) {
+      // On-demand/board-triggered runs never record an issue in their wake-time
+      // context snapshot (see BLA-582): the run starts unscoped and only picks up
+      // an issue via checkout mid-heartbeat. Fall back to the live checkout/
+      // execution lock — if this run is the one actively holding the target
+      // issue, the write is unambiguously the run's own issue, not a cross-issue
+      // influence attempt, and skips the cap below entirely.
+      const targetIssue = await tx
+        .select({ checkoutRunId: issues.checkoutRunId, executionRunId: issues.executionRunId })
+        .from(issues)
+        .where(and(eq(issues.id, input.targetIssueId), eq(issues.companyId, input.companyId)))
+        .then((rows) => rows[0] ?? null);
+      if (targetIssue && (targetIssue.checkoutRunId === input.runId || targetIssue.executionRunId === input.runId)) {
+        return null;
+      }
+      // No lock match: this is a genuine cross-issue write from an unscoped
+      // run (e.g. commenting on the run's own blocked issue, which can never
+      // hold the checkout lock). That is exactly the case the per-run cap
+      // below exists to budget, not a reason to fail closed before ever
+      // reaching the counter (GIF-41) — fall through instead of throwing.
     }
 
     const priorCount = await tx

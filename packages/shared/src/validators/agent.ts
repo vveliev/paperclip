@@ -9,9 +9,12 @@ import { agentAdapterTypeSchema } from "../adapter-type.js";
 import { envConfigSchema } from "./secret.js";
 import { trustAuthorizationPolicySchema, trustPresetSchema } from "./trust-policy.js";
 import { agentDesiredSkillSelectionSchema } from "./adapter-skills.js";
+import { objectWithoutDefaults } from "./partial.js";
 
 export const agentPermissionsSchema = z.object({
-  canCreateAgents: z.boolean().optional().default(false),
+  // No schema default: the server derives the default (enabled unless the
+  // permissions record marks the agent low-trust) when the field is omitted.
+  canCreateAgents: z.boolean().optional(),
   canCreateSkills: z.boolean().optional().default(true),
   trustPreset: trustPresetSchema.optional(),
   authorizationPolicy: trustAuthorizationPolicySchema.optional(),
@@ -56,31 +59,33 @@ export const createAgentInstructionsBundleSchema = z.object({
   }),
 });
 
-const agentModelProfileConfigSchema = z.object({
-  enabled: z.boolean().optional(),
-  label: z.string().trim().min(1).optional(),
-  adapterConfig: adapterConfigSchema,
-}).strict();
-
 export const agentRuntimeConfigSchema = z.object({
-  modelProfiles: z.object({
-    cheap: agentModelProfileConfigSchema.optional(),
+  debug: z.object({
+    providerTrace: z.literal("raw").optional(),
   }).strict().optional(),
-}).catchall(z.unknown());
+}).catchall(z.unknown()).superRefine((value, ctx) => {
+  if (Object.prototype.hasOwnProperty.call(value, "modelProfiles")) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["modelProfiles"],
+      message: "runtimeConfig.modelProfiles is no longer supported",
+    });
+  }
+});
 
 export const createAgentSchema = z.object({
   name: z.string().min(1),
   role: z.enum(AGENT_ROLES).optional().default("general"),
   title: z.string().optional().nullable(),
   icon: z.enum(AGENT_ICON_NAMES).optional().nullable(),
-  reportsTo: z.string().uuid().optional().nullable(),
+  reportsTo: z.string().guid().optional().nullable(),
   capabilities: z.string().optional().nullable(),
   desiredSkills: z.array(agentDesiredSkillSelectionSchema).optional(),
   adapterType: agentAdapterTypeSchema,
   adapterConfig: adapterConfigSchema.optional().default({}),
   instructionsBundle: createAgentInstructionsBundleSchema.optional(),
   runtimeConfig: agentRuntimeConfigSchema.optional().default({}),
-  defaultEnvironmentId: z.string().uuid().optional().nullable(),
+  defaultEnvironmentId: z.string().guid().optional().nullable(),
   budgetMonthlyCents: z.number().int().nonnegative().optional().default(0),
   permissions: agentPermissionsSchema.optional(),
   metadata: z.record(z.string(), z.unknown()).optional().nullable(),
@@ -116,14 +121,15 @@ export const builtInAgentResetSchema = z.object({
 export type BuiltInAgentReset = z.infer<typeof builtInAgentResetSchema>;
 
 export const createAgentHireSchema = createAgentSchema.extend({
-  sourceIssueId: z.string().uuid().optional().nullable(),
-  sourceIssueIds: z.array(z.string().uuid()).optional(),
+  sourceIssueId: z.string().guid().optional().nullable(),
+  sourceIssueIds: z.array(z.string().guid()).optional(),
 });
 
 export type CreateAgentHire = z.infer<typeof createAgentHireSchema>;
 
-export const updateAgentSchema = createAgentSchema
-  .omit({ permissions: true })
+export const updateAgentSchema = objectWithoutDefaults(
+  createAgentSchema.omit({ permissions: true }),
+)
   .partial()
   .extend({
     permissions: z.never().optional(),
@@ -143,11 +149,11 @@ export type UpdateAgentInstructionsPath = z.infer<typeof updateAgentInstructions
 
 export const taskBridgeAgentKeyScopeSchema = z.object({
   kind: z.literal("task_bridge"),
-  projectId: z.string().uuid().optional().nullable(),
-  projectIds: z.array(z.string().uuid()).max(50).optional(),
-  parentIssueId: z.string().uuid().optional().nullable(),
-  parentIssueIds: z.array(z.string().uuid()).max(50).optional(),
-  allowedAssigneeAgentIds: z.array(z.string().uuid()).max(50).optional(),
+  projectId: z.string().guid().optional().nullable(),
+  projectIds: z.array(z.string().guid()).max(50).optional(),
+  parentIssueId: z.string().guid().optional().nullable(),
+  parentIssueIds: z.array(z.string().guid()).max(50).optional(),
+  allowedAssigneeAgentIds: z.array(z.string().guid()).max(50).optional(),
 }).strict().superRefine((value, ctx) => {
   const hasProjectBoundary = Boolean(value.projectId) || Boolean(value.projectIds?.length);
   const hasParentBoundary = Boolean(value.parentIssueId) || Boolean(value.parentIssueIds?.length);
@@ -166,7 +172,7 @@ export const standardAgentKeyScopeSchema = z.object({
 
 export const skillTestAgentKeyScopeSchema = z.object({
   kind: z.literal("skill_test"),
-  issueId: z.string().uuid(),
+  issueId: z.string().guid(),
 }).strict();
 
 export const agentApiKeyScopeSchema = z.union([
@@ -208,6 +214,9 @@ export const wakeAgentSchema = z.object({
     (value) => (value === null ? undefined : value),
     z.boolean().optional().default(false),
   ),
+  debug: z.object({
+    providerTrace: z.literal("raw"),
+  }).strict().optional(),
 });
 
 export type WakeAgent = z.infer<typeof wakeAgentSchema>;
@@ -226,7 +235,7 @@ export const testAdapterEnvironmentSchema = z.object({
    * environment is non-local (SSH/sandbox), the test probes are executed
    * inside that environment so the result reflects real agent execution.
    */
-  environmentId: z.string().uuid().optional().nullable(),
+  environmentId: z.string().guid().optional().nullable(),
 });
 
 export type TestAdapterEnvironment = z.infer<typeof testAdapterEnvironmentSchema>;

@@ -10,7 +10,7 @@ import type {
   EnvSecretRefBinding,
   Environment,
 } from "@paperclipai/shared";
-import { AGENT_DEFAULT_MAX_CONCURRENT_RUNS, supportedEnvironmentDriversForAdapter, isValidBrowserCode } from "@paperclipai/shared";
+import { AGENT_DEFAULT_MAX_CONCURRENT_RUNS, supportedEnvironmentDriversForAdapter, isValidBrowserCode, ADAPTER_AUTH_MISSING_CHECK_CODE } from "@paperclipai/shared";
 import type { AdapterModel } from "../api/agents";
 import { agentsApi } from "../api/agents";
 import { ApiError } from "../api/client";
@@ -18,21 +18,36 @@ import { environmentsApi } from "../api/environments";
 import { instanceSettingsApi } from "../api/instanceSettings";
 import { secretsApi } from "../api/secrets";
 import { assetsApi } from "../api/assets";
-import { DEFAULT_CODEX_LOCAL_BYPASS_APPROVALS_AND_SANDBOX } from "@paperclipai/adapter-codex-local";
+import {
+  DEFAULT_CODEX_LOCAL_BYPASS_APPROVALS_AND_SANDBOX,
+  DEFAULT_CODEX_LOCAL_MODEL,
+} from "@paperclipai/adapter-codex-local";
 import { DEFAULT_CURSOR_LOCAL_MODEL } from "@paperclipai/adapter-cursor-local";
 import { DEFAULT_GEMINI_LOCAL_MODEL } from "@paperclipai/adapter-gemini-local";
+import { DEFAULT_KIMI_LOCAL_MODEL } from "@paperclipai/adapter-kimi-local";
 import { DEFAULT_OPENCODE_LOCAL_MODEL } from "@paperclipai/adapter-opencode-local";
-import { ADAPTER_AUTH_MISSING_CHECK_CODE } from "@paperclipai/adapter-codex-local/ui";
 import {
   Popover,
   PopoverContent,
   PopoverTrigger,
 } from "@/components/ui/popover";
 import { Button } from "@/components/ui/button";
-import { FolderOpen, Heart, ChevronDown, X, Copy, Check, ExternalLink, Loader2, TriangleAlert } from "lucide-react";
+import { FolderOpen, Heart, ChevronDown, X, Copy, Check, ExternalLink, Loader2, TriangleAlert, Bug } from "lucide-react";
 import { asBoolean, asFiniteNumber, asObject, cn } from "../lib/utils";
 import { copyTextToClipboard } from "../lib/clipboard";
-import { resolveAdapterTestEnvironmentId } from "../lib/adapter-test-environment";
+import {
+  connectSourceName,
+  OnboardingLoginCard,
+  OnboardingCardField,
+  OnboardingLoginCodeRow,
+  type AdapterLoginChrome,
+} from "./AdapterLoginChrome";
+import {
+  resolveAdapterTestEnvironmentId,
+  resolveLocalDefaultEnvironmentId,
+  resolveManagedSandboxEnvironmentId,
+} from "../lib/adapter-test-environment";
+import { environmentDisplayLabel } from "../lib/managed-sandbox-environment";
 import { extractModelName, extractProviderId } from "../lib/model-utils";
 import { queryKeys } from "../lib/queryKeys";
 import { useCompany } from "../context/CompanyContext";
@@ -46,7 +61,6 @@ import {
   help,
   adapterLabels,
 } from "./agent-config-primitives";
-import { ToggleSwitch } from "@/components/ui/toggle-switch";
 import { defaultCreateValues } from "./agent-config-defaults";
 import { getUIAdapter } from "../adapters";
 import { ClaudeLocalAdvancedFields } from "../adapters/claude-local/config-fields";
@@ -69,13 +83,17 @@ import { useDisabledAdaptersSync } from "../adapters/use-disabled-adapters";
 import { buildAgentUpdatePatch, omitUndefinedEntries, type AgentConfigOverlay } from "../lib/agent-config-patch";
 import { useAdapterCapabilities } from "../adapters/use-adapter-capabilities";
 import { resolveForcedKubernetesEnvironment } from "../lib/forced-kubernetes-environment";
+import { codexReasoningEffortOptions } from "../lib/codex-reasoning-effort";
 
 /* ---- Create mode values ---- */
 
 // Canonical type lives in @paperclipai/adapter-utils; re-exported here
 // so existing imports from this file keep working.
 export type { CreateConfigValues } from "@paperclipai/adapter-utils";
-import type { CreateConfigValues } from "@paperclipai/adapter-utils";
+import {
+  PAPERCLIP_RUNNER_PERMISSION_CAPABILITIES,
+  type CreateConfigValues,
+} from "@paperclipai/adapter-utils";
 import { Badge } from "@/components/ui/badge";
 
 /* ---- Props ---- */
@@ -102,6 +120,8 @@ type AgentConfigFormProps = {
   showAdapterTestEnvironmentButton?: boolean;
   showCreateRunPolicySection?: boolean;
   hideInstructionsFile?: boolean;
+  /** Allow instance administrators to configure short-lived raw provider capture. */
+  canConfigureProviderTrace?: boolean;
   /** Hide the prompt template field from the Identity section (used when it's shown in a separate Prompts tab). */
   hidePromptTemplate?: boolean;
   /** Render the main configuration sections or the dedicated edit-only Secrets surface. */
@@ -128,6 +148,7 @@ const emptyOverlay: AgentConfigOverlay = {
   identity: {},
   adapterConfig: {},
   heartbeat: {},
+  debug: {},
   runtime: {},
 };
 
@@ -138,14 +159,25 @@ export function supportsAdapterModelRefresh(adapterType: string): boolean {
   return adapterType === "claude_local" || adapterType === "codex_local";
 }
 
+export function resolvePaperclipRunnerTransitionModel(
+  previousAdapterType: string,
+  previousModel: unknown,
+): string {
+  return previousAdapterType === "codex_local"
+    && typeof previousModel === "string"
+    && previousModel.trim().length > 0
+    ? previousModel.trim()
+    : DEFAULT_CODEX_LOCAL_MODEL;
+}
+
 function isOverlayDirty(o: AgentConfigOverlay): boolean {
   return (
     Object.keys(o.identity).length > 0 ||
     o.adapterType !== undefined ||
     Object.keys(o.adapterConfig).length > 0 ||
     Object.keys(o.heartbeat).length > 0 ||
-    Object.keys(o.runtime).length > 0 ||
-    o.modelProfiles?.cheap !== undefined
+    Object.keys(o.debug).length > 0 ||
+    Object.keys(o.runtime).length > 0
   );
 }
 
@@ -169,15 +201,6 @@ function formatArgList(value: unknown): string {
   return typeof value === "string" ? value : "";
 }
 
-const codexThinkingEffortOptions = [
-  { id: "", label: "Auto" },
-  { id: "minimal", label: "Minimal" },
-  { id: "low", label: "Low" },
-  { id: "medium", label: "Medium" },
-  { id: "high", label: "High" },
-  { id: "xhigh", label: "X-High" },
-] as const;
-
 const openCodeThinkingEffortOptions = [
   { id: "", label: "Auto" },
   { id: "minimal", label: "Minimal" },
@@ -199,6 +222,15 @@ const claudeThinkingEffortOptions = [
   { id: "low", label: "Low" },
   { id: "medium", label: "Medium" },
   { id: "high", label: "High" },
+] as const;
+
+// Kimi exposes low/high/max (no "medium") via each model's support_efforts;
+// the kimi_local adapter maps a legacy "medium" onto "high" at runtime.
+const kimiThinkingEffortOptions = [
+  { id: "", label: "Auto" },
+  { id: "low", label: "Low" },
+  { id: "high", label: "High" },
+  { id: "max", label: "Max" },
 ] as const;
 
 const MAX_TURN_CONTINUATION_DEFAULT_MAX_ATTEMPTS = 2;
@@ -227,11 +259,12 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
   const showInlineAdapterTestEnvironmentFeedback = !props.onTestFeedbackChange;
   const showCreateRunPolicySection = props.showCreateRunPolicySection ?? true;
   const hideInstructionsFile = props.hideInstructionsFile ?? false;
+  const canConfigureProviderTrace = props.canConfigureProviderTrace === true;
   const { selectedCompanyId } = useCompany();
   const queryClient = useQueryClient();
   const environmentVariablesEditorRef = useRef<EnvironmentVariablesEditorHandle | null>(null);
 
-  // Sync disabled adapter types from server so dropdown filters them out
+  // Sync disabled adapter types from server so dropdown filters them out.
   const disabledTypes = useDisabledAdaptersSync();
 
   const { data: availableSecrets = [] } = useQuery({
@@ -273,7 +306,27 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
     queryFn: () => instanceSettingsApi.getExperimental(),
     retry: false,
   });
+  const adapterPickerDisabledTypes = useMemo(() => {
+    const next = new Set(disabledTypes);
+    // Fail closed while settings load. Existing native agents still render
+    // their current value in edit mode, but the picker does not offer a fresh
+    // native selection until the explicit experimental opt-in is known true.
+    if (experimentalSettings?.enableNativeRunner !== true) {
+      next.add("paperclip_runner");
+    }
+    return next;
+  }, [disabledTypes, experimentalSettings?.enableNativeRunner]);
   const environmentsEnabled = experimentalSettings?.enableEnvironments === true;
+  // Managed-sandbox-only policy: every agent runs in the platform-managed
+  // environment, so the form hides each host filesystem path and each
+  // execution-engine choice. Declared here because the field gates below and
+  // the adapter field props both read it.
+  const managedSandboxOnly = experimentalSettings?.enableManagedSandboxOnly === true;
+  // The gate the host-path fields use. It fails closed whenever the policy is
+  // unknown — in flight and also on a failed read: an unresolved policy reads as
+  // "not managed", which would show a stored working directory or
+  // instructions-file path.
+  const hideHostPaths = experimentalSettings === undefined || managedSandboxOnly;
 
   // Instance execution policy (general settings). When `executionMode` is
   // "kubernetes" the instance FORCES all execution onto the managed Kubernetes
@@ -309,7 +362,7 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
   );
   const createSecret = useMutation({
     mutationFn: (input: { name: string; value: string }) => {
-      if (!selectedCompanyId) throw new Error("Select a company to create secrets");
+      if (!selectedCompanyId) throw new Error("Select an organization to create secrets");
       return secretsApi.create(selectedCompanyId, input);
     },
     onSuccess: () => {
@@ -320,7 +373,7 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
 
   const uploadMarkdownImage = useMutation({
     mutationFn: async ({ file, namespace }: { file: File; namespace: string }) => {
-      if (!selectedCompanyId) throw new Error("Select a company to upload images");
+      if (!selectedCompanyId) throw new Error("Select an organization to upload images");
       return assetsApi.uploadImage(selectedCompanyId, file, namespace);
     },
   });
@@ -341,7 +394,7 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
 
   const isDirty = !isCreate && isOverlayDirty(overlay);
 
-  type RecordOverlayGroup = "identity" | "adapterConfig" | "heartbeat" | "runtime";
+  type RecordOverlayGroup = "identity" | "adapterConfig" | "heartbeat" | "debug" | "runtime";
 
   /** Read effective value: overlay if dirty, else original */
   function eff<T>(group: RecordOverlayGroup, field: string, original: T): T {
@@ -427,6 +480,7 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
   const config = !isCreate ? ((props.agent.adapterConfig ?? {}) as Record<string, unknown>) : {};
   const runtimeConfig = !isCreate ? ((props.agent.runtimeConfig ?? {}) as Record<string, unknown>) : {};
   const heartbeat = !isCreate ? ((runtimeConfig.heartbeat ?? {}) as Record<string, unknown>) : {};
+  const debug = !isCreate ? ((runtimeConfig.debug ?? {}) as Record<string, unknown>) : {};
 
   const adapterType = isCreate
     ? props.values.adapterType
@@ -435,8 +489,13 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
   const adapterCaps = getCapabilities(adapterType);
   const isLocal = adapterCaps.supportsInstructionsBundle || adapterCaps.supportsSkills || adapterCaps.supportsLocalAgentJwt;
   
+  // The legacy working directory is an absolute path on the host, so the
+  // managed-sandbox-only policy hides it. A stored value stays untouched; it is
+  // inert while every run happens in the platform-managed environment.
   const showLegacyWorkingDirectoryField =
-    isLocal && shouldShowLegacyWorkingDirectoryField({ isCreate, adapterConfig: config });
+    isLocal
+    && !hideHostPaths
+    && shouldShowLegacyWorkingDirectoryField({ isCreate, adapterConfig: config });
   const uiAdapter = useMemo(() => getUIAdapter(adapterType), [adapterType]);
   const supportedEnvironmentDrivers = useMemo(
     () => new Set(supportedEnvironmentDriversForAdapter(adapterType)),
@@ -572,32 +631,60 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
   );
 
   // The environment a login session runs in. It mirrors the Test resolution: the
-  // agent's own environment wins, otherwise the instance default. The login
-  // affordance shows only when this environment is a sandbox, because the
-  // canonical auth-missing check comes only from a sandbox target.
-  const effectiveLoginEnvironmentId = useMemo(
-    () =>
-      resolveAdapterTestEnvironmentId({
+  // agent's own environment wins, otherwise the instance default, otherwise the
+  // local default. The login affordance shows only when this environment is a
+  // sandbox, because the canonical auth-missing check comes only from a sandbox
+  // target.
+  //
+  // The resolution passes the same managed-sandbox-only policy inputs as the
+  // adapter Test target, so both resolve to the same environment. Under the
+  // policy a resolution that lands on the local environment redirects to the
+  // managed sandbox the real run uses. Without the redirect the login target
+  // stays local while the Test and the real run use the managed sandbox, so the
+  // login affordance reads the wrong target. The resolver throws when the policy
+  // is on but no managed sandbox is available; a render must not throw, so this
+  // resolution catches that case and resolves no login environment. The Test
+  // mutation surfaces the same case as a fail-closed error.
+  const effectiveLoginEnvironmentId = useMemo(() => {
+    try {
+      return resolveAdapterTestEnvironmentId({
         agentDefaultEnvironmentId: rawCurrentDefaultEnvironmentId || null,
         instanceDefaultEnvironmentId: instanceSettings?.defaultEnvironmentId ?? null,
-      }),
-    [rawCurrentDefaultEnvironmentId, instanceSettings?.defaultEnvironmentId],
-  );
+        localDefaultEnvironmentId: resolveLocalDefaultEnvironmentId(environments),
+        managedSandboxOnly: experimentalSettings?.enableManagedSandboxOnly === true,
+        managedSandboxEnvironmentId: resolveManagedSandboxEnvironmentId(environments),
+        // The policy hides the local environment, so an agent default that still
+        // points at the hidden local row names no visible environment. Pass the
+        // visible ids so the resolver redirects that stale local default to the
+        // managed sandbox instead of the hidden local id.
+        visibleEnvironmentIds: environments.map((environment) => environment.id),
+      });
+    } catch {
+      return null;
+    }
+  }, [
+    rawCurrentDefaultEnvironmentId,
+    instanceSettings?.defaultEnvironmentId,
+    environments,
+    experimentalSettings?.enableManagedSandboxOnly,
+  ]);
   const effectiveLoginEnvironment = useMemo(
     () => environments.find((environment) => environment.id === effectiveLoginEnvironmentId) ?? null,
     [environments, effectiveLoginEnvironmentId],
   );
-  // Load the sandbox provider capabilities. The Claude setup-token login runs on
-  // a real pseudo-terminal, so it needs a provider that advertises the
-  // setup-token login capability. The login panel gate reads this to hide the
-  // panel for a provider without the capability. The gate is advisory; the
-  // server resolves the capability again and fails closed.
+  // Load the sandbox provider capabilities. A login that runs on a real
+  // pseudo-terminal needs a provider that advertises the login pseudo-terminal
+  // capability. The login panel gate reads this to hide the panel for a provider
+  // without the capability. Enable the query when the adapter declares a login
+  // capability: every login runs on a real pseudo-terminal, so every login
+  // consults this data. The gate is advisory; the server resolves the capability
+  // again and fails closed.
   const { data: environmentCapabilities } = useQuery({
     queryKey: selectedCompanyId
       ? queryKeys.environments.capabilities(selectedCompanyId)
       : ["environment-capabilities", "none"],
     queryFn: () => environmentsApi.capabilities(selectedCompanyId!),
-    enabled: Boolean(selectedCompanyId) && adapterType === "claude_local",
+    enabled: Boolean(selectedCompanyId) && adapterCaps.login != null,
   });
 
   // When the instance forces Kubernetes execution, new agents must default to the
@@ -635,11 +722,10 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
     currentDefaultEnvironmentId.length > 0 ||
     runnableEnvironments.length >= 1
   );
-  const managedSandboxOnly = experimentalSettings?.enableManagedSandboxOnly === true;
   const inheritedEnvironmentLabel = instanceDefaultEnvironment
-    ? `${instanceDefaultEnvironment.name} (${instanceDefaultEnvironment.driver})`
+    ? environmentDisplayLabel(instanceDefaultEnvironment)
     : managedSandboxOnly
-      ? "Managed sandbox"
+      ? "Paperclip Computer"
       : "Local";
 
   // Fetch adapter models for the effective adapter type
@@ -669,7 +755,7 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
       : ["agents", "none", "detect-model", adapterType],
     queryFn: () => {
       if (!selectedCompanyId) {
-        throw new Error("Select a company to detect the model");
+        throw new Error("Select an organization to detect the model");
       }
       return agentsApi.detectModel(selectedCompanyId, adapterType);
     },
@@ -695,36 +781,18 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
     eff: eff as <T>(group: "adapterConfig", field: string, original: T) => T,
     mark: mark as (group: "adapterConfig", field: string, value: unknown) => void,
     models,
-    hideInstructionsFile,
+    // Resolve the effective instructions-file gate once. The instructions file
+    // is an absolute host path, so the managed-sandbox-only policy hides it for
+    // every adapter without a per-adapter edit.
+    hideInstructionsFile: hideInstructionsFile || hideHostPaths,
+    managedSandboxOnly: hideHostPaths,
   };
 
   // Section toggle state — advanced always starts collapsed
   const [runPolicyAdvancedOpen, setRunPolicyAdvancedOpen] = useState(false);
   // Popover states
   const [modelOpen, setModelOpen] = useState(false);
-  const [cheapModelOpen, setCheapModelOpen] = useState(false);
   const [thinkingEffortOpen, setThinkingEffortOpen] = useState(false);
-
-  // Cheap model profile state — only relevant when the adapter advertises
-  // `supportsModelProfiles`. Defaults are sourced from the adapter's
-  // /model-profiles endpoint so the UI does not encode adapter-specific
-  // cheap defaults.
-  const supportsModelProfiles = adapterCaps.supportsModelProfiles;
-  const { data: adapterCheapProfileDefinitions } = useQuery({
-    queryKey: selectedCompanyId
-      ? queryKeys.agents.adapterModelProfiles(selectedCompanyId, adapterType)
-      : ["agents", "none", "adapter-model-profiles", adapterType],
-    queryFn: () => agentsApi.adapterModelProfiles(selectedCompanyId!, adapterType),
-    enabled: Boolean(selectedCompanyId) && supportsModelProfiles,
-  });
-  const adapterCheapDefault = useMemo(() => {
-    return (adapterCheapProfileDefinitions ?? []).find((profile) => profile.key === "cheap") ?? null;
-  }, [adapterCheapProfileDefinitions]);
-  const adapterCheapDefaultModel = useMemo(() => {
-    const adapterConfig = adapterCheapDefault?.adapterConfig ?? {};
-    const value = (adapterConfig as Record<string, unknown>).model;
-    return typeof value === "string" ? value : "";
-  }, [adapterCheapDefault]);
 
   function buildAdapterConfigForTest(adapterConfigPatch?: Record<string, unknown>): Record<string, unknown> {
     if (isCreate) {
@@ -742,95 +810,13 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
     return omitUndefinedEntries(next);
   }
 
-  function buildCheapAdapterConfigForTest(adapterConfigPatch?: Record<string, unknown>): Record<string, unknown> {
-    const adapterDefaultConfig = asObject(adapterCheapDefault?.adapterConfig);
-    const createCheapModel = isCreate ? (val!.cheapModel ?? "").trim() : "";
-    const cheapAdapterConfig = isCreate
-      ? {
-          ...adapterDefaultConfig,
-          ...(createCheapModel ? { model: createCheapModel } : {}),
-        }
-      : {
-          ...adapterDefaultConfig,
-          ...cheapProfileFromAgent.adapterConfig,
-          ...asObject(cheapOverlay?.adapterConfig),
-        };
-    return buildAdapterConfigForTest({ ...cheapAdapterConfig, ...adapterConfigPatch });
-  }
-
-  function getCheapModelTestCase(adapterConfigPatch?: Record<string, unknown>): { model: string; adapterConfig: Record<string, unknown> } | null {
-    if (!currentCheapEnabled) return null;
-    const adapterConfig = buildCheapAdapterConfigForTest(adapterConfigPatch);
-    const configModel = typeof adapterConfig.model === "string" ? adapterConfig.model.trim() : "";
-    const model = configModel || currentCheapModel.trim();
-    if (!model) return null;
-    adapterConfig.model = model;
-    return { model, adapterConfig };
-  }
-
-  function prefixEnvironmentTestChecks(
-    result: AdapterEnvironmentTestResult,
-    label: string,
-    model: string | null,
-  ): AdapterEnvironmentTestResult {
-    const modelLabel = model ? ` (${model})` : "";
-    return {
-      ...result,
-      checks: [
-        {
-          code: `${label.toLowerCase().replace(/[^a-z0-9]+/g, "_")}_test_started`,
-          level: "info",
-          message: `${label} test${modelLabel}`,
-        },
-        ...result.checks.map((check) => ({
-          ...check,
-          message: `${label} test${modelLabel}: ${check.message}`,
-        })),
-      ],
-    };
-  }
-
-  async function runEnvironmentTestCase(
-    label: string,
-    model: string | null,
-    adapterConfig: Record<string, unknown>,
-    environmentId: string | null,
-  ): Promise<AdapterEnvironmentTestResult> {
-    const result = await agentsApi.testEnvironment(selectedCompanyId!, adapterType, {
-      adapterConfig,
-      environmentId,
-    });
-    return prefixEnvironmentTestChecks(result, label, model);
-  }
-
-  function mergeEnvironmentTestResults(
-    results: AdapterEnvironmentTestResult[],
-  ): AdapterEnvironmentTestResult {
-    const checks = results.flatMap((result) => result.checks);
-    const status = results.some((result) => result.status === "fail")
-      ? "fail"
-      : results.some((result) => result.status === "warn")
-        ? "warn"
-        : "pass";
-    const testedAt = results[results.length - 1]?.testedAt ?? new Date().toISOString();
-
-    return {
-      adapterType,
-      status,
-      checks,
-      testedAt,
-    };
-  }
-
   const testEnvironment = useMutation({
     mutationFn: async () => {
       if (!selectedCompanyId) {
-        throw new Error("Select a company to test adapter environment");
+        throw new Error("Select an organization to test adapter environment");
       }
       const flushedEnv = flushEnvironmentDraft();
       const adapterConfigPatch = flushedEnv ? { env: flushedEnv } : undefined;
-      const primaryModel = currentModelId.trim() || null;
-      const cheapTestCase = getCheapModelTestCase(adapterConfigPatch);
       // Probe where a real run would actually execute: the agent's own
       // environment, else the instance default. Testing the host for an
       // agent that runs in the instance-default sandbox reports failures
@@ -846,51 +832,62 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
       // the exact false command-not-found failure this resolution exists to
       // fix. Agents with their own environment never need the settings.
       let settings = instanceSettings;
-      if (!rawCurrentDefaultEnvironmentId && settings === undefined) {
+      let environmentList = environments;
+      let managedSandboxOnly = experimentalSettings?.enableManagedSandboxOnly === true;
+      if (!rawCurrentDefaultEnvironmentId) {
+        // The agent has no own environment, so the Test resolves the instance
+        // default, the local default, or the managed sandbox. Resolve the
+        // settings, the environment list, and the managed-sandbox-only policy
+        // here, because the render-time queries can be unsettled, or the
+        // environments query can be disabled under the managed-sandbox-only
+        // policy. A failure surfaces an honest error, not a silent host probe
+        // that reports a false result.
         try {
-          settings = await queryClient.ensureQueryData({
-            queryKey: queryKeys.instance.settings,
-            queryFn: () => instanceSettingsApi.get(),
-          });
+          const [resolvedSettings, resolvedEnvironments, resolvedExperimental] =
+            await Promise.all([
+              queryClient.ensureQueryData({
+                queryKey: queryKeys.instance.settings,
+                queryFn: () => instanceSettingsApi.get(),
+              }),
+              queryClient.ensureQueryData({
+                queryKey: queryKeys.environments.list(selectedCompanyId),
+                queryFn: () => environmentsApi.list(selectedCompanyId),
+              }),
+              queryClient.ensureQueryData({
+                queryKey: queryKeys.instance.experimentalSettings,
+                queryFn: () => instanceSettingsApi.getExperimental(),
+              }),
+            ]);
+          settings = resolvedSettings;
+          environmentList = resolvedEnvironments;
+          managedSandboxOnly = resolvedExperimental?.enableManagedSandboxOnly === true;
         } catch {
           throw new Error(
-            "Could not load instance settings to determine which environment to test in. Retry the test.",
+            "Could not load environment settings to determine which environment to test in. Retry the test.",
           );
         }
       }
+      // Mirror the server run-time resolution, including the managed-sandbox-only
+      // redirect: when the resolution lands on the local environment and the
+      // policy is on, probe the managed sandbox the real run uses instead. The
+      // resolver throws when no managed sandbox is available, which the mutation
+      // surfaces as a fail-closed error rather than a local host probe.
       const environmentId = resolveAdapterTestEnvironmentId({
         agentDefaultEnvironmentId: rawCurrentDefaultEnvironmentId || null,
         instanceDefaultEnvironmentId: settings?.defaultEnvironmentId ?? null,
+        localDefaultEnvironmentId: resolveLocalDefaultEnvironmentId(environmentList),
+        managedSandboxOnly,
+        managedSandboxEnvironmentId: resolveManagedSandboxEnvironmentId(environmentList),
+        // The policy hides the local environment, so an agent default that still
+        // points at the hidden local row names no visible environment. Pass the
+        // visible ids so the resolver redirects that stale local default to the
+        // managed sandbox instead of sending the hidden local id to the server.
+        visibleEnvironmentIds: environmentList.map((environment) => environment.id),
       });
-      const testResults: Array<{ label: string; model: string | null; result: AdapterEnvironmentTestResult }> = [
-        {
-          label: "Primary model",
-          model: primaryModel,
-          result: await runEnvironmentTestCase(
-            "Primary model",
-            primaryModel,
-            buildAdapterConfigForTest(adapterConfigPatch),
-            environmentId,
-          ),
-        },
-      ];
-
-      if (cheapTestCase) {
-        testResults.push({
-          label: "Cheap model",
-          model: cheapTestCase.model,
-          result: await runEnvironmentTestCase(
-            "Cheap model",
-            cheapTestCase.model,
-            cheapTestCase.adapterConfig,
-            environmentId,
-          ),
-        });
-      }
-
-      return testResults.length > 1
-        ? mergeEnvironmentTestResults(testResults.map(({ result }) => result))
-        : testResults[0]!.result;
+      return agentsApi.testEnvironment(selectedCompanyId, adapterType, {
+        adapterConfig: buildAdapterConfigForTest(adapterConfigPatch),
+        environmentId,
+      });
     },
   });
   const [testActionPending, setTestActionPending] = useState(false);
@@ -939,38 +936,42 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
     clearClaudeLoginClaimRef.current();
   }, [adapterType, effectiveLoginEnvironmentId]);
 
-  // Show the login affordance only for a current `codex_local` or `claude_local`
-  // sandbox whose most recent Test result carries the canonical auth-missing
-  // check. Both adapters emit the same neutral code. The result keeps its own
-  // `adapterType`, so a result from another adapter never gates the panel.
-  const adapterSupportsSandboxLogin =
-    adapterType === "codex_local" || adapterType === "claude_local";
+  // Show the login affordance only for a current sandbox adapter that declares a
+  // login capability, and whose most recent Test result carries the canonical
+  // auth-missing check. The form reads the projected capability, not the adapter
+  // name. The result keeps its own `adapterType`, so the form reads the
+  // capability for that result adapter; a result from an adapter with no login
+  // capability never gates the panel.
+  const adapterSupportsSandboxLogin = adapterCaps.login != null;
+  const testResult = testEnvironment.data;
+  const testResultSupportsSandboxLogin =
+    testResult != null && getCapabilities(testResult.adapterType).login != null;
   const authMissingCheck =
-    testEnvironment.data?.adapterType === "codex_local" ||
-    testEnvironment.data?.adapterType === "claude_local"
-      ? testEnvironment.data.checks.find((check) => check.code === ADAPTER_AUTH_MISSING_CHECK_CODE) ?? null
+    testResult && testResultSupportsSandboxLogin
+      ? testResult.checks.find((check) => check.code === ADAPTER_AUTH_MISSING_CHECK_CODE) ?? null
       : null;
-  // The Claude login runs on a real pseudo-terminal, so it needs a provider that
-  // advertises the setup-token login capability. Read the capability for the
-  // effective environment provider. The codex login uses a different flow and
-  // does not gate on this capability, so the requirement applies to Claude only.
+  // A login runs on a real pseudo-terminal, so it needs a provider that
+  // advertises the login pseudo-terminal capability. Read the capability for the
+  // effective environment provider. The form reads the adapter login capability,
+  // not the adapter name: every adapter login gates on this provider capability.
   const effectiveLoginProvider =
     typeof effectiveLoginEnvironment?.config?.provider === "string"
       ? effectiveLoginEnvironment.config.provider
       : null;
-  const providerSupportsSetupTokenLogin =
+  const providerSupportsLoginPty =
     effectiveLoginProvider != null &&
-    environmentCapabilities?.sandboxProviders?.[effectiveLoginProvider]?.supportsSetupTokenLogin === true;
+    environmentCapabilities?.sandboxProviders?.[effectiveLoginProvider]?.supportsLoginPty === true;
+  const loginNeedsPty = adapterCaps.login != null;
   const showAdapterLogin =
     adapterSupportsSandboxLogin &&
     effectiveLoginEnvironment?.driver === "sandbox" &&
     Boolean(effectiveLoginEnvironmentId) &&
     Boolean(selectedCompanyId) &&
     Boolean(authMissingCheck) &&
-    (adapterType !== "claude_local" || providerSupportsSetupTokenLogin);
+    (!loginNeedsPty || providerSupportsLoginPty);
   const runEnvironmentTest = useCallback(async () => {
     if (!selectedCompanyId) {
-      throw new Error("Select a company to test adapter environment");
+      throw new Error("Select an organization to test adapter environment");
     }
     setTestActionPending(true);
     setTestActionError(null);
@@ -1085,12 +1086,17 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
           : "effort";
   const thinkingEffortOptions =
     adapterType === "codex_local"
-      ? codexThinkingEffortOptions
+      ? codexReasoningEffortOptions(currentModelId, "Auto").map((option) => ({
+          id: option.value,
+          label: option.label,
+        }))
       : adapterType === "cursor"
         ? cursorModeOptions
         : adapterType === "opencode_local"
           ? openCodeThinkingEffortOptions
-          : claudeThinkingEffortOptions;
+          : adapterType === "kimi_local"
+            ? kimiThinkingEffortOptions
+            : claudeThinkingEffortOptions;
   const currentThinkingEffort = isCreate
     ? val!.thinkingEffort
     : adapterType === "codex_local"
@@ -1104,74 +1110,12 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
         : adapterType === "opencode_local"
           ? eff("adapterConfig", "variant", String(config.variant ?? ""))
           : eff("adapterConfig", "effort", String(config.effort ?? ""));
-  const showThinkingEffort = adapterType !== "gemini_local" && adapterType !== "cursor_cloud";
+  const showThinkingEffort = adapterType !== "gemini_local"
+    && adapterType !== "cursor_cloud"
+    && adapterType !== "paperclip_runner";
   const codexSearchEnabled = adapterType === "codex_local"
     ? (isCreate ? Boolean(val!.search) : eff("adapterConfig", "search", Boolean(config.search)))
     : false;
-  // Cheap profile read/write helpers. Edit-mode values come from
-  // runtimeConfig.modelProfiles.cheap with overlay overrides on top; create-mode
-  // values come straight from CreateConfigValues (cheapModel + cheapModelEnabled).
-  const cheapProfileFromAgent = useMemo(() => {
-    const profiles = (runtimeConfig.modelProfiles ?? {}) as Record<string, unknown>;
-    const cheap = (profiles.cheap ?? {}) as Record<string, unknown>;
-    const cheapAdapterConfig = asObject(cheap.adapterConfig);
-    return {
-      enabled: cheap.enabled !== false,
-      adapterConfig: cheapAdapterConfig,
-      model: typeof cheapAdapterConfig.model === "string" ? cheapAdapterConfig.model : "",
-    };
-  }, [runtimeConfig]);
-  const cheapOverlay = !isCreate ? overlay.modelProfiles?.cheap : undefined;
-  const currentCheapEnabled = isCreate
-    ? val!.cheapModelEnabled ?? false
-    : cheapOverlay?.enabled ?? cheapProfileFromAgent.enabled;
-  const currentCheapModel = isCreate
-    ? val!.cheapModel ?? ""
-    : (() => {
-        const overlayModel = (cheapOverlay?.adapterConfig as Record<string, unknown> | undefined)?.model;
-        if (typeof overlayModel === "string") return overlayModel;
-        return cheapProfileFromAgent.model;
-      })();
-
-  function setCheapEnabled(next: boolean) {
-    if (isCreate) {
-      set!({ cheapModelEnabled: next });
-      return;
-    }
-    setOverlay((prev) => ({
-      ...prev,
-      modelProfiles: {
-        cheap: {
-          ...(prev.modelProfiles?.cheap ?? {}),
-          enabled: next,
-        },
-      },
-    }));
-  }
-
-  function setCheapModel(next: string) {
-    if (isCreate) {
-      set!({ cheapModel: next });
-      return;
-    }
-    setOverlay((prev) => {
-      const existing = prev.modelProfiles?.cheap ?? {};
-      const nextAdapterConfig = {
-        ...((existing.adapterConfig ?? {}) as Record<string, unknown>),
-        model: next || undefined,
-      };
-      return {
-        ...prev,
-        modelProfiles: {
-          cheap: {
-            ...existing,
-            adapterConfig: nextAdapterConfig,
-          },
-        },
-      };
-    });
-  }
-
   const effectiveRuntimeConfig = useMemo(() => {
     if (isCreate) {
       return {
@@ -1368,7 +1312,7 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
               ) : (
                 <div className="rounded-md border border-amber-500/25 bg-amber-500/10 px-3 py-2 text-xs text-amber-800 dark:text-amber-200">
                   This instance requires the Kubernetes sandbox, but no managed Kubernetes
-                  environment is available for this company yet. Configure one before creating
+                  environment is available for this organization yet. Configure one before creating
                   agents; execution will not fall back to local.
                 </div>
               )}
@@ -1399,7 +1343,7 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
                   <option value="">Default: {inheritedEnvironmentLabel}</option>
                   {environmentOptions.map((environment) => (
                     <option key={environment.id} value={environment.id}>
-                      {environment.name} · {environment.driver}
+                      {environmentDisplayLabel(environment)}
                     </option>
                   ))}
                 </select>
@@ -1434,7 +1378,7 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
             <Field label="Adapter type" hint={help.adapterType}>
               <AdapterTypeDropdown
                 value={adapterType}
-                disabledTypes={disabledTypes}
+                disabledTypes={adapterPickerDisabledTypes}
                 onChange={(t) => {
                   if (isCreate) {
                     // Reset all adapter-specific fields to defaults when switching adapter type
@@ -1445,10 +1389,14 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
                         DEFAULT_CODEX_LOCAL_BYPASS_APPROVALS_AND_SANDBOX;
                     } else if (t === "gemini_local") {
                       nextValues.model = DEFAULT_GEMINI_LOCAL_MODEL;
+                    } else if (t === "kimi_local") {
+                      nextValues.model = DEFAULT_KIMI_LOCAL_MODEL;
                     } else if (t === "cursor") {
                       nextValues.model = DEFAULT_CURSOR_LOCAL_MODEL;
                     } else if (t === "opencode_local") {
                       nextValues.model = DEFAULT_OPENCODE_LOCAL_MODEL;
+                    } else if (t === "paperclip_runner") {
+                      nextValues.model = DEFAULT_CODEX_LOCAL_MODEL;
                     }
                     set!(nextValues);
                   } else {
@@ -1457,15 +1405,18 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
                     setOverlay((prev) => ({
                       ...prev,
                       adapterType: t,
-                      modelProfiles: { cheap: { cleared: true } },
                       adapterConfig: {
                         model:
                           t === "gemini_local"
                             ? DEFAULT_GEMINI_LOCAL_MODEL
+                            : t === "kimi_local"
+                              ? DEFAULT_KIMI_LOCAL_MODEL
                             : t === "opencode_local"
                               ? DEFAULT_OPENCODE_LOCAL_MODEL
                             : t === "cursor"
                               ? DEFAULT_CURSOR_LOCAL_MODEL
+                            : t === "paperclip_runner"
+                              ? resolvePaperclipRunnerTransitionModel(adapterType, config.model)
                               : "",
                         effort: "",
                         modelReasoningEffort: "",
@@ -1476,6 +1427,13 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
                               dangerouslyBypassApprovalsAndSandbox:
                                 DEFAULT_CODEX_LOCAL_BYPASS_APPROVALS_AND_SANDBOX,
                             }
+                          : t === "paperclip_runner"
+                            ? {
+                                provider: "codex",
+                                codexPermissionMode:
+                                  PAPERCLIP_RUNNER_PERMISSION_CAPABILITIES.codex.defaultMode,
+                                lifecycleMode: "per_turn",
+                              }
                           : {}),
                       },
                     }));
@@ -1551,50 +1509,74 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
             : <div className="px-4 py-2 text-xs font-medium text-muted-foreground">Permissions &amp; Configuration</div>
           }
           <div className={cn(cards ? "border border-border rounded-lg p-4 space-y-3" : "px-4 pb-3 space-y-3")}>
-              <Field label="Command" hint={help.localCommand}>
-                <DraftInput
-                  value={
-                    isCreate
-                      ? val!.command
-                      : eff(
-                          "adapterConfig",
-                          adapterCommandField,
-                          String(
-                            config.command ?? "",
-                          ),
-                        )
-                  }
-                  onCommit={(v) =>
-                    isCreate
-                      ? set!({ command: v })
-                      : mark("adapterConfig", adapterCommandField, v || null)
-                  }
-                  immediate
-                  className={inputClass}
-                  placeholder={
-                    ({
-                      claude_local: "claude",
-                      codex_local: "codex",
-                      gemini_local: "gemini",
-                      pi_local: "pi",
-                      cursor: "agent",
-                      opencode_local: "opencode",
-                    } as Record<string, string>)[adapterType] ?? adapterType.replace(/_local$/, "")
-                  }
-                />
-              </Field>
-
-              {supportsModelProfiles && (
-                <div className="text-(length:--text-micro) uppercase tracking-wide text-muted-foreground">Primary model</div>
+              {/*
+                The command names a binary on the execution host, so the
+                managed-sandbox-only policy hides it: the platform-managed image
+                owns the binary. Hiding is presentation only. A stored
+                `adapterConfig.command` stays as it is and the server does not
+                reject one, because an import carries adapter configuration
+                written on another instance; rejecting it would break that flow.
+                The value is inert while the policy is on. The field also stays
+                hidden until the policy is known, so a stored command never
+                flashes on a managed instance.
+              */}
+              {!hideHostPaths && (
+                <Field label="Command" hint={help.localCommand}>
+                  <DraftInput
+                    value={
+                      isCreate
+                        ? val!.command
+                        : eff(
+                            "adapterConfig",
+                            adapterCommandField,
+                            String(
+                              config.command ?? "",
+                            ),
+                          )
+                    }
+                    onCommit={(v) =>
+                      isCreate
+                        ? set!({ command: v })
+                        : mark("adapterConfig", adapterCommandField, v || null)
+                    }
+                    immediate
+                    className={inputClass}
+                    placeholder={
+                      ({
+                        claude_local: "claude",
+                        codex_local: "codex",
+                        gemini_local: "gemini",
+                        kimi_local: "kimi",
+                        pi_local: "pi",
+                        cursor: "agent",
+                        opencode_local: "opencode",
+                      } as Record<string, string>)[adapterType] ?? adapterType.replace(/_local$/, "")
+                    }
+                  />
+                </Field>
               )}
+
               <ModelDropdown
                 models={models}
                 value={currentModelId}
-                onChange={(v) =>
-                  isCreate
-                    ? set!({ model: v })
-                    : mark("adapterConfig", "model", v || undefined)
-                }
+                onChange={(v) => {
+                  const supportedEfforts = codexReasoningEffortOptions(v, "Auto");
+                  const clearUnsupportedEffort = adapterType === "codex_local"
+                    && Boolean(currentThinkingEffort)
+                    && !supportedEfforts.some((option) => option.value === currentThinkingEffort);
+                  if (isCreate) {
+                    set!({
+                      model: v,
+                      ...(clearUnsupportedEffort ? { thinkingEffort: "" } : {}),
+                    });
+                    return;
+                  }
+                  mark("adapterConfig", "model", v || undefined);
+                  if (clearUnsupportedEffort) {
+                    mark("adapterConfig", thinkingEffortKey, undefined);
+                    mark("adapterConfig", "reasoningEffort", undefined);
+                  }
+                }}
                 open={modelOpen}
                 onOpenChange={setModelOpen}
                 allowDefault={adapterType !== "opencode_local"}
@@ -1632,20 +1614,6 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
                 <p className="text-xs text-muted-foreground">
                   Live OpenCode model discovery only runs for Local environments. Using the curated list and manual entry for {currentDefaultEnvironment.name}.
                 </p>
-              )}
-
-              {supportsModelProfiles && (
-                <CheapModelSection
-                  enabled={currentCheapEnabled}
-                  model={currentCheapModel}
-                  models={models}
-                  adapterType={adapterType}
-                  adapterDefaultModel={adapterCheapDefaultModel}
-                  onEnabledChange={setCheapEnabled}
-                  onModelChange={setCheapModel}
-                  open={cheapModelOpen}
-                  onOpenChange={setCheapModelOpen}
-                />
               )}
 
               {showThinkingEffort && (
@@ -1897,6 +1865,46 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
         </div>
       ) : null}
 
+      {/* ---- Debugging ---- */}
+      {!isCreate && canConfigureProviderTrace ? (
+        <div className={cn(!cards && "border-b border-border")}>
+          {cards ? (
+            <h3 className="mb-3 flex items-center gap-2 text-sm font-medium">
+              <Bug className="h-3 w-3" /> Debugging
+            </h3>
+          ) : (
+            <div className="flex items-center gap-2 px-4 py-2 text-xs font-medium text-muted-foreground">
+              <Bug className="h-3 w-3" /> Debugging
+            </div>
+          )}
+          <div
+            className={cn(
+              "border-border bg-accent/30",
+              cards
+                ? "rounded-lg border p-4"
+                : "mx-4 mb-4 rounded-md border px-3 py-3",
+            )}
+          >
+            <ToggleField
+              label="Capture raw provider traces"
+              hint="Stores exact provider traffic for every future run until disabled. Traces may contain sensitive prompts and tool arguments, are administrator-only, and expire after 24 hours."
+              checked={eff<unknown>("debug", "providerTrace", debug.providerTrace) === "raw"}
+              onChange={(enabled) =>
+                mark("debug", "providerTrace", enabled ? "raw" : undefined)
+              }
+            />
+            {eff<unknown>("debug", "providerTrace", debug.providerTrace) === "raw" ? (
+              <div className="mt-3 flex items-start gap-2 rounded-md border border-border bg-background/60 px-3 py-2 text-xs text-foreground">
+                <Bug className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                <span>
+                  Raw tracing is on for future runs. Paperclip keeps at most 64 MiB per run and automatically deletes it after 24 hours.
+                </span>
+              </div>
+            ) : null}
+          </div>
+        </div>
+      ) : null}
+
     </div>
   );
 }
@@ -1962,7 +1970,7 @@ function AdapterLoginTerminalState({
     return (
       <div className="flex items-center gap-2 text-(length:--text-micro) text-foreground">
         <Check className="size-3 shrink-0" />
-        <span>Authenticated. The sandbox has credentials now.</span>
+        <span>Authenticated. The environment has credentials now.</span>
       </div>
     );
   }
@@ -2006,16 +2014,73 @@ export type AdapterLoginDescriptor = {
 // `onApplyStored` binds the fixed reference to an existing stored login with no
 // new login round trip. The panel shows the apply-existing affordance only when
 // the status route reports a stored value.
+// `autoStart`, `onCancel`, `onConnected` and `chrome` are what the onboarding
+// connect step needs, and each is off or absent by default so the two settings
+// surfaces that render this panel keep the behaviour they have.
+//
+// They are props on the existing panels rather than a second implementation
+// because the part onboarding needs unchanged is the whole of it: the session
+// start, the two polls, the server deadline, the one-shot completion read. A
+// copy drawn to the new design would have had to reproduce all of that
+// correctly, and the first thing to rot would have been the timeout and
+// cleanup paths, which are the ones nobody exercises by hand.
 export type AdapterLoginPanelProps = AdapterLoginDescriptor & {
   onStored?: (storedSessionId: string) => void;
   onApplyStored?: () => void;
+  // Start the login on mount instead of waiting for a press. The connect step's
+  // footer button is the press — by the time the panel is rendered there, the
+  // customer has already asked for this.
+  autoStart?: boolean;
+  // The customer abandoned the login from inside the card. The panel has
+  // already cancelled the server session by the time this fires; the caller
+  // uses it to put its own control back to the state it started in.
+  onCancel?: () => void;
+  // The login reached its success state. Onboarding advances on this, which is
+  // why the `onboarding` chrome draws no success state of its own — the screen
+  // it would appear on is already gone.
+  onConnected?: () => void;
+  chrome?: AdapterLoginChrome;
+  /**
+   * The address the customer has to open, once the server has produced one.
+   *
+   * The one fact about a running login that the step needs outside the card:
+   * its own button is what sends the customer there, and a prompt arriving is
+   * what moves the step from waiting to ready. Everything else it needs the
+   * panel already does — the paste submits itself, success is reported through
+   * `onConnected`, and the customer's own Cancel press is reported through
+   * `onCancel` — so this stays a single value rather than a whole session
+   * handed upward.
+   */
+  onPromptReady?: (authorizationUrl: string | null) => void;
 };
 
-// The login panel dispatcher. It picks the panel mode from the adapter. The
-// Claude adapter shows the submitted-browser-code panel. Every other adapter
-// shows the displayed-code panel.
+// The login panel dispatcher. It picks the panel from the projected panel mode,
+// not from the adapter name. The `submitted_browser_code` mode shows the
+// submitted-browser-code panel; every other mode shows the displayed-code panel.
+/**
+ * The account a source signs in to, named where one is known.
+ *
+ * "Sign in to the environment" describes the plumbing — a login performed inside
+ * a sandbox — and is the honest label when the provider is unknown. But for the
+ * two sources onboarding offers, the customer is signing in to Anthropic or to
+ * OpenAI, and naming that is what tells them which password manager entry to
+ * reach for. The generic wording stays for anything not listed, where a guess
+ * would be worse than a description.
+ */
+const ADAPTER_LOGIN_PROVIDER: Record<string, string> = {
+  claude_local: "Anthropic",
+  codex_local: "OpenAI",
+};
+
+function adapterLoginTitle(adapterType: string): string {
+  const provider = ADAPTER_LOGIN_PROVIDER[adapterType];
+  return provider ? `Sign in to ${provider}` : "Sign in to the environment";
+}
+
 export function AdapterLoginPanel(props: AdapterLoginPanelProps) {
-  if (props.adapterType === "claude_local") {
+  const getCapabilities = useAdapterCapabilities();
+  const panelMode = getCapabilities(props.adapterType).login?.panelMode;
+  if (panelMode === "submitted_browser_code") {
     return <SubmittedBrowserCodeLoginPanel {...props} />;
   }
   return <DisplayedCodeLoginPanel {...props} />;
@@ -2025,6 +2090,11 @@ function DisplayedCodeLoginPanel({
   companyId,
   adapterType,
   environmentId,
+  autoStart,
+  onCancel,
+  onConnected,
+  chrome = "panel",
+  onPromptReady,
 }: AdapterLoginPanelProps) {
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [startError, setStartError] = useState<string | null>(null);
@@ -2033,9 +2103,18 @@ function DisplayedCodeLoginPanel({
   // URL.
   const [latchedPrompt, setLatchedPrompt] = useState<AdapterAuthSessionPrompt | null>(null);
 
+  // True for the session currently held in `sessionId` when it came from the
+  // owner-scoped resume read rather than a fresh `startLogin`. It marks the
+  // one case that needs the extra release-on-error path below: a session this
+  // browser instance did not just start, so a broken poll cannot fall back to
+  // the ordinary "let the user press Sign in again" recovery — the owner has
+  // no local memory of ever starting it.
+  const resumedRef = useRef(false);
+
   const startLogin = useMutation({
     mutationFn: () => agentsApi.startAdapterAuthLogin(companyId, adapterType, { environmentId }),
     onSuccess: (session) => {
+      resumedRef.current = false;
       setStartError(null);
       setLatchedPrompt(null);
       setSessionId(session.sessionId);
@@ -2045,24 +2124,54 @@ function DisplayedCodeLoginPanel({
     },
   });
 
+  // Reset local state, so the panel returns to its idle start state and the
+  // Sign in button is available again.
+  const clearActiveSession = useCallback(() => {
+    resumedRef.current = false;
+    setSessionId(null);
+    setLatchedPrompt(null);
+    setStartError(null);
+  }, []);
+
   const cancelLogin = useMutation({
     mutationFn: () => agentsApi.cancelAdapterAuthLogin(companyId, adapterType, sessionId!),
-    onSuccess: () => {
-      // Reset local state, so the panel returns to its idle start state and the
-      // Log in button is available again.
-      setSessionId(null);
-      setLatchedPrompt(null);
-      setStartError(null);
-    },
+    onSuccess: clearActiveSession,
     onError: (error) => {
       setStartError(error instanceof Error ? error.message : "Could not cancel the login.");
     },
   });
 
+  // Read the caller's active session on mount, with no session id, so the
+  // browser rediscovers its own session after a reload with no local state. A
+  // 404 means no active session for the caller.
+  const activeSessionQuery = useQuery({
+    queryKey: ["adapter-login-active-session", companyId, adapterType],
+    queryFn: async () => {
+      try {
+        return await agentsApi.getActiveAdapterAuthLoginSession(companyId, adapterType);
+      } catch (error) {
+        if (error instanceof ApiError && error.status === 404) return null;
+        throw error;
+      }
+    },
+    retry: false,
+  });
+
+  // While the panel releases a resumed session it cannot recover (see below),
+  // it keeps showing the login as active rather than dropping back to idle, so
+  // it does not clear local state before the release finishes.
+  const [releasingResumedSession, setReleasingResumedSession] = useState(false);
+
   const statusQuery = useQuery({
     queryKey: ["adapter-login-status", companyId, adapterType, sessionId],
     queryFn: () => agentsApi.getAdapterAuthLoginStatus(companyId, adapterType, sessionId!),
-    enabled: Boolean(sessionId),
+    enabled: Boolean(sessionId) && !releasingResumedSession,
+    // A status 404 is unrecoverable: the server removed the row, so a retry
+    // cannot bring it back. Stop at once and fail loudly.
+    retry: (failureCount, error) => {
+      if (error instanceof ApiError && error.status === 404) return false;
+      return failureCount < 3;
+    },
     refetchInterval: (query) => {
       const status = query.state.data?.status;
       return status && ADAPTER_LOGIN_TERMINAL_STATUSES.has(status)
@@ -2085,10 +2194,159 @@ function DisplayedCodeLoginPanel({
   const isActive = Boolean(sessionId) && !isTerminal;
   const startDisabled = startLogin.isPending || isActive;
 
+  // Adopt the caller's active session once, on mount. This is what makes a
+  // page reload keep the session: with no local state at all, the panel would
+  // otherwise show its idle start state even though the server still holds an
+  // active login for this owner.
+  const resumeAttemptedRef = useRef(false);
+  useEffect(() => {
+    if (resumeAttemptedRef.current || !activeSessionQuery.isFetched) return;
+    resumeAttemptedRef.current = true;
+    const active = activeSessionQuery.data;
+    if (!active) return;
+    resumedRef.current = true;
+    setStartError(null);
+    setLatchedPrompt(active.prompt ?? null);
+    setSessionId(active.sessionId);
+  }, [activeSessionQuery.isFetched, activeSessionQuery.data]);
+
+  // A resumed session's status poll found the session already gone: the read
+  // that discovered it and the poll that tried to use it raced, and the
+  // session lost. The panel cannot resume it, and there is no unmount cleanup
+  // left to fall back on, so it releases the reservation itself and waits for
+  // that release before it returns to the idle start state.
+  useEffect(() => {
+    const error = statusQuery.error;
+    if (!(error instanceof ApiError && error.status === 404)) return;
+    if (!resumedRef.current || releasingResumedSession) return;
+    setReleasingResumedSession(true);
+    const id = sessionId;
+    void (async () => {
+      if (id) {
+        await agentsApi.cancelAdapterAuthLogin(companyId, adapterType, id).catch(() => {
+          // The session is already gone either way; nothing more to do.
+        });
+      }
+      setReleasingResumedSession(false);
+      clearActiveSession();
+    })();
+  }, [statusQuery.error, releasingResumedSession, sessionId, companyId, adapterType, clearActiveSession]);
+
+  // Start once, on mount, when the caller has already taken the press, and
+  // only once the resume read has answered: a resumed session takes over
+  // instead of a fresh start. The ref is the guard rather than the mutation's
+  // own pending flag: `startLogin` settles, and without a latch a re-render
+  // after it settles would read "not pending, no session yet" during the gap
+  // before the session id lands and start a second login the server would
+  // count against the per-owner cap.
+  const autoStartedRef = useRef(false);
+  const startLoginRef = useRef(startLogin.mutate);
+  startLoginRef.current = startLogin.mutate;
+  useEffect(() => {
+    if (!autoStart || autoStartedRef.current) return;
+    // A failed lookup is not proof that no session exists: only a successful
+    // lookup is. Show the failure to the user instead of starting a second
+    // login the server would reject against the per-owner cap.
+    if (activeSessionQuery.isError) {
+      autoStartedRef.current = true;
+      setStartError(
+        activeSessionQuery.error instanceof Error
+          ? activeSessionQuery.error.message
+          : "Could not check for an active login.",
+      );
+      return;
+    }
+    if (!activeSessionQuery.isSuccess) return;
+    autoStartedRef.current = true;
+    if (activeSessionQuery.data) return;
+    startLoginRef.current();
+  }, [
+    autoStart,
+    activeSessionQuery.isSuccess,
+    activeSessionQuery.isError,
+    activeSessionQuery.data,
+    activeSessionQuery.error,
+  ]);
+
+  // Report success upward once. `authenticated` is this panel's terminal
+  // success: unlike the Claude login there is no completion read after it, so
+  // the status is the whole of the news.
+  const connectedRef = useRef(false);
+  const onConnectedRef = useRef(onConnected);
+  onConnectedRef.current = onConnected;
+  useEffect(() => {
+    if (status !== "authenticated" || connectedRef.current) return;
+    connectedRef.current = true;
+    onConnectedRef.current?.();
+  }, [status]);
+
+  // Report the prompt's URL upward, the way the submitted-browser-code panel
+  // does. The caller's loading beat ends when this arrives, so without it the
+  // onboarding step waits on a card that has already opened: the code is on
+  // screen and the button stays disabled. Fires with null on mount, before the
+  // one-time prompt lands, which is the same null the caller starts from.
+  const onPromptReadyRef = useRef(onPromptReady);
+  onPromptReadyRef.current = onPromptReady;
+  useEffect(() => {
+    onPromptReadyRef.current?.(prompt?.url ?? null);
+  }, [prompt]);
+
+  const handleCancel = () => {
+    cancelLogin.mutate();
+    onCancel?.();
+  };
+
+  if (chrome === "onboarding") {
+    const failed = isTerminal && status && status !== "authenticated";
+    return (
+      <OnboardingLoginCard
+        loading={!prompt && !startError && !failed}
+        onCancel={handleCancel}
+        instruction={
+          <>
+            {/* The same destination as the step's own button. Two ways to one
+                link: the button for the customer following the flow, the anchor
+                for anyone finishing in another browser. */}
+            <a
+              href={prompt?.url}
+              target="_blank"
+              rel="noreferrer noopener"
+              className="underline underline-offset-2 hover:text-foreground"
+            >
+              Sign in to {connectSourceName(adapterType)}
+            </a>
+            {" by providing the authorization code below"}
+          </>
+        }
+      >
+        {startError ? (
+          <p role="alert" className="pl-2 text-xs text-destructive">
+            {startError}
+          </p>
+        ) : failed ? (
+          <p role="alert" className="pl-2 text-xs text-destructive">
+            {status === "timed_out"
+              ? "The login timed out. Start it again."
+              : status === "cancelled"
+                ? "The login was cancelled."
+                : "The login did not finish. Start it again."}
+          </p>
+        ) : (
+          <OnboardingLoginCodeRow code={prompt?.code ?? ""} autoCopy />
+        )}
+      </OnboardingLoginCard>
+    );
+  }
+
   return (
-    <div className="rounded-md border border-border bg-muted/40 px-3 py-2 space-y-2">
+    <div className="rounded-md border border-border bg-muted/40 px-3 py-2 flex flex-col gap-2">
+      {/* `gap`, not `space-y`: the live region below collapses to
+          `display: none` whenever it has nothing to announce, and
+          `space-y` would still put its 8px on the row above — dead space
+          inside the card that pushes the row off centre. A gap only
+          applies between children that render. */}
       <div className="flex items-center justify-between gap-2">
-        <span className="text-xs font-medium text-foreground">Sign in to the sandbox</span>
+        <span className="text-xs font-medium text-foreground">{adapterLoginTitle(adapterType)}</span>
         <div className="flex items-center gap-1.5">
           {isActive && (
             <Button
@@ -2110,7 +2368,7 @@ function DisplayedCodeLoginPanel({
             disabled={startDisabled}
             onClick={() => startLogin.mutate()}
           >
-            Log in
+            Sign in
           </Button>
         </div>
       </div>
@@ -2127,19 +2385,34 @@ function DisplayedCodeLoginPanel({
         {isActive && !prompt && (
           <div className="flex items-center gap-2 text-(length:--text-micro) text-muted-foreground">
             <Loader2 className="size-3 animate-spin shrink-0" />
-            <span>Preparing the login…</span>
+            <span>Preparing...</span>
           </div>
         )}
 
         {isActive && prompt && (
           <div className="space-y-2">
             <div className="text-(length:--text-micro) text-muted-foreground">
-              Open the authentication page and enter the code.
+              Copy the code, then open the authentication page.
             </div>
+          {/* Code first, then the URL, and the sentence and the numbering both
+              say so.
+
+              This used to run the other way, on the reasoning that handing over
+              a code before the page it belongs to was getting ahead of the
+              customer. What that missed is where the two rows are used: opening
+              the page is what leaves this screen, and the form waiting on the
+              other side wants the code that was on this one. Reaching back for
+              it is the step worth removing, so the code is read and copied
+              while it is still in front of you.
+
+              The onboarding card is ordered the same way and for the same
+              reason. The Claude panel below is not, and should not be — its
+              second row is a field to type *into*, so there the page genuinely
+              does come first. */}
           <div className="flex items-center justify-between gap-2">
             <div className="min-w-0">
               <div className="text-(length:--text-micro) uppercase tracking-wide text-muted-foreground">
-                Code
+                1. Code
               </div>
               <span className="font-mono text-xs text-foreground break-all">{prompt.code}</span>
             </div>
@@ -2148,7 +2421,7 @@ function DisplayedCodeLoginPanel({
           <div className="flex items-center justify-between gap-2">
             <div className="min-w-0">
               <div className="text-(length:--text-micro) uppercase tracking-wide text-muted-foreground">
-                Authentication URL
+                2. Authentication URL
               </div>
               <span className="font-mono text-xs text-foreground break-all">{prompt.url}</span>
             </div>
@@ -2217,9 +2490,15 @@ const CLAUDE_LOGIN_TIMED_OUT_MESSAGE = "The login timed out. Start the login aga
 // only the server `stored` state as success, and it never shows the OAuth token.
 function SubmittedBrowserCodeLoginPanel({
   companyId,
+  adapterType,
   environmentId,
   onStored,
   onApplyStored,
+  autoStart,
+  onCancel,
+  onConnected,
+  chrome = "panel",
+  onPromptReady,
 }: AdapterLoginPanelProps) {
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [startError, setStartError] = useState<string | null>(null);
@@ -2252,6 +2531,13 @@ function SubmittedBrowserCodeLoginPanel({
   // apply-existing path binds the fixed reference with no new login round trip,
   // so the panel shows the applied confirmation and hides the apply affordance.
   const [appliedStored, setAppliedStored] = useState(false);
+  // True for the session currently held in `sessionId` when it came from the
+  // owner-scoped resume read rather than a fresh `startLogin`. It marks the
+  // one case that needs the extra release-on-error path below: a session this
+  // browser instance did not just start, so a broken poll cannot fall back to
+  // the ordinary "let the user press Sign in again" recovery — the owner has
+  // no local memory of ever starting it.
+  const resumedRef = useRef(false);
 
   const resetLocalState = () => {
     setStartError(null);
@@ -2307,6 +2593,7 @@ function SubmittedBrowserCodeLoginPanel({
           : {}),
       }),
     onSuccess: (session) => {
+      resumedRef.current = false;
       resetLocalState();
       setSessionId(session.sessionId);
     },
@@ -2318,6 +2605,7 @@ function SubmittedBrowserCodeLoginPanel({
   const clearActiveSession = () => {
     // Return the panel to its idle start state. The Log in button is available
     // again, and both polls stop because the session id is null.
+    resumedRef.current = false;
     setSessionId(null);
     resetLocalState();
   };
@@ -2342,7 +2630,7 @@ function SubmittedBrowserCodeLoginPanel({
   });
 
   // Release the server session at once, without a change to the panel state. The
-  // client-cutoff timer and the unmount path both use this. The server holds a
+  // client-cutoff timer uses this. The server holds a
   // per-owner reservation until the session reaches a terminal state, so an
   // abandoned session locks the owner out until the server deadline. A best-
   // effort cancel frees that reservation now, so the same owner can start a new
@@ -2362,11 +2650,33 @@ function SubmittedBrowserCodeLoginPanel({
     [companyId],
   );
 
+  // Read the caller's active Claude setup-token session on mount, with no
+  // session id, so the browser rediscovers its own session after a reload
+  // with no local state. A 404 means no active session for the caller.
+  const activeSessionQuery = useQuery({
+    queryKey: ["claude-setup-token-active-session", companyId],
+    queryFn: async () => {
+      try {
+        return await agentsApi.getActiveClaudeSetupTokenLoginSession(companyId);
+      } catch (error) {
+        if (error instanceof ApiError && error.status === 404) return null;
+        throw error;
+      }
+    },
+    retry: false,
+  });
+
+  // While the panel releases a resumed session it cannot recover (see below),
+  // it keeps showing the login as active rather than dropping back to idle, so
+  // it does not clear local state before the release finishes.
+  const [releasingResumedSession, setReleasingResumedSession] = useState(false);
+
   // Both polls run only while a session is active and the client cap has not
   // passed. The timeout stops the polls, so the panel never polls forever. A
   // status 404 also stops the polls: the server cleaned up the session, so the
   // panel enters a terminal failure state instead.
-  const pollingEnabled = Boolean(sessionId) && !timedOut && !statusGone;
+  const pollingEnabled =
+    Boolean(sessionId) && !timedOut && !statusGone && !releasingResumedSession;
 
   const statusQuery = useQuery({
     queryKey: ["claude-setup-token-status", companyId, sessionId],
@@ -2393,12 +2703,51 @@ function SubmittedBrowserCodeLoginPanel({
   // race against the next poll. React Query keeps the last successful data on
   // error, so without this branch the panel would hold stale data and show
   // nothing. Enter the terminal failure state, which stops both polls.
+  //
+  // A resumed session takes a different path: the read that discovered it and
+  // the poll that tried to use it raced, and the session lost. There is no
+  // unmount cleanup left to fall back on, so the panel releases the
+  // reservation itself and waits for that release before it returns to the
+  // idle start state, instead of trusting the 404 alone.
   useEffect(() => {
     const error = statusQuery.error;
-    if (error instanceof ApiError && error.status === 404) {
-      setStatusGone(true);
+    if (!(error instanceof ApiError && error.status === 404)) return;
+    if (resumedRef.current) {
+      if (releasingResumedSession) return;
+      setReleasingResumedSession(true);
+      const id = sessionId;
+      void (async () => {
+        if (id) {
+          await agentsApi.cancelClaudeSetupTokenLogin(companyId, id).catch(() => {
+            // The session is already gone either way; nothing more to do.
+          });
+        }
+        setReleasingResumedSession(false);
+        clearActiveSession();
+      })();
+      return;
     }
-  }, [statusQuery.error]);
+    setStatusGone(true);
+  }, [statusQuery.error, releasingResumedSession, sessionId, companyId]);
+
+  // Adopt the caller's active session once, on mount. This is what makes a
+  // page reload keep the session: with no local state at all, the panel would
+  // otherwise show its idle start state even though the server still holds an
+  // active login for this owner.
+  const resumeAttemptedRef = useRef(false);
+  useEffect(() => {
+    if (resumeAttemptedRef.current || !activeSessionQuery.isFetched) return;
+    resumeAttemptedRef.current = true;
+    const active = activeSessionQuery.data;
+    if (!active) return;
+    resumedRef.current = true;
+    resetLocalState();
+    setSessionId(active.sessionId);
+    if (active.prompt) {
+      setAuthorizationUrl(active.prompt.authorizationUrl);
+      if (active.prompt.transportAdvisory) setTransportInsecure(true);
+    }
+  }, [activeSessionQuery.isFetched, activeSessionQuery.data]);
 
   // Poll the guarded prompt route until it returns the authorization URL. The
   // route returns 404 until the URL is ready, so the panel treats a 404 as
@@ -2473,21 +2822,6 @@ function SubmittedBrowserCodeLoginPanel({
   const isActive = Boolean(sessionId) && !isStored && !isFailure && !timedOut;
   const startDisabled = startLogin.isPending || isActive;
 
-  // Hold the active session id for the unmount cleanup. The panel updates it on
-  // every render. When the panel unmounts, or the parent removes it as the login
-  // closes, with an active, non-terminal session, the cleanup releases that
-  // session on the server. The ref is null once the session leaves the active
-  // state, so the cleanup never cancels a session the server already removed.
-  const activeSessionRef = useRef<string | null>(null);
-  activeSessionRef.current = isActive ? sessionId : null;
-
-  useEffect(() => {
-    return () => {
-      const id = activeSessionRef.current;
-      if (id) releaseServerSession(id);
-    };
-  }, [releaseServerSession]);
-
   // Cap the active login at the server deadline. The timer arms when the login
   // becomes active and clears when the login leaves the active state (a terminal
   // status, a stored success, or a new login). It re-arms when `expiresAt`
@@ -2528,15 +2862,176 @@ function SubmittedBrowserCodeLoginPanel({
   const handleSubmit = () => {
     if (!canSubmit) return;
     submitCode.mutate(trimmedCode);
-    // Clear the browser code right after submit, so the secret never lingers in
-    // the input.
-    setBrowserCode("");
+    // Onboarding keeps the code on screen; the panel still clears it.
+    //
+    // Clearing emptied the input in the same frame the paste landed, so on the
+    // connect step the only feedback for the seconds that followed was a field
+    // that had just gone blank — reported from staging as the paste looking
+    // dropped, or the step looking stuck. There the field is disabled from here
+    // on and the step's own button carries the status, so the code can stay:
+    // `resetLocalState` clears it whenever a session starts, resumes or is
+    // cleared, the value dies with the panel moments later, and the code is
+    // single-use and already spent.
+    //
+    // The panel is not that. It sits in a form that stays open long after the
+    // login, with its own status area doing the reporting — so there the code
+    // does have somewhere to linger, and clearing it remains right.
+    if (chrome !== "onboarding") setBrowserCode("");
   };
 
+  // Start once, on mount, when the caller has already taken the press, and
+  // only once the resume read has answered: a resumed session takes over
+  // instead of a fresh start. Latched for the same reason as the
+  // displayed-code panel: a second start would burn an owner reservation, and
+  // here it would also rotate the stored token twice.
+  const autoStartedRef = useRef(false);
+  const startLoginRef = useRef(startLogin.mutate);
+  startLoginRef.current = startLogin.mutate;
+  useEffect(() => {
+    if (!autoStart || autoStartedRef.current) return;
+    // A failed lookup is not proof that no session exists: only a successful
+    // lookup is. Show the failure to the user instead of starting a second
+    // login the server would reject against the per-owner cap.
+    if (activeSessionQuery.isError) {
+      autoStartedRef.current = true;
+      setStartError(
+        activeSessionQuery.error instanceof Error
+          ? activeSessionQuery.error.message
+          : "Could not check for an active login.",
+      );
+      return;
+    }
+    if (!activeSessionQuery.isSuccess) return;
+    autoStartedRef.current = true;
+    if (activeSessionQuery.data) return;
+    startLoginRef.current();
+  }, [
+    autoStart,
+    activeSessionQuery.isSuccess,
+    activeSessionQuery.isError,
+    activeSessionQuery.data,
+    activeSessionQuery.error,
+  ]);
+
+  /**
+   * Submit the pasted code without a press.
+   *
+   * Only in the onboarding chrome, and only here: this is the login where the
+   * code comes *back* off the clipboard, so the paste is the answer and a
+   * Submit button after it adds a step that can be missed. The displayed-code
+   * login has no field to watch.
+   *
+   * Driven by the paste rather than by the value, which is the part that is
+   * easy to get wrong. `isValidBrowserCode` looks like a completeness check and
+   * is not one: it accepts any run of printable ASCII from a single character
+   * up, deliberately, because the provider's exact format has never been
+   * pinned down. Keying the submit off the value therefore fires on the first
+   * keystroke of anyone who types the code instead of pasting it — submitting
+   * one character, failing, and clearing the field they were typing into.
+   *
+   * So the paste arms it and the shape check still gates it, which leaves
+   * typing to Enter. A paste that is not usable simply sits in the field.
+   *
+   * `submitCode.isPending` is inside `canSubmit` and `handleSubmit` clears the
+   * field, so one paste can only submit once.
+   */
+  const handleSubmitRef = useRef(handleSubmit);
+  handleSubmitRef.current = handleSubmit;
+  const autoSubmit = chrome === "onboarding";
+  const pastedRef = useRef(false);
+  useEffect(() => {
+    if (!autoSubmit || !pastedRef.current) return;
+    pastedRef.current = false;
+    if (!canSubmit) return;
+    handleSubmitRef.current();
+  }, [autoSubmit, canSubmit, browserCode]);
+
+  // Report success upward once. The `stored` state is the only success state,
+  // which is why this watches `isStored` and not the `authenticated` status the
+  // completion read still has to follow.
+  const connectedRef = useRef(false);
+  const onConnectedRef = useRef(onConnected);
+  onConnectedRef.current = onConnected;
+  useEffect(() => {
+    if (!isStored || connectedRef.current) return;
+    connectedRef.current = true;
+    onConnectedRef.current?.();
+  }, [isStored]);
+
+  const handleCancel = () => {
+    cancelLogin.mutate();
+    onCancel?.();
+  };
+
+  const onPromptReadyRef = useRef(onPromptReady);
+  onPromptReadyRef.current = onPromptReady;
+  useEffect(() => {
+    onPromptReadyRef.current?.(authorizationUrl);
+  }, [authorizationUrl]);
+
+  if (chrome === "onboarding") {
+    const failedNow = isFailure || timedOut;
+    return (
+      <OnboardingLoginCard
+        loading={!authorizationUrl && !startError && !failedNow}
+        onCancel={handleCancel}
+        instruction={
+          <>
+            <a
+              href={authorizationUrl ?? undefined}
+              target="_blank"
+              rel="noreferrer noopener"
+              className="underline underline-offset-2 hover:text-foreground"
+            >
+              Sign in to {connectSourceName(adapterType)}
+            </a>
+            {" then come back and enter authorization code"}
+          </>
+        }
+      >
+        {/* The plain-HTTP advisory survives the redesign. It is the one thing on
+            this card not about getting the login done, and dropping it to keep
+            the card tidy would remove a warning about a code travelling in
+            clear text. */}
+        {transportInsecure && (
+          <p className="flex items-start gap-2 pl-2 text-xs text-amber-700 dark:text-amber-200">
+            <TriangleAlert className="mt-0.5 size-3 shrink-0" />
+            This connection is not encrypted. The login code travels in clear text on this
+            network. Continue only on a network you trust.
+          </p>
+        )}
+        {startError ? (
+          <p role="alert" className="pl-2 text-xs text-destructive">
+            {startError}
+          </p>
+        ) : failedNow ? (
+          <p role="alert" className="pl-2 text-xs text-destructive">
+            {timedOut && !isFailure ? CLAUDE_LOGIN_TIMED_OUT_MESSAGE : CLAUDE_LOGIN_FAILED_MESSAGE}
+          </p>
+        ) : (
+          <OnboardingCardField
+            value={browserCode}
+            onChange={setBrowserCode}
+            onSubmit={handleSubmit}
+            onPaste={() => {
+              pastedRef.current = true;
+            }}
+            disabled={submitCode.isPending || isCompleting}
+          />
+        )}
+      </OnboardingLoginCard>
+    );
+  }
+
   return (
-    <div className="rounded-md border border-border bg-muted/40 px-3 py-2 space-y-2">
+    <div className="rounded-md border border-border bg-muted/40 px-3 py-2 flex flex-col gap-2">
+      {/* `gap`, not `space-y`: the live region below collapses to
+          `display: none` whenever it has nothing to announce, and
+          `space-y` would still put its 8px on the row above — dead space
+          inside the card that pushes the row off centre. A gap only
+          applies between children that render. */}
       <div className="flex items-center justify-between gap-2">
-        <span className="text-xs font-medium text-foreground">Sign in to the sandbox</span>
+        <span className="text-xs font-medium text-foreground">{adapterLoginTitle(adapterType)}</span>
         <div className="flex items-center gap-1.5">
           {isActive && (
             <Button
@@ -2575,7 +3070,7 @@ function SubmittedBrowserCodeLoginPanel({
             disabled={startDisabled}
             onClick={() => startLogin.mutate()}
           >
-            {storedToken && !isActive && !isStored ? "Log in to replace" : "Log in"}
+            {storedToken && !isActive && !isStored ? "Sign in to replace" : "Sign in"}
           </Button>
         </div>
       </div>
@@ -2609,7 +3104,7 @@ function SubmittedBrowserCodeLoginPanel({
         {isActive && !authorizationUrl && !isCompleting && (
           <div className="flex items-center gap-2 text-(length:--text-micro) text-muted-foreground">
             <Loader2 className="size-3 animate-spin shrink-0" />
-            <span>Preparing the login…</span>
+            <span>Preparing...</span>
           </div>
         )}
 
@@ -2632,7 +3127,7 @@ function SubmittedBrowserCodeLoginPanel({
             <div className="flex items-center justify-between gap-2">
               <div className="min-w-0">
                 <div className="text-(length:--text-micro) uppercase tracking-wide text-muted-foreground">
-                  Authorization URL
+                  1. Authorization URL
                 </div>
                 <span className="font-mono text-xs text-foreground break-all">{authorizationUrl}</span>
               </div>
@@ -2655,7 +3150,7 @@ function SubmittedBrowserCodeLoginPanel({
             </div>
             <div className="space-y-1">
               <div className="text-(length:--text-micro) uppercase tracking-wide text-muted-foreground">
-                Browser code
+                2. Browser code
               </div>
               <div className="flex items-center gap-2">
                 <input
@@ -2698,7 +3193,7 @@ function SubmittedBrowserCodeLoginPanel({
         {isStored && (
           <div className="flex items-center gap-2 text-(length:--text-micro) text-foreground">
             <Check className="size-3 shrink-0" />
-            <span>Authenticated. The sandbox has credentials now.</span>
+            <span>Authenticated. The environment has credentials now.</span>
           </div>
         )}
 
@@ -3146,72 +3641,6 @@ export function ModelDropdown({
         </PopoverContent>
       </Popover>
     </Field>
-  );
-}
-
-function CheapModelSection({
-  enabled,
-  model,
-  models,
-  adapterType,
-  adapterDefaultModel,
-  onEnabledChange,
-  onModelChange,
-  open,
-  onOpenChange,
-}: {
-  enabled: boolean;
-  model: string;
-  models: AdapterModel[];
-  adapterType: string;
-  adapterDefaultModel: string;
-  onEnabledChange: (next: boolean) => void;
-  onModelChange: (next: string) => void;
-  open: boolean;
-  onOpenChange: (open: boolean) => void;
-}) {
-  const placeholderHint = adapterDefaultModel
-    ? `Adapter default · ${adapterDefaultModel}`
-    : "No adapter default — choose a cheaper model";
-  return (
-    <div className="rounded-md border border-border/70 bg-muted/20 p-3 space-y-3">
-      <div className="flex items-center justify-between gap-3">
-        <div className="min-w-0">
-          <div className="text-(length:--text-micro) uppercase tracking-wide text-muted-foreground">Cheap model</div>
-          <p className="text-xs text-muted-foreground">
-            Used when a run requests the cheap profile (e.g. routine summaries). The primary model stays unchanged.
-          </p>
-        </div>
-        <ToggleSwitch checked={enabled} onCheckedChange={onEnabledChange} />
-      </div>
-      {enabled ? (
-        <ModelDropdown
-          models={models}
-          value={model}
-          onChange={onModelChange}
-          open={open}
-          onOpenChange={onOpenChange}
-          allowDefault
-          required={false}
-          groupByProvider={adapterType === "opencode_local"}
-          creatable
-          detectedModel={null}
-          detectedModelCandidates={[]}
-          emptyDetectHint={placeholderHint}
-          defaultLabel={placeholderHint}
-        />
-      ) : null}
-      {enabled && !model && adapterDefaultModel ? (
-        <p className="text-(length:--text-micro) text-muted-foreground">
-          No explicit cheap model selected — runtime falls back to <code>{adapterDefaultModel}</code>.
-        </p>
-      ) : null}
-      {enabled && !model && !adapterDefaultModel ? (
-        <p className="text-(length:--text-micro) text-amber-500">
-          No cheap model selected and the adapter has no default. Cheap-lane runs will continue on the primary model with a fallback note.
-        </p>
-      ) : null}
-    </div>
   );
 }
 

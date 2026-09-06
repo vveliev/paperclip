@@ -6,6 +6,7 @@ import { and, asc, desc, eq, inArray, isNull, notInArray } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   activityLog,
+  agentWakeupRequests,
   agents,
   approvals,
   companyMemberships,
@@ -31,6 +32,7 @@ import {
   acceptIssueThreadInteractionSchema,
   attachmentArtifactWorkProductMetadataSchema,
   cancelIssueThreadInteractionSchema,
+  skipIssueThreadInteractionSchema,
   withdrawIssueThreadInteractionSchema,
   companySearchExtractQuerySchema,
   companySearchQuerySchema,
@@ -67,6 +69,8 @@ import {
   upsertIssueDocumentSchema,
   updateIssueSchema,
   isClosedIsolatedExecutionWorkspace,
+  isMarkdownArtifactWorkProduct,
+  isMarkdownAttachmentContent,
   isUuidLike,
   normalizeIssueIdentifier as normalizeIssueReferenceIdentifier,
   type CompactIssue,
@@ -92,6 +96,7 @@ import {
   type IssueReviewPolicy,
   type IssueThreadInteractionCanonicalResolverPolicy,
   type IssueCommentPresentation,
+  type IssueQueuedCommentQueue,
   type IssueWatchdogDiscoveryKind,
   type ProjectWorkspace,
   type SourceTrustMetadata,
@@ -107,15 +112,17 @@ import { trackAgentTaskCompleted } from "@paperclipai/shared/telemetry";
 import { getTelemetryClient } from "../telemetry.js";
 import { isUniqueViolation } from "../db-errors.js";
 import type { StorageService } from "../storage/types.js";
-import { validate } from "../middleware/validate.js";
+import { validate, validateIssueMutationBody } from "../middleware/validate.js";
 import * as serviceIndex from "../services/index.js";
 import {
   accessService,
   agentService,
+  budgetService,
   companySkillService,
   companyService,
   companySearchService,
   executionWorkspaceService,
+  enrichWorkProductMetadataWithDiff,
   goalService,
   heartbeatService,
   issueApprovalService,
@@ -137,6 +144,9 @@ import {
   routineService,
   workProductService,
 } from "../services/index.js";
+import { questionResponseDeliveryService } from "../services/question-response-delivery.js";
+import { emitAgentTaskRun } from "../services/agent-task-run-telemetry.js";
+import { artifactReviewDocumentService } from "../services/artifact-review-documents.js";
 import { assertCanResolveProposal } from "../services/secret-proposal-authorization.js";
 import { buildDocumentReviewContext, buildPlanReviewContext } from "../services/plan-review-context.js";
 import {
@@ -163,9 +173,10 @@ import {
 } from "./workspace-command-authz.js";
 import { shouldWakeAssigneeOnCheckout } from "./issues-checkout-wakeup.js";
 import {
+  formatAttachmentSize,
   GENERIC_ATTACHMENT_CONTENT_TYPES,
   isInlineAttachmentContentType,
-  normalizeIssueAttachmentMaxBytes,
+  MAX_ATTACHMENT_BYTES,
   normalizeContentType,
   normalizeUploadAttachmentContentType,
   SVG_CONTENT_TYPE,
@@ -179,8 +190,8 @@ import {
 } from "../services/onboarding-greeting.js";
 import {
   ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
-  buildIssueBlockersResolvedWakeIdempotencyKey,
-  findExistingIssueBlockersResolvedWake,
+  buildIssueBlockersResolvedWakeStateKey,
+  findExistingIssueBlockersResolvedWakeForReadyState,
 } from "../services/issue-dependency-wakeups.js";
 import { assertEnvironmentSelectionForCompany } from "./environment-selection.js";
 import {
@@ -196,6 +207,7 @@ import {
   ISSUE_WAKE_DIAGNOSTICS_MAX_ACTIVITY_RECORDS,
   ISSUE_WAKE_DIAGNOSTICS_MAX_WAKE_REQUESTS,
   readAcceptedPlanConfirmationTarget,
+  type IssuePostCommitAction,
 } from "../services/issues.js";
 import { authorizationDeniedDetails } from "../services/authorization.js";
 import { stalledReviewDecisionService } from "../services/stalled-review-decisions.js";
@@ -203,6 +215,11 @@ import { environmentService } from "../services/environments.js";
 import { environmentRuntimeService } from "../services/environment-runtime.js";
 import { redactSensitiveText } from "../redaction.js";
 import { createRunSecretRedactionRegistry } from "../services/run-secret-redaction.js";
+import {
+  deliverNativeQuestionResponse,
+  requestNativeQuestionRunCancellation,
+  validateNativeQuestionResponseInput,
+} from "../services/native-runtime/native-question-bridge.js";
 import {
   createCompanySearchRateLimiter,
   type CompanySearchRateLimiter,
@@ -248,10 +265,37 @@ import {
   observeCrossIssueInfluence,
   type CrossIssueInfluenceKind,
 } from "../services/cross-issue-influence-limit.js";
+import {
+  getNativeSessionSteeringState,
+  NativeSessionSteeringError,
+  steerNativeSession,
+} from "../services/native-runtime/native-session-executor.js";
+import {
+  queuedCommentIdsFromWakePayload,
+  withQueuedCommentIdsInRunContext,
+  withQueuedCommentIdsInWakePayload,
+} from "../services/issue-queued-comment-queue.js";
 
 const MAX_ISSUE_COMMENT_LIMIT = 500;
 const updateIssueRouteSchema = updateIssueSchema.extend({
   interrupt: z.boolean().optional(),
+});
+const queuedCommentMutationTargetSchema = z.object({
+  queueId: z.string().min(1),
+  revision: z.string().min(1),
+});
+const queuedCommentSteeringTargetSchema = queuedCommentMutationTargetSchema.extend({
+  targetRunId: z.string().min(1),
+});
+const editQueuedCommentSchema = queuedCommentMutationTargetSchema.extend({
+  body: z
+    .string()
+    .min(1)
+    .max(200_000)
+    .refine((value) => value.trim().length > 0, "Queued message cannot be empty"),
+});
+const reorderQueuedCommentsSchema = queuedCommentMutationTargetSchema.extend({
+  orderedCommentIds: z.array(z.string().min(1)).max(MAX_ISSUE_COMMENT_LIMIT),
 });
 
 function prefersMinimalIssueUpdateResponse(req: Request) {
@@ -261,18 +305,18 @@ function prefersMinimalIssueUpdateResponse(req: Request) {
 }
 
 const refreshExternalObjectsSchema = z.object({
-  objectIds: z.array(z.string().uuid()).max(50).optional(),
+  objectIds: z.array(z.string().guid()).max(50).optional(),
 }).strict();
 const inboxArchiveBodySchema = z.object({
   userId: z.string().trim().min(1).optional(),
 }).strict().default({});
 const externalObjectSummariesSchema = z.object({
-  issueIds: z.array(z.string().uuid()).max(1000),
+  issueIds: z.array(z.string().guid()).max(1000),
 }).strict();
 
 const promoteLowTrustOutputSchema = z.object({
   sourceArtifactKind: z.enum(["comment", "document", "work_product", "issue"]),
-  sourceArtifactId: z.string().uuid(),
+  sourceArtifactId: z.string().guid(),
   title: z.string().trim().min(1).max(200),
   summary: z.string().trim().min(1).max(8_000),
 });
@@ -456,7 +500,7 @@ function requiresPaperclipAttachmentMetadata(input: {
 }
 
 const attachmentArtifactMetadataInputSchema = z.object({
-  attachmentId: z.string().uuid(),
+  attachmentId: z.string().guid(),
 }).passthrough();
 
 function buildCreateIssueActivityStatusDetails(
@@ -663,6 +707,24 @@ function readConfirmationResultForWake(result: unknown) {
     outcome: readNonEmptyString(parsed.outcome),
     reason: readNonEmptyString(parsed.reason) ?? readNonEmptyString(parsed.rejectionReason),
     commentId: readNonEmptyString(parsed.commentId),
+  };
+}
+
+function readNativeCompletionReviewForWake(input: {
+  payload: unknown;
+  result: unknown;
+  status: string;
+}) {
+  const target = readObject(readObject(input.payload).target);
+  if (target.type !== "custom" || target.key !== "native_completion_review") return null;
+  const result = readConfirmationResultForWake(input.result);
+  return {
+    decisionId: readNonEmptyString(target.revisionId),
+    outcome: result?.outcome ?? input.status,
+    reviewerReason: result?.reason ?? null,
+    instruction: input.status === "rejected"
+      ? "Address only the reviewer rejection for the accepted source run. Use the existing result and evidence; do not redo completed implementation or unrelated work."
+      : "The completion review was resolved; preserve the accepted source-run result and disposition lineage.",
   };
 }
 
@@ -1107,6 +1169,56 @@ const ISSUE_WAKE_DIAGNOSTIC_KNOWN_REASONS = new Set([
   "heartbeat.disabled",
   "heartbeat.timer.no_actionable_work",
   "heartbeat.wakeOnDemand.disabled",
+  "issue_unblock_requested",
+  "heartbeat_timer",
+  "issue_monitor_due",
+  "monitor_due",
+  "issue_monitor_recovery",
+  "issue_monitor_recovery_issue",
+  "task_watchdog_stopped_subtree",
+  "finish_successful_run_handoff",
+  "issue_review_path_lost",
+  "issue_disposition_repair",
+  "issue_assignment_recovery",
+  "issue_continuation_needed",
+  "execution_review_participant_recovery",
+  "plugin_issue_wakeup_requested",
+  "approval_approved",
+  "approval_rejected",
+  "issue_tree_restored",
+  "issue_checked_out",
+  "interaction_pending",
+  "skill_test_run_created",
+  "issue_recovery_action_restored",
+  "status_card_compile_assigned",
+  "status_card_update_assigned",
+  "secret_proposal_resolved",
+  "summary_slot_generation_requested",
+  "execution_approval_requested",
+  "execution_review_requested",
+  "execution_changes_requested",
+  "transient_failure_retry",
+  "workspace_busy_retry",
+  "interaction_continuation_infra_retry",
+  "max_turns_continuation_retry",
+  "issue_execution_issue_not_found",
+  "heartbeat.worktree_execution_cutoff",
+  "workspace_worktree_requires_project",
+  "issue_execution_same_name",
+  "issue_execution_deferred",
+  "issue_rewake_throttled",
+  "heartbeat.daily_run_limit",
+  "heartbeat.daily_cost_limit",
+  "heartbeat.scheduling_suppressed",
+  "company.inactive",
+  "budget.blocked",
+  "agent.not_invokable",
+  "provider_quota_recovery",
+  "issue_status_changed",
+  "issue_reopened_via_comment",
+  "issue_children_completed",
+  "issue_execution_promoted",
+  "issue_state_guard_mismatch",
 ]);
 
 const ISSUE_WAKE_DIAGNOSTIC_KNOWN_STATUSES = new Set([
@@ -1990,6 +2102,18 @@ function readToolActionContinuationContext(interaction: {
     };
   }
 
+  if (executionStatus === "expired") {
+    const expirationMessage = error ? `: ${error}` : "";
+    return {
+      toolName,
+      actionRequestId,
+      decision: "accepted",
+      executionStatus,
+      ...(error ? { error } : {}),
+      instructions: `the approved ${toolName} action expired before execution${expirationMessage}; if the task still requires it, call the tool again to request a fresh approval.`,
+    };
+  }
+
   return {
     toolName,
     actionRequestId,
@@ -2097,11 +2221,29 @@ async function queueResolvedInteractionContinuationWakeup(input: {
     input.interaction.continuationPolicy === "wake_assignee"
     || (
       input.interaction.continuationPolicy === "wake_assignee_on_accept"
-      && input.interaction.status === "accepted"
+      // Question interactions resolve as `answered`, not `accepted`. An
+      // authoritative answer is the positive resolution that this policy is
+      // waiting for, just as acceptance is for confirmation interactions.
+      && (input.interaction.status === "accepted" || input.interaction.status === "answered")
     );
-  if (!continuationPolicyAllowsWake && !reviewPathLost) return;
+  const rejectedPlanNeedsRevision =
+    input.interaction.status === "rejected"
+    && input.interaction.kind === "request_confirmation"
+    && readPlanConfirmationTargetForIssue(input.interaction.payload, input.issue.id) !== null;
+  // A plan confirmation presents rejection as "Request changes". That action
+  // is incomplete unless the plan author receives the requested revisions,
+  // even when an adapter/model selected the accept-only continuation policy.
+  // Keep this as a resolution-time invariant so existing pending interactions
+  // and future providers receive the same behavior.
+  if (!continuationPolicyAllowsWake && !rejectedPlanNeedsRevision && !reviewPathLost) return;
   if (input.interaction.status === "expired" && !reviewPathLost) return;
+  // A normal interaction continuation is itself the durable recovery path.
+  // Do not contaminate that wake with the fallback "review path lost"
+  // instruction merely because the just-consumed interaction now appears
+  // stalled before its continuation has had a chance to run.
   const reviewPathContext = reviewPathLost
+    && !continuationPolicyAllowsWake
+    && !rejectedPlanNeedsRevision
     ? {
         reviewPathLost: true,
         reviewPathConsumedRef: input.interaction.id,
@@ -2113,6 +2255,11 @@ async function queueResolvedInteractionContinuationWakeup(input: {
   const workspaceRefreshReason = readNonEmptyString(input.workspaceRefreshReason);
   const planTarget = readPlanConfirmationTargetForIssue(input.interaction.payload, input.issue.id);
   const interactionResult = readConfirmationResultForWake(input.interaction.result);
+  const nativeCompletionReview = readNativeCompletionReviewForWake({
+    payload: input.interaction.payload,
+    result: input.interaction.result,
+    status: input.interaction.status,
+  });
   const checkboxSelection = readCheckboxSelectionForWake(input.interaction);
   const toolAction = readToolActionContinuationContext(input.interaction);
   const secretProposal = readSecretProposalContinuationContext(input.interaction);
@@ -2134,53 +2281,85 @@ async function queueResolvedInteractionContinuationWakeup(input: {
           result: interactionResult,
         }
       : null;
-  void input.heartbeat.wakeup(input.issue.assigneeAgentId, {
-    source: "automation",
-    triggerDetail: "system",
-    reason: "issue_commented",
-    payload: {
-      issueId: input.issue.id,
-      interactionId: input.interaction.id,
-      interactionKind: input.interaction.kind,
-      interactionStatus: input.interaction.status,
-      sourceCommentId: input.interaction.sourceCommentId ?? null,
-      sourceRunId: input.interaction.sourceRunId ?? null,
-      ...(planReviewInteraction ? { planReviewInteraction } : {}),
-      ...(checkboxSelection ? { checkboxSelection } : {}),
-      ...(toolAction ? { toolAction } : {}),
-      ...(secretProposal ? { secretProposal } : {}),
-      ...(itemVerdicts ? { itemVerdicts, newlyResolvedItemIds } : {}),
-      ...(reviewPathContext ?? {}),
-      mutation: "interaction",
-    },
-    idempotencyKey: input.idempotencyKey ?? `interaction:${input.interaction.id}:${input.interaction.status}`,
-    requestedByActorType: input.actor.actorType,
-    requestedByActorId: input.actor.actorId,
-    contextSnapshot: {
-      issueId: input.issue.id,
-      taskId: input.issue.id,
-      interactionId: input.interaction.id,
-      interactionKind: input.interaction.kind,
-      interactionStatus: input.interaction.status,
-      sourceCommentId: input.interaction.sourceCommentId ?? null,
-      sourceRunId: input.interaction.sourceRunId ?? null,
-      ...(planReviewInteraction ? { planReviewInteraction } : {}),
-      ...(checkboxSelection ? { checkboxSelection } : {}),
-      ...(toolAction ? { toolAction } : {}),
-      ...(secretProposal ? { secretProposal } : {}),
-      ...(itemVerdicts ? { itemVerdicts, newlyResolvedItemIds } : {}),
-      ...(reviewPathContext ?? {}),
-      wakeReason: "issue_commented",
-      source: input.source,
-      ...(forceFreshSession ? { forceFreshSession: true } : {}),
-      ...(workspaceRefreshReason ? { workspaceRefreshReason } : {}),
-    },
-  }).catch((err) => logger.warn({
-    err,
-    issueId: input.issue.id,
-    interactionId: input.interaction.id,
-    agentId: input.issue.assigneeAgentId,
-  }, "failed to wake assignee on issue interaction resolution"));
+  const genericRejectionReason =
+    !planReviewInteraction &&
+    !nativeCompletionReview &&
+    input.interaction.status === "rejected" &&
+    (input.interaction.kind === "request_confirmation" ||
+      input.interaction.kind === "request_checkbox_confirmation")
+      ? readNonEmptyString(readObject(input.interaction.result).reason)
+      : null;
+  const rejectionAgentMessage = genericRejectionReason
+    ? {
+        text: genericRejectionReason,
+        source: "interaction_rejection",
+        sessionId: input.interaction.id,
+      }
+    : null;
+  void input.heartbeat
+    .wakeup(input.issue.assigneeAgentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_commented",
+      payload: {
+        issueId: input.issue.id,
+        interactionId: input.interaction.id,
+        interactionKind: input.interaction.kind,
+        interactionStatus: input.interaction.status,
+        sourceCommentId: input.interaction.sourceCommentId ?? null,
+        sourceRunId: input.interaction.sourceRunId ?? null,
+        ...(planReviewInteraction ? { planReviewInteraction } : {}),
+        ...(nativeCompletionReview ? { nativeCompletionReview } : {}),
+        ...(checkboxSelection ? { checkboxSelection } : {}),
+        ...(toolAction ? { toolAction } : {}),
+        ...(secretProposal ? { secretProposal } : {}),
+        ...(itemVerdicts ? { itemVerdicts, newlyResolvedItemIds } : {}),
+        ...(rejectionAgentMessage
+          ? { paperclipAgentMessage: rejectionAgentMessage }
+          : {}),
+        ...(reviewPathContext ?? {}),
+        mutation: "interaction",
+      },
+      idempotencyKey:
+        input.idempotencyKey ??
+        `interaction:${input.interaction.id}:${input.interaction.status}`,
+      requestedByActorType: input.actor.actorType,
+      requestedByActorId: input.actor.actorId,
+      contextSnapshot: {
+        issueId: input.issue.id,
+        taskId: input.issue.id,
+        interactionId: input.interaction.id,
+        interactionKind: input.interaction.kind,
+        interactionStatus: input.interaction.status,
+        sourceCommentId: input.interaction.sourceCommentId ?? null,
+        sourceRunId: input.interaction.sourceRunId ?? null,
+        ...(planReviewInteraction ? { planReviewInteraction } : {}),
+        ...(nativeCompletionReview ? { nativeCompletionReview } : {}),
+        ...(checkboxSelection ? { checkboxSelection } : {}),
+        ...(toolAction ? { toolAction } : {}),
+        ...(secretProposal ? { secretProposal } : {}),
+        ...(itemVerdicts ? { itemVerdicts, newlyResolvedItemIds } : {}),
+        ...(rejectionAgentMessage
+          ? { paperclipAgentMessage: rejectionAgentMessage }
+          : {}),
+        ...(reviewPathContext ?? {}),
+        wakeReason: "issue_commented",
+        source: input.source,
+        ...(forceFreshSession ? { forceFreshSession: true } : {}),
+        ...(workspaceRefreshReason ? { workspaceRefreshReason } : {}),
+      },
+    })
+    .catch((err) =>
+      logger.warn(
+        {
+          err,
+          issueId: input.issue.id,
+          interactionId: input.interaction.id,
+          agentId: input.issue.assigneeAgentId,
+        },
+        "failed to wake assignee on issue interaction resolution",
+      ),
+    );
 }
 
 function readCheckboxSelectionForWake(input: {
@@ -2810,6 +2989,20 @@ export function issueRoutes(
   const heartbeat = heartbeatService(db, {
     pluginWorkerManager: opts.pluginWorkerManager,
   });
+  const commentWasCreatedByAssigneeRun = async (
+    comment: { companyId: string; createdByRunId?: string | null },
+    assigneeAgentId: string | null | undefined,
+  ) => {
+    // Legacy adapters can authenticate through the board while still stamping
+    // the real source run on the comment. Treat that durable provenance as the
+    // author identity for wake routing.
+    if (!comment.createdByRunId || !assigneeAgentId) return false;
+    const sourceRun = await heartbeat.getRun(comment.createdByRunId);
+    return (
+      sourceRun?.companyId === comment.companyId &&
+      sourceRun.agentId === assigneeAgentId
+    );
+  };
   const enqueueStalledReviewDecisionWakeup = opts.stalledReviewDecisionEnqueueWakeup ?? heartbeat.wakeup;
   const enqueueRecoveryActionWakeup = opts.recoveryActionEnqueueWakeup ?? heartbeat.wakeup;
   const feedback = feedbackService(db);
@@ -2829,11 +3022,22 @@ export function issueRoutes(
   const executionWorkspacesSvc = executionWorkspaceServiceDirect(db);
   const workProductsSvc = workProductService(db);
   const documentsSvc = documentService(db);
+  const artifactReviewDocumentsSvc = artifactReviewDocumentService(db, storage);
   const companySkillsSvc = companySkillService(db);
   const documentAnnotationsSvc = documentAnnotationService(db);
   const decisionTrainingSvc = decisionTrainingService(db);
   const issueReferencesSvc = issueReferenceService(db);
   const issueThreadInteractionsSvc = issueThreadInteractionService(db);
+  const questionResponseDeliveries = questionResponseDeliveryService(db, {
+    heartbeat,
+    resolveNativeQuestion: (interaction) => deliverNativeQuestionResponse(db, interaction),
+  });
+  const flushIssuePostCommitActions = async (actions: readonly IssuePostCommitAction[]) => {
+    if (actions.length === 0) return;
+    const { executeIssuePostCommitActions } = await import("../services/issues.js");
+    await executeIssuePostCommitActions(db, actions);
+  };
+
   const memoizeIssueRead = createRequestPromiseMemo<Request, Awaited<ReturnType<typeof svc.getById>>>({
     shouldCache: (issue) => issue !== null,
   });
@@ -2908,7 +3112,7 @@ export function issueRoutes(
     kind: CrossIssueInfluenceKind,
   ) {
     if (req.actor.type !== "agent") return true;
-    if (!req.actor.agentId || !req.actor.runId) throw crossIssueInfluenceRunContextError();
+    if (!req.actor.agentId || !req.actor.runId) throw crossIssueInfluenceRunContextError(req.actor.runId);
 
     // The counter transaction locks and validates the persisted run before it
     // derives the source issue. Never trust the API-key run header by itself.
@@ -4323,6 +4527,7 @@ export function issueRoutes(
       effectiveResolverPolicy: string;
       resolverPolicyProvenance?: string | null;
       addresseeAgentId?: string | null;
+      addresseeUserId?: string | null;
       kind: string;
       status: string;
       payload?: unknown;
@@ -4817,22 +5022,13 @@ export function issueRoutes(
     return { scope, discovery, sourceIssue, watchdogIssue };
   }
 
-  function isStatusOnlyCheapRecoveryContext(contextSnapshot: unknown) {
+  function isStatusOnlyRecoveryContext(contextSnapshot: unknown) {
     if (!contextSnapshot || typeof contextSnapshot !== "object" || Array.isArray(contextSnapshot)) return false;
     const context = contextSnapshot as Record<string, unknown>;
-    return context.modelProfile === "cheap" &&
-      context.recoveryIntent === "status_only" &&
+    return context.recoveryIntent === "status_only" &&
       context.allowDeliverableWork === false &&
       context.allowDocumentUpdates === false &&
       context.resumeRequiresNormalModel === true;
-  }
-
-  function requestsCheapIssueAssigneeModelProfile(input: { assigneeAdapterOverrides?: unknown }) {
-    const overrides = input.assigneeAdapterOverrides;
-    return !!overrides &&
-      typeof overrides === "object" &&
-      !Array.isArray(overrides) &&
-      (overrides as Record<string, unknown>).modelProfile === "cheap";
   }
 
   async function loadActorRunContext(req: Request, companyId: string) {
@@ -4900,29 +5096,6 @@ export function issueRoutes(
     };
   }
 
-  async function assertCheapRecoveryIssueAssigneeProfileAllowed(
-    req: Request,
-    res: Response,
-    issue: { id?: string; companyId: string },
-    input: { assigneeAdapterOverrides?: unknown },
-  ) {
-    if (!requestsCheapIssueAssigneeModelProfile(input)) return true;
-    const run = await loadActorRunContext(req, issue.companyId);
-    if (!run || !isStatusOnlyCheapRecoveryContext(run.contextSnapshot)) return true;
-
-    res.status(403).json({
-      error: "Cheap status-only recovery runs cannot assign downstream issue work to the cheap model profile",
-      details: {
-        issueId: issue.id ?? null,
-        runId: run.id,
-        modelProfile: "cheap",
-        recoveryIntent: "status_only",
-        resumeRequiresNormalModel: true,
-      },
-    });
-    return false;
-  }
-
   async function assertDeliverableMutationAllowedByRunContext(
     req: Request,
     res: Response,
@@ -4930,14 +5103,13 @@ export function issueRoutes(
   ) {
     const run = await loadActorRunContext(req, issue.companyId);
     if (!run) return true;
-    if (!isStatusOnlyCheapRecoveryContext(run.contextSnapshot)) return true;
+    if (!isStatusOnlyRecoveryContext(run.contextSnapshot)) return true;
 
     res.status(403).json({
-      error: "Cheap status-only recovery runs cannot update issue documents, plans, or deliverable artifacts",
+      error: "Status-only recovery runs cannot update issue documents, plans, or deliverable artifacts",
       details: {
         issueId: issue.id,
         runId: run.id,
-        modelProfile: "cheap",
         recoveryIntent: "status_only",
         resumeRequiresNormalModel: true,
       },
@@ -4952,14 +5124,13 @@ export function issueRoutes(
   ) {
     const run = await loadActorRunContext(req, issue.companyId);
     if (!run) return true;
-    if (!isStatusOnlyCheapRecoveryContext(run.contextSnapshot)) return true;
+    if (!isStatusOnlyRecoveryContext(run.contextSnapshot)) return true;
 
     res.status(403).json({
-      error: "Cheap status-only recovery runs cannot create or modify approvals",
+      error: "Status-only recovery runs cannot create or modify approvals",
       details: {
         issueId: issue.id,
         runId: run.id,
-        modelProfile: "cheap",
         recoveryIntent: "status_only",
         resumeRequiresNormalModel: true,
       },
@@ -5123,9 +5294,8 @@ export function issueRoutes(
     return false;
   }
 
-  async function assertRecoveryActionAuthority(
+  async function requireRecoveryActionAuthority(
     req: Request,
-    res: Response,
     issue: { id: string; companyId: string; assigneeAgentId: string | null },
     activeRecoveryAction: Awaited<ReturnType<typeof recoveryActionsSvc.getActiveForIssue>>,
     input: { source: "issue_update" | "recovery_action_resolution" },
@@ -5135,8 +5305,7 @@ export function issueRoutes(
 
     const actorAgentId = req.actor.agentId;
     if (!actorAgentId) {
-      res.status(403).json({ error: "Agent authentication required" });
-      return false;
+      throw forbidden("Agent authentication required");
     }
     if (issue.assigneeAgentId === actorAgentId) return true;
     if (
@@ -5153,9 +5322,9 @@ export function issueRoutes(
       return true;
     }
 
-    res.status(403).json({
-      error: "Agent cannot resolve another owner's recovery action",
-      details: {
+    throw forbidden(
+      "Agent cannot resolve another owner's recovery action",
+      {
         issueId: issue.id,
         recoveryActionId: activeRecoveryAction.id,
         actorAgentId,
@@ -5164,8 +5333,157 @@ export function issueRoutes(
         source: input.source,
         securityPrinciples: ["Least Privilege", "Complete Mediation", "Secure Defaults"],
       },
-    });
-    return false;
+    );
+  }
+
+  function activeExecutionParticipantAgentId(issue: { executionState?: unknown }) {
+    const state = parseIssueExecutionState(issue.executionState);
+    return state?.status === "pending" && state.currentParticipant?.type === "agent"
+      ? state.currentParticipant.agentId
+      : null;
+  }
+
+  async function requireRecoverySourceMutationAuthority(
+    req: Request,
+    issue: {
+      id: string;
+      companyId: string;
+      status: string;
+      assigneeAgentId: string | null;
+      checkoutRunId?: string | null;
+      executionRunId?: string | null;
+      executionState?: unknown;
+    },
+  ) {
+    if (req.actor.type !== "agent") return;
+    const actorAgentId = req.actor.agentId;
+    if (!actorAgentId) throw forbidden("Agent authentication required");
+
+    const isSourceOwner = issue.assigneeAgentId === actorAgentId;
+    const isExecutionParticipant = activeExecutionParticipantAgentId(issue) === actorAgentId;
+    const hasPolicyGrant = Boolean(
+      issue.assigneeAgentId &&
+      await hasActiveCheckoutManagementOverride(actorAgentId, issue.companyId, issue.assigneeAgentId)
+    );
+    if (!isSourceOwner && !isExecutionParticipant && !hasPolicyGrant) {
+      throw forbidden(
+        "Recovery ownership does not authorize this source issue mutation",
+        {
+          code: "recovery_source_authority_required",
+          issueId: issue.id,
+          actorAgentId,
+          assigneeAgentId: issue.assigneeAgentId,
+          currentExecutionParticipantAgentId: activeExecutionParticipantAgentId(issue),
+          remediation:
+            "Have the source owner, current execution participant, board, or a policy-authorized agent perform the source mutation.",
+          securityPrinciples: ["Least Privilege", "Complete Mediation", "Secure Defaults"],
+        },
+      );
+    }
+
+    const actorRunId = req.actor.runId?.trim() || null;
+    const conflictingRunId = [issue.checkoutRunId, issue.executionRunId]
+      .find((runId) => runId && runId !== actorRunId);
+    if (conflictingRunId && !hasPolicyGrant) {
+      throw conflict("Source issue mutation is locked by another active checkout or run", {
+        code: "recovery_source_run_lock",
+        issueId: issue.id,
+        actorAgentId,
+        actorRunId,
+        checkoutRunId: issue.checkoutRunId ?? null,
+        executionRunId: issue.executionRunId ?? null,
+      });
+    }
+    if (isSourceOwner && issue.status === "in_progress" && !actorRunId && !hasPolicyGrant) {
+      throw unauthorized("Agent run id required");
+    }
+  }
+
+  async function assertSafeRecoveryHandBackGates(input: {
+    req: Request;
+    issue: {
+      id: string;
+      companyId: string;
+      projectId: string | null;
+      assigneeAgentId: string | null;
+      checkoutRunId?: string | null;
+      executionRunId?: string | null;
+      executionState?: unknown;
+    };
+    recoveryAction: NonNullable<Awaited<ReturnType<typeof recoveryActionsSvc.getActiveForIssue>>>;
+  }) {
+    const returnOwnerAgentId = input.recoveryAction.returnOwnerAgentId;
+    if (!returnOwnerAgentId || input.issue.assigneeAgentId !== returnOwnerAgentId) {
+      throw forbidden(
+        "Safe recovery hand-back requires the recorded original owner to remain assigned",
+        {
+          code: "recovery_safe_hand_back_owner_mismatch",
+          issueId: input.issue.id,
+          assigneeAgentId: input.issue.assigneeAgentId,
+          returnOwnerAgentId,
+        },
+      );
+    }
+    const actorRunId = input.req.actor.type === "agent"
+      ? input.req.actor.runId?.trim() || null
+      : null;
+    const conflictingRunId = [input.issue.checkoutRunId, input.issue.executionRunId]
+      .find((runId) => runId && runId !== actorRunId);
+    if (conflictingRunId) {
+      throw conflict("Safe recovery hand-back is locked by another active checkout or run", {
+        code: "recovery_source_run_lock",
+        issueId: input.issue.id,
+        actorRunId,
+        checkoutRunId: input.issue.checkoutRunId ?? null,
+        executionRunId: input.issue.executionRunId ?? null,
+      });
+    }
+    if (parseIssueExecutionState(input.issue.executionState)?.status === "pending") {
+      throw conflict("Safe recovery hand-back cannot bypass a pending execution review or approval stage", {
+        code: "recovery_governed_stage_pending",
+        issueId: input.issue.id,
+      });
+    }
+
+    const activePauseHold = await treeControlSvc.getActivePauseHoldGate(input.issue.companyId, input.issue.id);
+    if (activePauseHold) {
+      throw conflict("Safe recovery hand-back blocked by active subtree pause hold", {
+        issueId: input.issue.id,
+        holdId: activePauseHold.holdId,
+        rootIssueId: activePauseHold.rootIssueId,
+        mode: activePauseHold.mode,
+      });
+    }
+    if (input.issue.projectId) {
+      const project = await projectsSvc.getById(input.issue.projectId);
+      if (project?.pausedAt) {
+        throw conflict(
+          project.pauseReason === "budget"
+            ? "Project is paused because its budget hard-stop was reached"
+            : "Project is paused",
+        );
+      }
+    }
+    const approvals = await issueApprovalsSvc.listApprovalsForIssue(input.issue.id);
+    if (approvals.some((approval) => ACTIVE_REVIEW_APPROVAL_STATUSES.has(String(approval.status)))) {
+      throw conflict("Safe recovery hand-back cannot bypass a pending governed approval", {
+        code: "recovery_governed_approval_pending",
+        issueId: input.issue.id,
+      });
+    }
+    const budgetBlock = await budgetService(db).getInvocationBlock(
+      input.issue.companyId,
+      returnOwnerAgentId,
+      { issueId: input.issue.id, projectId: input.issue.projectId },
+    );
+    if (budgetBlock) {
+      throw conflict("Safe recovery hand-back is blocked by the source owner's budget or pause gate", {
+        code: "recovery_safe_hand_back_budget_blocked",
+        issueId: input.issue.id,
+        returnOwnerAgentId,
+        budgetBlock,
+      });
+    }
   }
 
   async function resolveActiveIssueRun(issue: {
@@ -5190,6 +5508,449 @@ export function issueRoutes(
     }
 
     return runToInterrupt?.status === "running" ? runToInterrupt : null;
+  }
+
+  type IssueQueueDb = Db | Parameters<Parameters<Db["transaction"]>[0]>[0];
+  type IssueQueueTx = Parameters<Parameters<Db["transaction"]>[0]>[0];
+  type IssueQueueWake = typeof agentWakeupRequests.$inferSelect;
+  type IssueQueueRun = typeof heartbeatRuns.$inferSelect;
+  type IssueQueueState = {
+    wake: IssueQueueWake;
+    state: "deferred" | "queued";
+    queueRun: IssueQueueRun | null;
+  };
+
+  function queueRevision(input: {
+    wake: IssueQueueWake | null;
+    comments: Array<{ id: string; updatedAt: Date }>;
+  }): string {
+    return createHash("sha256")
+      .update(JSON.stringify({
+        queueId: input.wake?.id ?? null,
+        comments: input.comments.map((comment) => [comment.id, comment.updatedAt.toISOString()]),
+      }))
+      .digest("hex")
+      .slice(0, 32);
+  }
+
+  async function findQueuedCommentWake(
+    executor: IssueQueueDb,
+    issue: { id: string; companyId: string; assigneeAgentId: string | null },
+  ): Promise<IssueQueueState | null> {
+    if (!issue.assigneeAgentId) return null;
+    const rows = await executor
+      .select()
+      .from(agentWakeupRequests)
+      .where(and(
+        eq(agentWakeupRequests.companyId, issue.companyId),
+        eq(agentWakeupRequests.agentId, issue.assigneeAgentId),
+        inArray(agentWakeupRequests.status, ["deferred_issue_execution", "queued"]),
+      ))
+      .orderBy(asc(agentWakeupRequests.requestedAt));
+
+    for (const wake of rows) {
+      if (
+        readObject(wake.payload).issueId !== issue.id
+        || queuedCommentIdsFromWakePayload(wake.payload).length === 0
+      ) continue;
+      if (wake.status === "deferred_issue_execution") {
+        return { wake, state: "deferred", queueRun: null };
+      }
+      if (!wake.runId) continue;
+      const queueRun = await executor
+        .select()
+        .from(heartbeatRuns)
+        .where(and(
+          eq(heartbeatRuns.id, wake.runId),
+          eq(heartbeatRuns.companyId, issue.companyId),
+          eq(heartbeatRuns.agentId, issue.assigneeAgentId),
+          eq(heartbeatRuns.wakeupRequestId, wake.id),
+          eq(heartbeatRuns.status, "queued"),
+        ))
+        .limit(1)
+        .then((runRows) => runRows[0] ?? null);
+      if (queueRun) return { wake, state: "queued", queueRun };
+    }
+    return null;
+  }
+
+  async function queueCommentsForWake(executor: IssueQueueDb, issueId: string, wake: IssueQueueWake | null) {
+    const ids = queuedCommentIdsFromWakePayload(wake?.payload);
+    if (ids.length === 0) return [];
+    const rows = await executor
+      .select()
+      .from(issueComments)
+      .where(and(eq(issueComments.issueId, issueId), inArray(issueComments.id, ids)));
+    const byId = new Map(rows.map((row) => [row.id, row]));
+    return ids.flatMap((id) => {
+      const row = byId.get(id);
+      return row && !row.deletedAt ? [row] : [];
+    });
+  }
+
+  async function buildQueuedCommentQueue(input: {
+    executor: IssueQueueDb;
+    issue: { id: string; companyId: string; assigneeAgentId: string | null };
+    activeRun: Awaited<ReturnType<typeof resolveActiveIssueRun>>;
+    actor: ReturnType<typeof getActorInfo>;
+    queueState?: IssueQueueState | null;
+    steeringDisposition?: IssueQueuedCommentQueue["steeringDisposition"];
+  }): Promise<IssueQueuedCommentQueue> {
+    const queueState = input.queueState === undefined
+      ? await findQueuedCommentWake(input.executor, input.issue)
+      : input.queueState;
+    const wake = queueState?.wake ?? null;
+    const comments = await queueCommentsForWake(input.executor, input.issue.id, wake);
+    const assignedAgent = input.issue.assigneeAgentId
+      ? await input.executor
+        .select({ adapterType: agents.adapterType })
+        .from(agents)
+        .where(and(
+          eq(agents.id, input.issue.assigneeAgentId),
+          eq(agents.companyId, input.issue.companyId),
+        ))
+        .limit(1)
+        .then((rows) => rows[0] ?? null)
+      : null;
+    const persistedRuntimeMode = queueState?.state === "queued" && queueState.queueRun
+      ? queueState.queueRun.runtimeMode
+      : queueState?.state === "deferred" && input.activeRun
+        ? input.activeRun.runtimeMode
+        : null;
+    const protocol = persistedRuntimeMode === "native"
+      || (persistedRuntimeMode === null && assignedAgent?.adapterType === "paperclip_runner")
+      ? "paperclip_runner_v1" as const
+      : "legacy" as const;
+    const steeringRun = queueState?.state === "deferred" ? input.activeRun : null;
+    let steeringDisposition = input.steeringDisposition
+      ?? (protocol === "paperclip_runner_v1" && steeringRun
+        ? await getNativeSessionSteeringState(steeringRun.id)
+          .then((state) => state.disposition)
+          .catch(() => "temporarily_unavailable" as const)
+        : "unsupported" as const);
+    if (protocol === "paperclip_runner_v1" && (!steeringRun || comments.length === 0)) {
+      steeringDisposition = "temporarily_unavailable";
+    }
+    return {
+      issueId: input.issue.id,
+      queueId: wake?.id ?? null,
+      state: queueState?.state ?? null,
+      targetRunId: steeringRun?.id ?? null,
+      revision: queueRevision({ wake, comments }),
+      protocol,
+      steeringDisposition,
+      entries: comments.map((comment, position) => ({
+        comment: comment as IssueQueuedCommentQueue["entries"][number]["comment"],
+        position,
+        canEdit: input.actor.actorType === "user" && comment.authorUserId === input.actor.actorId,
+        canDiscard: input.actor.actorType === "user" && comment.authorUserId === input.actor.actorId,
+      })),
+    };
+  }
+
+  function assertQueueMutationTarget(input: {
+    queue: IssueQueuedCommentQueue;
+    queueId: string;
+    revision: string;
+  }) {
+    if (input.queue.queueId !== input.queueId) {
+      throw conflict("The queued message targets a stale queue", { code: "queued_comment_stale_queue" });
+    }
+    if (input.queue.revision !== input.revision) {
+      throw conflict("The queued messages changed in another session", { code: "queued_comment_revision_conflict" });
+    }
+  }
+
+  async function lockQueuedCommentState(input: {
+    tx: IssueQueueTx;
+    issue: {
+      id: string;
+      companyId: string;
+      assigneeAgentId: string | null;
+      executionRunId?: string | null;
+    };
+    actor: ReturnType<typeof getActorInfo>;
+    queueId: string;
+    targetRunId?: string;
+  }) {
+    await input.tx
+      .select({ id: issueRows.id })
+      .from(issueRows)
+      .where(and(eq(issueRows.id, input.issue.id), eq(issueRows.companyId, input.issue.companyId)))
+      .for("update");
+    const wake = await input.tx
+      .select()
+      .from(agentWakeupRequests)
+      .where(and(
+        eq(agentWakeupRequests.id, input.queueId),
+        eq(agentWakeupRequests.companyId, input.issue.companyId),
+        input.issue.assigneeAgentId
+          ? eq(agentWakeupRequests.agentId, input.issue.assigneeAgentId)
+          : undefined,
+      ))
+      .for("update")
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    if (
+      !wake
+      || readObject(wake.payload).issueId !== input.issue.id
+      || queuedCommentIdsFromWakePayload(wake.payload).length === 0
+    ) {
+      throw conflict("The queued message is no longer pending", { code: "queued_comment_not_pending" });
+    }
+
+    let state: IssueQueueState["state"];
+    let queueRun: IssueQueueRun | null = null;
+    if (wake.status === "deferred_issue_execution") {
+      state = "deferred";
+    } else if (wake.status === "queued" && wake.runId) {
+      queueRun = await input.tx
+        .select()
+        .from(heartbeatRuns)
+        .where(and(
+          eq(heartbeatRuns.id, wake.runId),
+          eq(heartbeatRuns.companyId, input.issue.companyId),
+          eq(heartbeatRuns.agentId, wake.agentId),
+          eq(heartbeatRuns.wakeupRequestId, wake.id),
+        ))
+        .for("update")
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+      if (!queueRun || queueRun.status !== "queued") {
+        throw conflict("The queued message is already being dispatched", {
+          code: "queued_comment_already_dispatching",
+        });
+      }
+      state = "queued";
+    } else if (
+      wake.status === "claimed"
+      || wake.status === "running"
+      || (wake.runId && (wake.status === "succeeded" || wake.status === "failed"))
+    ) {
+      throw conflict("The queued message is already being dispatched", {
+        code: "queued_comment_already_dispatching",
+      });
+    } else {
+      throw conflict("The queued message is no longer pending", { code: "queued_comment_not_pending" });
+    }
+
+    const activeRunId = state === "deferred"
+      ? input.targetRunId ?? input.issue.executionRunId ?? null
+      : null;
+    const activeRun = activeRunId
+      ? await input.tx
+        .select()
+        .from(heartbeatRuns)
+        .where(and(
+          eq(heartbeatRuns.id, activeRunId),
+          eq(heartbeatRuns.companyId, input.issue.companyId),
+          eq(heartbeatRuns.status, "running"),
+        ))
+        .for("update")
+        .limit(1)
+        .then((rows) => rows[0] ?? null)
+      : null;
+    if (input.targetRunId) {
+      const runContext = readObject(activeRun?.contextSnapshot);
+      if (!activeRun || (runContext.issueId !== input.issue.id && runContext.taskId !== input.issue.id)) {
+        throw conflict("The queued message targets a stale run", { code: "queued_comment_stale_target" });
+      }
+    }
+    const queueState = { wake, state, queueRun } satisfies IssueQueueState;
+    const queue = await buildQueuedCommentQueue({
+      executor: input.tx,
+      issue: input.issue,
+      activeRun,
+      actor: input.actor,
+      queueState,
+      steeringDisposition: activeRun?.runtimeMode === "native"
+        ? "temporarily_unavailable"
+        : "unsupported",
+    });
+    return { activeRun, wake, queueRun, state, queue, queueState };
+  }
+
+  async function updateQueuedRunCommentIds(
+    tx: IssueQueueTx,
+    queueRun: IssueQueueRun | null,
+    ids: string[],
+    updatedAt: Date,
+  ) {
+    if (!queueRun) return null;
+    const updated = await tx
+      .update(heartbeatRuns)
+      .set({
+        contextSnapshot: withQueuedCommentIdsInRunContext(queueRun.contextSnapshot, ids),
+        updatedAt,
+      })
+      .where(and(eq(heartbeatRuns.id, queueRun.id), eq(heartbeatRuns.status, "queued")))
+      .returning()
+      .then((rows) => rows[0] ?? null);
+    if (!updated) {
+      throw conflict("The queued message is already being dispatched", {
+        code: "queued_comment_already_dispatching",
+      });
+    }
+    return updated;
+  }
+
+  async function discardQueuedComment(input: {
+    issue: {
+      id: string;
+      companyId: string;
+      assigneeAgentId: string | null;
+      executionRunId?: string | null;
+    };
+    actor: ReturnType<typeof getActorInfo>;
+    commentId: string;
+    queueId: string;
+    revision?: string;
+  }) {
+    let cancelledRunToEmit: typeof heartbeatRuns.$inferSelect | null = null;
+    const result = await db.transaction(async (tx) => {
+      const locked = await lockQueuedCommentState({
+        tx,
+        issue: input.issue,
+        actor: input.actor,
+        queueId: input.queueId,
+      });
+      if (input.revision) {
+        assertQueueMutationTarget({
+          queue: locked.queue,
+          queueId: input.queueId,
+          revision: input.revision,
+        });
+      }
+      const entry = locked.queue.entries.find(
+        (candidate) => candidate.comment.id === input.commentId,
+      );
+      if (!entry) {
+        throw conflict("The queued message is no longer pending", {
+          code: "queued_comment_not_pending",
+        });
+      }
+      const actorOwnsEntry = input.actor.actorType === "agent"
+        ? entry.comment.authorAgentId === input.actor.agentId
+        : entry.comment.authorUserId === input.actor.actorId;
+      if (!actorOwnsEntry) {
+        throw forbidden("Only the queued message author can discard it");
+      }
+
+      const deleted = await tx
+        .delete(issueComments)
+        .where(and(
+          eq(issueComments.id, input.commentId),
+          eq(issueComments.issueId, input.issue.id),
+        ))
+        .returning()
+        .then((rows) => rows[0] ?? null);
+      if (!deleted) {
+        throw conflict("The queued message is no longer pending", {
+          code: "queued_comment_not_pending",
+        });
+      }
+      await issueReferencesSvc.deleteCommentSource(input.commentId, tx);
+      await externalObjectsSvc.syncCommentSafely(input.commentId, tx);
+
+      const remainingIds = locked.queue.entries
+        .map((candidate) => candidate.comment.id)
+        .filter((candidateId) => candidateId !== input.commentId);
+      const now = new Date();
+      let nextQueueState: IssueQueueState | null = null;
+
+      if (remainingIds.length === 0) {
+        await tx
+          .update(agentWakeupRequests)
+          .set({
+            status: "cancelled",
+            finishedAt: now,
+            error: "Queued message discarded before dispatch",
+            updatedAt: now,
+          })
+          .where(eq(agentWakeupRequests.id, locked.wake.id));
+
+        if (locked.queueRun) {
+          const cancelledRun = await tx
+            .update(heartbeatRuns)
+            .set({
+              status: "cancelled",
+              finishedAt: now,
+              error: "Queued message discarded before dispatch",
+              errorCode: "queued_comment_discarded",
+              updatedAt: now,
+            })
+            .where(and(
+              eq(heartbeatRuns.id, locked.queueRun.id),
+              eq(heartbeatRuns.status, "queued"),
+            ))
+            .returning()
+            .then((rows) => rows[0] ?? null);
+          if (!cancelledRun) {
+            throw conflict("The queued message is already being dispatched", {
+              code: "queued_comment_already_dispatching",
+            });
+          }
+          cancelledRunToEmit = cancelledRun;
+        }
+      } else {
+        const updatedWake = await tx
+          .update(agentWakeupRequests)
+          .set({
+            payload: withQueuedCommentIdsInWakePayload(locked.wake.payload, remainingIds),
+            updatedAt: now,
+          })
+          .where(eq(agentWakeupRequests.id, locked.wake.id))
+          .returning()
+          .then((rows) => rows[0] ?? locked.wake);
+        const updatedQueueRun = await updateQueuedRunCommentIds(
+          tx,
+          locked.queueRun,
+          remainingIds,
+          now,
+        );
+        nextQueueState = {
+          wake: updatedWake,
+          state: locked.state,
+          queueRun: updatedQueueRun ?? locked.queueRun,
+        };
+      }
+
+      await tx
+        .update(issueRows)
+        .set({
+          ...(locked.queueRun && remainingIds.length === 0
+            ? {
+                executionRunId: null,
+                executionAgentNameKey: null,
+                executionLockedAt: null,
+              }
+            : {}),
+          updatedAt: now,
+        })
+        .where(and(
+          eq(issueRows.id, input.issue.id),
+          locked.queueRun && remainingIds.length === 0
+            ? eq(issueRows.executionRunId, locked.queueRun.id)
+            : undefined,
+        ));
+
+      return {
+        deleted,
+        queue: await buildQueuedCommentQueue({
+          executor: tx,
+          issue: input.issue,
+          activeRun: locked.activeRun,
+          actor: input.actor,
+          queueState: nextQueueState,
+        }),
+      };
+    });
+    // Telemetry is best-effort background work; it must not delay the
+    // response with a slow lookup, so fire it and do not await it.
+    if (cancelledRunToEmit) {
+      void emitAgentTaskRun(db, cancelledRunToEmit);
+    }
+    return result;
   }
 
   function operatorInterruptCancelOptions(input: { issueId: string; actor: ReturnType<typeof getActorInfo> }) {
@@ -6686,18 +7447,16 @@ export function issueRoutes(
     const id = req.params.id as string;
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
     if (!existing) return;
-    if (!(await assertAgentIssueMutationAllowed(req, res, existing))) return;
-    const activeRecoveryAction = await recoveryActionsSvc.getActiveForIssue(existing.companyId, existing.id);
-    if (
-      !(await assertRecoveryActionAuthority(
-        req,
-        res,
-        existing,
-        activeRecoveryAction,
-        { source: "recovery_action_resolution" },
-      ))
-    ) {
-      return;
+    if (!(await assertIssueReadAllowed(req, res, existing))) return;
+    if (await assertLowTrustControlPlaneDenied(req, res, existing.companyId, existing)) return;
+    if (req.actor.type === "agent") {
+      const boundaryDecision = await decideIssueAccess(req, existing, "issue:mutate");
+      if (!boundaryDecision.allowed) {
+        await denyIssueWrite(req, res, existing, issueWriteDenialCodeForDecision(boundaryDecision));
+        return;
+      }
+      if (!requireAgentRunId(req, res)) return;
+      if (!(await assertCrossIssueInfluenceWithinRunCap(req, res, existing, "update"))) return;
     }
 
     const { actionId, outcome, sourceIssueStatus, resolutionNote } = req.body;
@@ -6706,29 +7465,36 @@ export function issueRoutes(
     }
 
     const actor = getActorInfo(req);
-    const handBackAgentId = outcome === "restored" && sourceIssueStatus === "todo"
-      ? activeRecoveryAction?.returnOwnerAgentId ?? null
-      : null;
-    const recordedOutcome = handBackAgentId
-      ? "handed_back"
-      : outcome === "restored" && sourceIssueStatus === "done"
-        ? "owner_completed"
-        : outcome;
-    const updateFields = sourceIssueStatus ? { status: sourceIssueStatus } : {};
-    await assertInReviewReviewPath({
-      existing,
-      updateFields,
-      actorType: actor.actorType,
-      actorId: actor.actorId,
-      actorAgentId: actor.agentId,
-      actorRunId: actor.runId,
-    });
-
     const actionStatus = outcome === "cancelled" ? "cancelled" : "resolved";
     const postCommitActivityPublications: ActivityPublication[] = [];
+    const postCommitIssueActions: IssuePostCommitAction[] = [];
     const result = await db.transaction(async (tx) => {
-      let issue = existing;
-      if (outcome === "blocked") {
+      const lockedIssue = await tx
+        .select()
+        .from(issueRows)
+        .where(and(eq(issueRows.companyId, existing.companyId), eq(issueRows.id, existing.id)))
+        .for("update")
+        .then((rows) => rows[0] ?? null);
+      if (!lockedIssue) throw notFound("Issue not found");
+
+      const activeRecoveryAction = await recoveryActionsSvc.getActiveForIssue(
+        lockedIssue.companyId,
+        lockedIssue.id,
+        tx,
+      );
+      if (!activeRecoveryAction || (actionId && activeRecoveryAction.id !== actionId)) {
+        throw notFound("Active recovery action not found");
+      }
+      await requireRecoveryActionAuthority(
+        req,
+        lockedIssue,
+        activeRecoveryAction,
+        { source: "recovery_action_resolution" },
+      );
+
+      let issue = lockedIssue;
+      const sourceStatusChanged = sourceIssueStatus !== lockedIssue.status;
+      if (outcome === "blocked" && sourceStatusChanged) {
         const unresolvedBlockers = await tx
           .select({ id: issueRows.id })
           .from(issueRelations)
@@ -6747,27 +7513,113 @@ export function issueRoutes(
         }
       }
 
-      if (sourceIssueStatus) {
-        const updatedIssue = await svc.update(
-          id,
-          {
-            status: sourceIssueStatus,
-            ...(handBackAgentId ? { assigneeAgentId: handBackAgentId } : {}),
-            actorAgentId: actor.agentId ?? null,
-            actorUserId: actor.actorType === "user" ? actor.actorId : null,
-          },
-          tx,
-          postCommitActivityPublications,
-        );
+      if (sourceStatusChanged) {
+        const safeHandBack =
+          outcome === "restored" &&
+          sourceIssueStatus === "todo" &&
+          activeRecoveryAction.returnOwnerAgentId != null &&
+          lockedIssue.assigneeAgentId === activeRecoveryAction.returnOwnerAgentId;
+        if (safeHandBack) {
+          await assertSafeRecoveryHandBackGates({
+            req,
+            issue: lockedIssue,
+            recoveryAction: activeRecoveryAction,
+          });
+        } else {
+          await requireRecoverySourceMutationAuthority(req, lockedIssue);
+        }
+
+        if (
+          lockedIssue.status === "in_review" &&
+          (sourceIssueStatus === "done" || sourceIssueStatus === "cancelled") &&
+          lockedIssue.reviewPolicy != null &&
+          lockedIssue.reviewPolicy !== "anyone"
+        ) {
+          await assertIssueReviewVerdictActorAllowed(tx as unknown as Db, {
+            issue: lockedIssue,
+            actor: { type: actor.actorType, id: actor.actorId },
+          });
+        }
+
+        const updateFields: Record<string, unknown> = { status: sourceIssueStatus };
+        if (!safeHandBack) {
+          await assertInReviewReviewPath({
+            existing: lockedIssue,
+            updateFields,
+            actorType: actor.actorType,
+            actorId: actor.actorId,
+            actorAgentId: actor.agentId,
+            actorRunId: actor.runId,
+          });
+          const executionPolicy = normalizeIssueExecutionPolicy(lockedIssue.executionPolicy ?? null);
+          const transition = applyIssueExecutionPolicyTransition({
+            issue: lockedIssue,
+            policy: executionPolicy,
+            previousPolicy: executionPolicy,
+            requestedStatus: sourceIssueStatus,
+            requestedAssigneePatch: {},
+            actor: {
+              agentId: actor.agentId ?? null,
+              userId: actor.actorType === "user" ? actor.actorId : null,
+            },
+            allowBoardOverride: req.actor.type === "board",
+            commentBody: resolutionNote ?? null,
+          });
+          Object.assign(updateFields, transition.patch);
+          if (transition.decision) {
+            const decisionId = randomUUID();
+            const nextExecutionState = updateFields.executionState;
+            if (!nextExecutionState || typeof nextExecutionState !== "object") {
+              throw new Error("Execution policy decision patch is missing executionState");
+            }
+            updateFields.executionState = { ...nextExecutionState, lastDecisionId: decisionId };
+            await tx.insert(issueExecutionDecisions).values({
+              id: decisionId,
+              companyId: lockedIssue.companyId,
+              issueId: lockedIssue.id,
+              stageId: transition.decision.stageId,
+              stageType: transition.decision.stageType,
+              actorAgentId: actor.agentId ?? null,
+              actorUserId: actor.actorType === "user" ? actor.actorId : null,
+              outcome: transition.decision.outcome,
+              body: transition.decision.body,
+              createdByRunId: actor.runId ?? null,
+            });
+          }
+        }
+
+        const issueUpdate = {
+          ...updateFields,
+          actorAgentId: actor.agentId ?? null,
+          actorUserId: actor.actorType === "user" ? actor.actorId : null,
+        };
+        const updatedIssue = sourceIssueStatus === "done" || sourceIssueStatus === "cancelled"
+          ? await svc.update(
+              id,
+              issueUpdate,
+              tx,
+              postCommitActivityPublications,
+              postCommitIssueActions,
+            )
+          : await svc.update(id, issueUpdate, tx, postCommitActivityPublications);
         if (!updatedIssue) throw notFound("Issue not found");
         issue = updatedIssue;
       }
+
+      const recordedOutcome =
+        outcome === "restored" && issue.status === "todo" &&
+          activeRecoveryAction.returnOwnerAgentId != null &&
+          issue.assigneeAgentId === activeRecoveryAction.returnOwnerAgentId
+          ? "handed_back"
+          : outcome === "restored" && issue.status === "done"
+            ? "owner_completed"
+            : outcome;
 
       const recoveryAction = await recoveryActionsSvc.resolveActiveForIssue(
         {
           companyId: existing.companyId,
           sourceIssueId: existing.id,
-          actionId: actionId ?? null,
+          actionId: activeRecoveryAction.id,
           status: actionStatus,
           outcome: recordedOutcome,
           resolutionNote: resolutionNote ?? null,
@@ -6779,6 +7631,7 @@ export function issueRoutes(
       return { issue, recoveryAction };
     });
     for (const publication of postCommitActivityPublications) publishActivity(publication);
+    await flushIssuePostCommitActions(postCommitIssueActions);
 
     await routinesSvc.syncRunStatusForIssue(result.issue.id);
 
@@ -6873,7 +7726,9 @@ export function issueRoutes(
     const issue = await getAccessibleResource(req, res, getIssueById(req, id), "Issue not found");
     if (!issue) return;
     if (!(await assertIssueReadAllowed(req, res, issue))) return;
-    const workProducts = await workProductsSvc.listForIssue(issue.id);
+    const workProducts = await workProductsSvc.listForIssue(issue.id, {
+      refreshPullRequests: req.query.refreshPullRequests === "true",
+    });
     res.json(workProducts);
   });
 
@@ -7625,13 +8480,42 @@ export function issueRoutes(
     const createdByRunId = await resolveWorkProductCreatedByRunId(req, res, issue.companyId, req.body, "create");
     if (createdByRunId === undefined) return;
     createInput.createdByRunId = createdByRunId;
+    if (createdByRunId && (createInput.type === "pull_request" || createInput.type === "commit")) {
+      const runDiffSummary = await workProductsSvc.latestRunDiffSummary(createdByRunId);
+      createInput.metadata = enrichWorkProductMetadataWithDiff(
+        createInput.metadata,
+        runDiffSummary ?? (createInput.type === "commit"
+          ? await workProductsSvc.resolveCommitDiffSummary(issue.companyId, createInput)
+          : null),
+      );
+    }
     if (requiresPaperclipAttachmentMetadata(createInput)) {
       createInput.metadata = await canonicalizePaperclipArtifactMetadata({
         issue,
         metadata: req.body.metadata ?? null,
       });
     }
-    const product = await workProductsSvc.createForIssue(issue.id, issue.companyId, createInput);
+    const attachmentId = createInput.type === "artifact" && createInput.provider === "paperclip"
+      ? (createInput.metadata as Record<string, unknown> | null)?.attachmentId
+      : null;
+    const existingRunAttachmentProduct = typeof attachmentId === "string" && createdByRunId
+      ? await db
+        .select({ id: issueWorkProducts.id })
+        .from(issueWorkProducts)
+        .where(and(
+          eq(issueWorkProducts.companyId, issue.companyId),
+          eq(issueWorkProducts.issueId, issue.id),
+          eq(issueWorkProducts.type, "artifact"),
+          eq(issueWorkProducts.provider, "paperclip"),
+          eq(issueWorkProducts.externalId, attachmentId),
+          eq(issueWorkProducts.createdByRunId, createdByRunId),
+        ))
+        .limit(1)
+        .then((rows) => rows[0] ?? null)
+      : null;
+    const product = existingRunAttachmentProduct
+      ? await workProductsSvc.update(existingRunAttachmentProduct.id, createInput)
+      : await workProductsSvc.createForIssue(issue.id, issue.companyId, createInput);
     if (!product) {
       res.status(422).json({ error: "Invalid work product payload" });
       return;
@@ -7654,7 +8538,108 @@ export function issueRoutes(
       actor,
       workProductChanged: true,
     });
+    await materializeArtifactReviewDocumentBestEffort({ issue, workProduct: product, actor });
     res.status(201).json(product);
+  });
+
+  async function ensureArtifactReviewDocumentForWorkProduct(input: {
+    issue: NonNullable<Awaited<ReturnType<typeof svc.getById>>>;
+    workProduct: NonNullable<Awaited<ReturnType<typeof workProductsSvc.getById>>>;
+    actor: ReturnType<typeof getActorInfo>;
+  }) {
+    const { issue, workProduct, actor } = input;
+    const result = await artifactReviewDocumentsSvc.ensureForWorkProduct({
+      issue: { id: issue.id, companyId: issue.companyId },
+      workProduct,
+    });
+    if (!result.revisionChanged) return result;
+    const doc = result.document;
+    await issueReferencesSvc.syncDocument(doc.id);
+    await externalObjectsSvc.syncDocumentSafely(doc.id);
+    await logActivity(db, {
+      companyId: issue.companyId,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: actor.runId,
+      agentApiKeyId: actor.agentApiKeyId,
+      action: result.created ? "issue.document_created" : "issue.document_updated",
+      entityType: "issue",
+      entityId: issue.id,
+      details: {
+        key: doc.key,
+        documentId: doc.id,
+        title: doc.title,
+        format: doc.format,
+        revisionNumber: doc.latestRevisionNumber,
+        workProductId: workProduct.id,
+        artifactReviewDocument: true,
+      },
+    });
+    for (const remap of result.remappedAnnotations) {
+      await logActivity(db, {
+        companyId: issue.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
+        action: "issue.document_annotation_remapped",
+        entityType: "issue",
+        entityId: issue.id,
+        details: {
+          key: doc.key,
+          documentId: doc.id,
+          threadId: remap.thread.id,
+          revisionNumber: doc.latestRevisionNumber,
+          anchorState: remap.thread.anchorState,
+          anchorConfidence: remap.thread.anchorConfidence,
+          snapshotId: remap.snapshot.id,
+        },
+      });
+    }
+    await revalidateActiveSourceRecoveryAfterCommittedWrite({
+      issue,
+      trigger: "document",
+      actor,
+      documentChanged: true,
+    });
+    return result;
+  }
+
+  async function materializeArtifactReviewDocumentBestEffort(input: {
+    issue: NonNullable<Awaited<ReturnType<typeof svc.getById>>>;
+    workProduct: NonNullable<Awaited<ReturnType<typeof workProductsSvc.getById>>>;
+    actor: ReturnType<typeof getActorInfo>;
+  }) {
+    if (!isMarkdownArtifactWorkProduct(input.workProduct)) return;
+    try {
+      await ensureArtifactReviewDocumentForWorkProduct(input);
+    } catch (error) {
+      // Work-product writes stay fail-open: raw open and download remain
+      // available, and the explicit review-document endpoint is the retry path.
+      logger.warn(
+        { err: error, issueId: input.issue.id, workProductId: input.workProduct.id },
+        "markdown work product review-document materialization failed",
+      );
+    }
+  }
+
+  router.post("/issues/:id/work-products/:workProductId/review-document", async (req, res) => {
+    const id = req.params.id as string;
+    const workProductId = req.params.workProductId as string;
+    const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+    if (!issue) return;
+    if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
+    if (!(await assertDeliverableMutationAllowedByRunContext(req, res, issue))) return;
+    const workProduct = await workProductsSvc.getById(workProductId);
+    if (!workProduct || workProduct.issueId !== issue.id || workProduct.companyId !== issue.companyId) {
+      res.status(404).json({ error: "Work product not found" });
+      return;
+    }
+    const actor = getActorInfo(req);
+    const result = await ensureArtifactReviewDocumentForWorkProduct({ issue, workProduct, actor });
+    res.status(result.created ? 201 : 200).json(result.document);
   });
 
   router.post("/issues/:id/low-trust/promotions", validate(promoteLowTrustOutputSchema), async (req, res) => {
@@ -7853,6 +8838,11 @@ export function issueRoutes(
       actor,
       workProductChanged: true,
     });
+    const reviewDocumentInputChanged = ["type", "provider", "metadata", "title", "createdByRunId"]
+      .some((key) => Object.prototype.hasOwnProperty.call(patch, key));
+    if (reviewDocumentInputChanged || sourceTrust) {
+      await materializeArtifactReviewDocumentBestEffort({ issue, workProduct: product, actor });
+    }
     res.json(product);
   });
 
@@ -8125,7 +9115,7 @@ export function issueRoutes(
     res.json({ ok: true });
   });
 
-  router.post("/companies/:companyId/issues", applyCreateIssueStatusDefault, validate(createIssueSchema), async (req, res) => {
+  router.post("/companies/:companyId/issues", applyCreateIssueStatusDefault, validateIssueMutationBody(createIssueSchema), async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
     if (isSkillTestScopedActor(req)) {
@@ -8253,7 +9243,6 @@ export function issueRoutes(
         }
         : {}),
     };
-    if (!(await assertCheapRecoveryIssueAssigneeProfileAllowed(req, res, { companyId }, createBody))) return;
     const createAssignmentScope = {
       projectId: await resolveAssignmentProjectId({
         companyId,
@@ -8462,7 +9451,7 @@ export function issueRoutes(
     });
   });
 
-  router.post("/issues/:id/children", applyCreateIssueStatusDefault, validate(createChildIssueSchema), async (req, res) => {
+  router.post("/issues/:id/children", applyCreateIssueStatusDefault, validateIssueMutationBody(createChildIssueSchema), async (req, res) => {
     const parentId = req.params.id as string;
     const parent = await getAccessibleResource(req, res, svc.getById(parentId), "Parent issue not found");
     if (!parent) return;
@@ -8489,7 +9478,6 @@ export function issueRoutes(
       ...sanitizedBody,
       ...(normalizedAssigneeAgentId !== undefined ? { assigneeAgentId: normalizedAssigneeAgentId } : {}),
     };
-    if (!(await assertCheapRecoveryIssueAssigneeProfileAllowed(req, res, parent, createBody))) return;
     const childAssignmentScope = {
       projectId: createBody.projectId ?? parent.projectId ?? null,
       parentIssueId: parent.id,
@@ -8644,7 +9632,7 @@ export function issueRoutes(
     res.json(decompositions);
   });
 
-  router.post("/issues/:id/accepted-plan-decompositions", validate(createAcceptedPlanDecompositionSchema), async (req, res) => {
+  router.post("/issues/:id/accepted-plan-decompositions", validateIssueMutationBody(createAcceptedPlanDecompositionSchema), async (req, res) => {
     const sourceIssueId = req.params.id as string;
     const sourceIssue = await getAccessibleResource(req, res, svc.getById(sourceIssueId), "Issue not found");
     if (!sourceIssue) return;
@@ -8668,7 +9656,6 @@ export function issueRoutes(
       };
       requestedChildren.push(childBody);
       assertNoAgentHostWorkspaceCommandMutation(req, collectIssueWorkspaceCommandPaths(childBody));
-      if (!(await assertCheapRecoveryIssueAssigneeProfileAllowed(req, res, sourceIssue, childBody))) return;
       if (childBody.assigneeAgentId || childBody.assigneeUserId) {
         await assertCanAssignTasks(req, sourceIssue.companyId, {
           projectId: childBody.projectId ?? sourceIssue.projectId ?? null,
@@ -9013,7 +10000,7 @@ export function issueRoutes(
     },
   );
 
-  router.patch("/issues/:id", validate(updateIssueRouteSchema), async (req, res) => {
+  router.patch("/issues/:id", validateIssueMutationBody(updateIssueRouteSchema), async (req, res) => {
     const id = req.params.id as string;
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
     if (!existing) return;
@@ -9039,7 +10026,6 @@ export function issueRoutes(
     const issueMutationAuthorizationReason = req.actor.type === "agent"
       ? issueWriteAuthorizationReason(req, await decideIssueAccess(req, existing, "issue:mutate"))
       : issueWriteAuthorizationReason(req, true);
-    if (!(await assertCheapRecoveryIssueAssigneeProfileAllowed(req, res, existing, req.body))) return;
 
     const actor = getActorInfo(req);
     const isClosed = isClosedIssueStatus(existing.status);
@@ -9126,17 +10112,29 @@ export function issueRoutes(
     const activeRecoveryActionBeforeUpdate = recoveryRelevantSourceMutationRequested
       ? await recoveryActionsSvc.getActiveForIssue(existing.companyId, existing.id)
       : null;
-    if (
-      recoveryRelevantSourceMutationRequested &&
-      !(await assertRecoveryActionAuthority(
+    if (recoveryRelevantSourceMutationRequested) {
+      await requireRecoveryActionAuthority(
         req,
-        res,
         existing,
         activeRecoveryActionBeforeUpdate,
         { source: "issue_update" },
-      ))
-    ) {
-      return;
+      );
+      const recoveryRestrictedSourceMutationRequested =
+        activeRecoveryActionBeforeUpdate != null &&
+        (
+          updateFields.status === "done" ||
+          updateFields.status === "cancelled" ||
+          normalizedAssigneeAgentId !== undefined ||
+          req.body.assigneeUserId !== undefined ||
+          (
+            activeExecutionParticipantAgentId(existing) != null &&
+            typeof updateFields.status === "string" &&
+            updateFields.status !== existing.status
+          )
+        );
+      if (recoveryRestrictedSourceMutationRequested) {
+        await requireRecoverySourceMutationAuthority(req, existing);
+      }
     }
     if (
       resumeRequested !== true &&
@@ -9193,7 +10191,18 @@ export function issueRoutes(
       return;
     }
     let interruptedRunId: string | null = null;
-    const closedExecutionWorkspace = await getClosedIssueExecutionWorkspace(existing);
+    // Evaluate the reopen guard against the value this request would leave in
+    // place, not the pre-update value. An update that itself clears or
+    // replaces `executionWorkspaceId` (e.g. detaching a broken archived
+    // workspace) must not be blocked on rebuilding the workspace it is trying
+    // to move away from.
+    const nextExecutionWorkspaceId =
+      updateFields.executionWorkspaceId !== undefined
+        ? (updateFields.executionWorkspaceId as string | null)
+        : existing.executionWorkspaceId;
+    const closedExecutionWorkspace = await getClosedIssueExecutionWorkspace({
+      executionWorkspaceId: nextExecutionWorkspaceId,
+    });
     const isAgentWorkUpdate =
       req.actor.type === "agent" &&
       (Object.keys(updateFields).length > 0 || reviewRequest !== undefined || hiddenAtRaw !== undefined);
@@ -9478,6 +10487,7 @@ export function issueRoutes(
       value: Awaited<ReturnType<typeof svc.addStopRelayCommentIfNeeded>>;
     } = { value: null };
     const postCommitActivityPublications: ActivityPublication[] = [];
+    const postCommitIssueActions: IssuePostCommitAction[] = [];
     const issueUpdateData = {
       ...updateFields,
       actorAgentId: actor.agentId ?? null,
@@ -9485,10 +10495,15 @@ export function issueRoutes(
     };
     const shouldCollectCompletionPublication =
       actor.actorType === "user" && existing.status !== "done" && updateFields.status === "done";
+    const shouldCollectTerminalIssueActions =
+      updateFields.status === "done" || updateFields.status === "cancelled";
     const updateIssue = (tx?: Parameters<typeof svc.update>[2]) => {
       if (tx) {
-        return shouldCollectCompletionPublication
-          ? svc.update(id, issueUpdateData, tx, postCommitActivityPublications)
+        if (shouldCollectCompletionPublication) {
+          return svc.update(id, issueUpdateData, tx, postCommitActivityPublications, postCommitIssueActions);
+        }
+        return shouldCollectTerminalIssueActions
+          ? svc.update(id, issueUpdateData, tx, undefined, postCommitIssueActions)
           : svc.update(id, issueUpdateData, tx);
       }
       return shouldCollectCompletionPublication
@@ -9659,6 +10674,7 @@ export function issueRoutes(
       return;
     }
     for (const publication of postCommitActivityPublications) publishActivity(publication);
+    await flushIssuePostCommitActions(postCommitIssueActions);
 
     if (enteringBlocked) {
       const blockedIssue = issue;
@@ -10017,6 +11033,7 @@ export function issueRoutes(
             agentId: actorAgent.id,
             adapterType: actorAgent.adapterType,
             model,
+            taskId: issue.id,
           });
         }
       }
@@ -10155,6 +11172,10 @@ export function issueRoutes(
       };
     }
 
+    const commentIsFromAssigneeRun = comment
+      ? await commentWasCreatedByAssigneeRun(comment, issue.assigneeAgentId)
+      : false;
+
     const assigneeChanged =
       issue.assigneeAgentId !== existing.assigneeAgentId || issue.assigneeUserId !== existing.assigneeUserId;
     const statusChangedFromBacklog =
@@ -10201,17 +11222,21 @@ export function issueRoutes(
         dependentIssueId: string;
         resolvedBlockerIssueId: string;
         blockerIssueIds: string[];
+        blockedTransitionAt?: Date | string | null;
         source: string;
         mutation: string;
       }) => {
-        const idempotencyKey = buildIssueBlockersResolvedWakeIdempotencyKey({
+        const idempotencyKey = buildIssueBlockersResolvedWakeStateKey({
           dependentIssueId: input.dependentIssueId,
-          resolvedBlockerIssueId: input.resolvedBlockerIssueId,
+          blockerIssueIds: input.blockerIssueIds,
+          blockedTransitionAt: input.blockedTransitionAt,
         });
         try {
-          const existingWake = await findExistingIssueBlockersResolvedWake(db, {
+          const existingWake = await findExistingIssueBlockersResolvedWakeForReadyState(db, {
             companyId: issue.companyId,
-            idempotencyKey,
+            dependentIssueId: input.dependentIssueId,
+            blockerIssueIds: input.blockerIssueIds,
+            blockedTransitionAt: input.blockedTransitionAt,
           });
           if (existingWake) return;
         } catch (err) {
@@ -10310,13 +11335,17 @@ export function issueRoutes(
       if (commentBody && comment) {
         const assigneeId = issue.assigneeAgentId;
         const actorIsAgent = actor.actorType === "agent";
-        const selfComment = actorIsAgent && actor.actorId === assigneeId;
+        const selfComment =
+          (actorIsAgent && actor.actorId === assigneeId) ||
+          commentIsFromAssigneeRun;
         // Re-derive closed-ness from the post-update issue so a status change
         // like in_progress -> done with a closure comment does not enqueue a
         // stale issue_commented wake for an already-completed issue.
-        const skipAssigneeCommentWake = selfComment || isClosedIssueStatus(issue.status);
+        const shouldWakeAssigneeForComment =
+          !(selfComment && resumeRequested !== true) &&
+          (reopened || !isClosedIssueStatus(issue.status));
 
-        if (assigneeId && !assigneeChanged && (reopened || !skipAssigneeCommentWake)) {
+        if (assigneeId && !assigneeChanged && shouldWakeAssigneeForComment) {
           addWakeup(assigneeId, {
             source: "automation",
             triggerDetail: "system",
@@ -10367,7 +11396,10 @@ export function issueRoutes(
         }
 
         for (const mentionedId of mentionedIds) {
-          if (actor.actorType === "agent" && actor.actorId === mentionedId) continue;
+          if (
+            (actor.actorType === "agent" && actor.actorId === mentionedId) ||
+            (commentIsFromAssigneeRun && mentionedId === assigneeId)
+          ) continue;
           addWakeup(mentionedId, {
             source: "automation",
             triggerDetail: "system",
@@ -10396,6 +11428,7 @@ export function issueRoutes(
             dependentIssueId: dependent.id,
             resolvedBlockerIssueId: issue.id,
             blockerIssueIds: dependent.blockerIssueIds,
+            blockedTransitionAt: dependent.blockedTransitionAt,
             source: "issue.blockers_resolved",
             mutation: "blocker_done",
           });
@@ -10423,6 +11456,7 @@ export function issueRoutes(
             dependentIssueId: issue.id,
             resolvedBlockerIssueId,
             blockerIssueIds: readiness.blockerIssueIds,
+            blockedTransitionAt: issue.blockedTransitionAt,
             source: "issue.blockers_restored",
             mutation: "blocked_dependency_restored",
           });
@@ -10840,6 +11874,372 @@ export function issueRoutes(
     res.json(await runRedactions.redactForIssue(issue.companyId, issue.id, comments));
   });
 
+  router.get("/issues/:id/queued-comments", async (req, res) => {
+    const id = req.params.id as string;
+    const issue = await getAccessibleResource(req, res, getIssueById(req, id), "Issue not found");
+    if (!issue) return;
+    if (!(await assertIssueReadAllowed(req, res, issue))) return;
+    const queue = await buildQueuedCommentQueue({
+      executor: db,
+      issue,
+      activeRun: await resolveActiveIssueRun(issue),
+      actor: getActorInfo(req),
+    });
+    res.json(await runRedactions.redactForIssue(issue.companyId, issue.id, queue));
+  });
+
+  router.patch(
+    "/issues/:id/queued-comments/:commentId",
+    validate(editQueuedCommentSchema),
+    async (req, res) => {
+      assertBoard(req);
+      if (!req.actor.userId) throw forbidden("Board user context required");
+      const id = req.params.id as string;
+      const commentId = req.params.commentId as string;
+      const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+      if (!issue) return;
+      const actor = getActorInfo(req);
+      const queue = await db.transaction(async (tx) => {
+        const locked = await lockQueuedCommentState({
+          tx,
+          issue,
+          actor,
+          queueId: req.body.queueId,
+        });
+        assertQueueMutationTarget({
+          queue: locked.queue,
+          queueId: req.body.queueId,
+          revision: req.body.revision,
+        });
+        const entry = locked.queue.entries.find((candidate) => candidate.comment.id === commentId);
+        if (!entry) throw conflict("The queued message is no longer pending", { code: "queued_comment_not_pending" });
+        if (!entry.canEdit) throw forbidden("Only the queued message author can edit it");
+        const updatedAt = new Date();
+        const updated = await tx
+          .update(issueComments)
+          .set({ body: req.body.body, updatedAt })
+          .where(and(eq(issueComments.id, commentId), eq(issueComments.issueId, issue.id)))
+          .returning({ id: issueComments.id })
+          .then((rows) => rows[0] ?? null);
+        if (!updated) throw conflict("The queued message is no longer pending", { code: "queued_comment_not_pending" });
+        await tx.update(issueRows).set({ updatedAt }).where(eq(issueRows.id, issue.id));
+        await issueReferencesSvc.syncComment(commentId, tx);
+        await externalObjectsSvc.syncCommentSafely(commentId, tx);
+        const updatedQueueRun = await updateQueuedRunCommentIds(
+          tx,
+          locked.queueRun,
+          locked.queue.entries.map((candidate) => candidate.comment.id),
+          updatedAt,
+        );
+        return buildQueuedCommentQueue({
+          executor: tx,
+          issue,
+          activeRun: locked.activeRun,
+          actor,
+          queueState: {
+            wake: locked.wake,
+            state: locked.state,
+            queueRun: updatedQueueRun ?? locked.queueRun,
+          },
+        });
+      });
+      res.json(await runRedactions.redactForIssue(issue.companyId, issue.id, queue));
+    },
+  );
+
+  router.put(
+    "/issues/:id/queued-comments/order",
+    validate(reorderQueuedCommentsSchema),
+    async (req, res) => {
+      assertBoard(req);
+      if (!req.actor.userId) throw forbidden("Board user context required");
+      const id = req.params.id as string;
+      const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+      if (!issue) return;
+      const actor = getActorInfo(req);
+      const queue = await db.transaction(async (tx) => {
+        const locked = await lockQueuedCommentState({
+          tx,
+          issue,
+          actor,
+          queueId: req.body.queueId,
+        });
+        assertQueueMutationTarget({
+          queue: locked.queue,
+          queueId: req.body.queueId,
+          revision: req.body.revision,
+        });
+        const currentIds = locked.queue.entries.map((entry) => entry.comment.id);
+        const orderedIds = req.body.orderedCommentIds as string[];
+        const orderedSet = new Set(orderedIds);
+        if (
+          orderedSet.size !== orderedIds.length
+          || orderedIds.length !== currentIds.length
+          || currentIds.some((commentId) => !orderedSet.has(commentId))
+        ) {
+          throw conflict("The queued message order does not match the current queue", {
+            code: "queued_comment_order_mismatch",
+          });
+        }
+        const now = new Date();
+        const updatedWake = await tx
+          .update(agentWakeupRequests)
+          .set({
+            payload: withQueuedCommentIdsInWakePayload(locked.wake.payload, orderedIds),
+            updatedAt: now,
+          })
+          .where(eq(agentWakeupRequests.id, locked.wake.id))
+          .returning()
+          .then((rows) => rows[0] ?? locked.wake);
+        const updatedQueueRun = await updateQueuedRunCommentIds(
+          tx,
+          locked.queueRun,
+          orderedIds,
+          now,
+        );
+        return buildQueuedCommentQueue({
+          executor: tx,
+          issue,
+          activeRun: locked.activeRun,
+          actor,
+          queueState: {
+            wake: updatedWake,
+            state: locked.state,
+            queueRun: updatedQueueRun ?? locked.queueRun,
+          },
+        });
+      });
+      res.json(await runRedactions.redactForIssue(issue.companyId, issue.id, queue));
+    },
+  );
+
+  router.post(
+    "/issues/:id/queued-comments/:commentId/steer",
+    validate(queuedCommentSteeringTargetSchema),
+    async (req, res) => {
+      assertBoard(req);
+      if (!req.actor.userId) throw forbidden("Board user context required");
+      const id = req.params.id as string;
+      const commentId = req.params.commentId as string;
+      const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+      if (!issue) return;
+      const actor = getActorInfo(req);
+      let acknowledgedTurnId: string | null = null;
+      let duplicate = false;
+      let queue: IssueQueuedCommentQueue;
+      try {
+        queue = await db.transaction(async (tx) => {
+          // A client can lose the successful response after the final queued
+          // message cancels its wake. Lock the original queue and target run
+          // first so that the persisted acknowledgement remains a durable
+          // idempotency record even when no pending queue remains.
+          await tx
+            .select({ id: issueRows.id })
+            .from(issueRows)
+            .where(and(eq(issueRows.id, issue.id), eq(issueRows.companyId, issue.companyId)))
+            .for("update");
+          const retryWake = await tx
+            .select()
+            .from(agentWakeupRequests)
+            .where(and(
+              eq(agentWakeupRequests.id, req.body.queueId),
+              eq(agentWakeupRequests.companyId, issue.companyId),
+              issue.assigneeAgentId
+                ? eq(agentWakeupRequests.agentId, issue.assigneeAgentId)
+                : undefined,
+            ))
+            .for("update")
+            .limit(1)
+            .then((rows) => rows[0] ?? null);
+          const retryRun = retryWake && readObject(retryWake.payload).issueId === issue.id
+            ? await tx
+              .select()
+              .from(heartbeatRuns)
+              .where(and(
+                eq(heartbeatRuns.id, req.body.targetRunId),
+                eq(heartbeatRuns.companyId, issue.companyId),
+                eq(heartbeatRuns.agentId, retryWake.agentId),
+              ))
+              .for("update")
+              .limit(1)
+              .then((rows) => rows[0] ?? null)
+            : null;
+          const retryRunContext = readObject(retryRun?.contextSnapshot);
+          const retryRunResult = readObject(retryRun?.resultJson);
+          const retryAcknowledgements = readObject(
+            retryRunResult.queuedSteeringAcknowledgements,
+          );
+          const retryAcknowledgement = readObject(retryAcknowledgements[commentId]);
+          if (
+            retryRun
+            && (retryRunContext.issueId === issue.id || retryRunContext.taskId === issue.id)
+            && retryAcknowledgement.status === "acknowledged"
+            && retryAcknowledgement.queueId === req.body.queueId
+          ) {
+            duplicate = true;
+            acknowledgedTurnId = typeof retryAcknowledgement.turnId === "string"
+              ? retryAcknowledgement.turnId
+              : null;
+            return buildQueuedCommentQueue({
+              executor: tx,
+              issue,
+              activeRun: retryRun.status === "running" ? retryRun : null,
+              actor,
+            });
+          }
+
+          const locked = await lockQueuedCommentState({
+            tx,
+            issue,
+            actor,
+            queueId: req.body.queueId,
+            targetRunId: req.body.targetRunId,
+          });
+          if (!locked.activeRun) {
+            throw conflict("The queued message targets a stale run", {
+              code: "queued_comment_stale_target",
+            });
+          }
+          const runResult = readObject(locked.activeRun.resultJson);
+          const acknowledgements = readObject(runResult.queuedSteeringAcknowledgements);
+          const priorAcknowledgement = readObject(acknowledgements[commentId]);
+          if (
+            priorAcknowledgement.status === "acknowledged"
+            && priorAcknowledgement.queueId === req.body.queueId
+          ) {
+            duplicate = true;
+            acknowledgedTurnId = typeof priorAcknowledgement.turnId === "string"
+              ? priorAcknowledgement.turnId
+              : null;
+            return buildQueuedCommentQueue({
+              executor: tx,
+              issue,
+              activeRun: locked.activeRun,
+              actor,
+              queueState: locked.queueState,
+            });
+          }
+          assertQueueMutationTarget({
+            queue: locked.queue,
+            queueId: req.body.queueId,
+            revision: req.body.revision,
+          });
+          if (locked.queue.protocol !== "paperclip_runner_v1") {
+            throw conflict("This runner does not support same-turn steering", {
+              code: "steering_unsupported",
+            });
+          }
+          const entry = locked.queue.entries.find((candidate) => candidate.comment.id === commentId);
+          if (!entry) {
+            throw conflict("The queued message is no longer pending", {
+              code: "queued_comment_not_pending",
+            });
+          }
+
+          const acknowledgement = await steerNativeSession({
+            runId: locked.activeRun.id,
+            message: entry.comment.body,
+            correlationId: commentId,
+          });
+          acknowledgedTurnId = acknowledgement.turnId;
+          const remainingIds = locked.queue.entries
+            .map((candidate) => candidate.comment.id)
+            .filter((candidateId) => candidateId !== commentId);
+          const now = new Date();
+          const nextWake = remainingIds.length === 0
+            ? await tx
+              .update(agentWakeupRequests)
+              .set({ status: "cancelled", finishedAt: now, updatedAt: now })
+              .where(eq(agentWakeupRequests.id, locked.wake.id))
+              .returning()
+              .then(() => null)
+            : await tx
+              .update(agentWakeupRequests)
+              .set({
+                payload: withQueuedCommentIdsInWakePayload(locked.wake.payload, remainingIds),
+                updatedAt: now,
+              })
+              .where(eq(agentWakeupRequests.id, locked.wake.id))
+              .returning()
+              .then((rows) => rows[0] ?? locked.wake);
+          await tx
+            .update(heartbeatRuns)
+            .set({
+              resultJson: {
+                ...runResult,
+                queuedSteeringAcknowledgements: {
+                  ...acknowledgements,
+                  [commentId]: {
+                    status: "acknowledged",
+                    queueId: req.body.queueId,
+                    turnId: acknowledgement.turnId,
+                    acknowledgedAt: now.toISOString(),
+                  },
+                },
+              },
+              updatedAt: now,
+            })
+            .where(eq(heartbeatRuns.id, locked.activeRun.id));
+          return buildQueuedCommentQueue({
+            executor: tx,
+            issue,
+            activeRun: locked.activeRun,
+            actor,
+            queueState: nextWake
+              ? { wake: nextWake, state: "deferred", queueRun: null }
+              : null,
+          });
+        });
+      } catch (error) {
+        if (error instanceof NativeSessionSteeringError) {
+          throw conflict(error.message, { code: error.code, retryable: true });
+        }
+        throw error;
+      }
+      await logActivity(db, {
+        companyId: issue.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
+        action: "issue.queued_comment_steered",
+        entityType: "issue",
+        entityId: issue.id,
+        details: {
+          commentId,
+          targetRunId: req.body.targetRunId,
+          turnId: acknowledgedTurnId,
+          duplicate,
+        },
+      });
+      res.json(await runRedactions.redactForIssue(issue.companyId, issue.id, queue));
+    },
+  );
+
+
+  router.delete(
+    "/issues/:id/queued-comments/:commentId",
+    validate(queuedCommentMutationTargetSchema),
+    async (req, res) => {
+      assertBoard(req);
+      if (!req.actor.userId) throw forbidden("Board user context required");
+      const id = req.params.id as string;
+      const commentId = req.params.commentId as string;
+      const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+      if (!issue) return;
+      const actor = getActorInfo(req);
+      const { queue } = await discardQueuedComment({
+        issue,
+        actor,
+        commentId,
+        queueId: req.body.queueId,
+        revision: req.body.revision,
+      });
+      res.json(await runRedactions.redactForIssue(issue.companyId, issue.id, queue));
+    },
+  );
+
   router.get("/issues/:id/interactions", async (req, res) => {
     const id = req.params.id as string;
     const issue = await getAccessibleResource(req, res, getIssueById(req, id), "Issue not found");
@@ -10907,6 +12307,7 @@ export function issueRoutes(
         interactionStatus: interaction.status,
         continuationPolicy: interaction.continuationPolicy,
         addresseeAgentId: interaction.addresseeAgentId ?? null,
+        addresseeUserId: interaction.addresseeUserId ?? null,
         requestedResolverPolicy: interaction.requestedResolverPolicy,
         effectiveResolverPolicy: interaction.effectiveResolverPolicy,
         resolverPolicyProvenance: interaction.resolverPolicyProvenance,
@@ -10978,6 +12379,9 @@ export function issueRoutes(
       );
       if (!authorizedResolution) return;
       const { interactionSvc, current, resolutionAuthorization } = authorizedResolution;
+      if (current.kind === "connection_intent") {
+        throw unprocessable("Connection intents must be resolved through the connection intent endpoints");
+      }
       const suggestedTaskEffectsAuthorized = current.kind === "suggest_tasks"
         ? await assertSuggestedTaskEffectsAllowed(
             req,
@@ -11163,12 +12567,14 @@ export function issueRoutes(
           details: {
             identifier: issue.identifier,
             status: continuationIssue.status,
+            ...(continuationIssue.workMode ? { workMode: continuationIssue.workMode } : {}),
             assigneeAgentId: continuationIssue.assigneeAgentId ?? null,
             assigneeUserId: continuationIssue.assigneeUserId ?? null,
             source: "request_confirmation_accept",
             interactionId: interaction.id,
             _previous: {
               status: issue.status,
+              workMode: issue.workMode,
               assigneeAgentId: issue.assigneeAgentId ?? null,
               assigneeUserId: issue.assigneeUserId ?? null,
             },
@@ -11189,7 +12595,7 @@ export function issueRoutes(
       }
 
       const acceptedPlanTarget = interaction.kind === "request_confirmation"
-        ? readAcceptedPlanConfirmationTarget(interaction.payload)
+        ? readAcceptedPlanConfirmationTarget(interaction.payload, issue.id)
         : null;
       const acceptedPlanConfirmation =
         interaction.kind === "request_confirmation" &&
@@ -11226,7 +12632,10 @@ export function issueRoutes(
         interactionId,
       );
       if (!authorizedResolution) return;
-      const { interactionSvc, resolutionAuthorization } = authorizedResolution;
+      const { interactionSvc, current, resolutionAuthorization } = authorizedResolution;
+      if (current.kind === "connection_intent") {
+        throw unprocessable("Connection intents must be resolved through the connection intent endpoints");
+      }
 
       const actor = getActorInfo(req);
       const interaction = await interactionSvc.rejectInteraction(issue, interactionId, req.body, {
@@ -11295,9 +12704,12 @@ export function issueRoutes(
         interactionId,
       );
       if (!authorizedResolution) return;
-      const { interactionSvc, resolutionAuthorization } = authorizedResolution;
+      const { interactionSvc, current, resolutionAuthorization } = authorizedResolution;
 
       const actor = getActorInfo(req);
+      if (current.kind === "ask_user_questions") {
+        validateNativeQuestionResponseInput(current, req.body);
+      }
       const interaction = await interactionSvc.answerQuestions(issue, interactionId, req.body, {
         agentId: actor.agentId,
         runId: actor.runId,
@@ -11332,13 +12744,13 @@ export function issueRoutes(
         },
       });
 
-      await queueResolvedInteractionContinuationWakeup({
-        db,
-        heartbeat,
-        issue,
-        interaction,
-        actor,
-        source: "issue.interaction.respond",
+      await questionResponseDeliveries.deliver(interaction.id).catch((err) => {
+        logger.warn({
+          err,
+          companyId: issue.companyId,
+          issueId: issue.id,
+          interactionId: interaction.id,
+        }, "synchronous question response delivery failed; durable outbox will retry");
       });
 
       res.json(interaction);
@@ -11442,11 +12854,42 @@ export function issueRoutes(
       await assertPendingReviewInteractionVerdictAllowed(req, issue, current);
 
       const actor = getActorInfo(req);
-      const interaction = await interactionSvc.withdrawInteraction(issue, interactionId, req.body, {
-        agentId: actor.agentId,
-        runId: actor.runId,
-        userId: actor.actorType === "user" ? actor.actorId : null,
-      });
+      let nativeRunId: string | null = null;
+      const interaction = await interactionSvc.withdrawInteraction(
+        issue,
+        interactionId,
+        req.body,
+        {
+          agentId: actor.agentId,
+          runId: actor.runId,
+          userId: actor.actorType === "user" ? actor.actorId : null,
+        },
+        {
+          afterResolveInTransaction: async (tx, resolved) => {
+            if (resolved.kind !== "ask_user_questions") return;
+            nativeRunId = await requestNativeQuestionRunCancellation(tx, resolved, {
+              kind: "interaction_withdrawn",
+              interactionId: resolved.id,
+            });
+          },
+        },
+      );
+      if (nativeRunId) {
+        try {
+          await heartbeat.cancelRun(nativeRunId, "Question withdrawn while waiting for operator input", {
+            resultJson: {
+              withdrawnInteractionId: interaction.id,
+              withdrawnByActorType: actor.actorType,
+              withdrawnByActorId: actor.actorId,
+            },
+          });
+        } catch (err) {
+          logger.warn(
+            { err, runId: nativeRunId, interactionId: interaction.id },
+            "native question withdrawal cancellation deferred to recovery sweep",
+          );
+        }
+      }
       await logActivity(db, {
         companyId: issue.companyId,
         actorType: actor.actorType,
@@ -11480,6 +12923,53 @@ export function issueRoutes(
   );
 
   router.post(
+    "/issues/:id/interactions/:interactionId/skip",
+    validate(skipIssueThreadInteractionSchema),
+    async (req, res) => {
+      const id = req.params.id as string;
+      const interactionId = req.params.interactionId as string;
+      const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+      if (!issue) return;
+      if (req.actor.type === "agent") {
+        res.status(403).json({ error: "Agent actors cannot skip issue-thread interactions through this board-only route" });
+        return;
+      }
+      assertBoard(req);
+
+      const actor = getActorInfo(req);
+      const interaction = await issueThreadInteractionService(db).skipInteraction(issue, interactionId, req.body, {
+        agentId: actor.agentId,
+        runId: actor.runId,
+        userId: actor.actorType === "user" ? actor.actorId : null,
+      });
+
+      await logActivity(db, {
+        companyId: issue.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
+        action: "issue.thread_interaction_skipped",
+        entityType: "issue",
+        entityId: issue.id,
+        details: {
+          interactionId: interaction.id,
+          interactionKind: interaction.kind,
+          interactionStatus: interaction.status,
+          reason: interaction.result && "reason" in interaction.result
+            ? interaction.result.reason ?? null
+            : null,
+        },
+      });
+
+      // Skip intentionally does not enqueue an interaction continuation. A
+      // subsequent ordinary message uses the existing comment steering path.
+      res.json(interaction);
+    },
+  );
+
+  router.post(
     "/issues/:id/interactions/:interactionId/cancel",
     validate(cancelIssueThreadInteractionSchema),
     async (req, res) => {
@@ -11494,10 +12984,25 @@ export function issueRoutes(
       assertBoard(req);
 
       const actor = getActorInfo(req);
-      const interaction = await issueThreadInteractionService(db).cancelQuestions(issue, interactionId, req.body, {
-        agentId: actor.agentId,
-        userId: actor.actorType === "user" ? actor.actorId : null,
-      });
+      let nativeRunId: string | null = null;
+      const interaction = await issueThreadInteractionService(db).cancelQuestions(
+        issue,
+        interactionId,
+        req.body,
+        {
+          agentId: actor.agentId,
+          userId: actor.actorType === "user" ? actor.actorId : null,
+        },
+        {
+          afterResolveInTransaction: async (tx, resolved) => {
+            if (resolved.kind !== "ask_user_questions") return;
+            nativeRunId = await requestNativeQuestionRunCancellation(tx, resolved, {
+              kind: "interaction_cancelled",
+              interactionId: resolved.id,
+            });
+          },
+        },
+      );
 
       await logActivity(db, {
         companyId: issue.companyId,
@@ -11519,6 +13024,23 @@ export function issueRoutes(
               : null,
         },
       });
+
+      if (nativeRunId) {
+        try {
+          await heartbeat.cancelRun(nativeRunId, "Cancelled while waiting for operator input", {
+            resultJson: {
+              cancelledByActorType: "user",
+              cancelledByUserId: req.actor.userId ?? null,
+              cancelledInteractionId: interaction.id,
+            },
+          });
+        } catch (err) {
+          logger.warn(
+            { err, runId: nativeRunId, interactionId: interaction.id },
+            "native question board cancellation deferred to recovery sweep",
+          );
+        }
+      }
 
       await queueResolvedInteractionContinuationWakeup({
         db,
@@ -11567,27 +13089,60 @@ export function issueRoutes(
         : comment.authorUserId === actor.actorId;
     const deleteMode = req.query.mode === "cancel" ? "cancel" : "delete";
 
+    const authoritativeQueueWake = issue.assigneeAgentId
+      ? await db
+        .select()
+        .from(agentWakeupRequests)
+        .where(and(
+          eq(agentWakeupRequests.companyId, issue.companyId),
+          eq(agentWakeupRequests.agentId, issue.assigneeAgentId),
+          inArray(agentWakeupRequests.status, [
+            "deferred_issue_execution",
+            "queued",
+            "claimed",
+            "succeeded",
+            "failed",
+          ]),
+        ))
+        .orderBy(desc(agentWakeupRequests.requestedAt))
+        .then((rows) => rows.find((wake) => (
+          readObject(wake.payload).issueId === issue.id
+          && queuedCommentIdsFromWakePayload(wake.payload).includes(commentId)
+        )) ?? null)
+      : null;
     const activeRun = await resolveActiveIssueRun(issue);
-    const isQueuedComment = activeRun ? isQueuedIssueCommentForActiveRun({ comment, activeRun }) : false;
-    if (deleteMode === "cancel" || isQueuedComment) {
+    const pendingQueueWake = authoritativeQueueWake
+      && ["deferred_issue_execution", "queued"].includes(authoritativeQueueWake.status)
+      ? authoritativeQueueWake
+      : null;
+    const isLegacyQueuedComment = activeRun
+      ? isQueuedIssueCommentForActiveRun({ comment, activeRun })
+      : false;
+    if (deleteMode === "cancel" || pendingQueueWake || isLegacyQueuedComment) {
       if (!actorOwnsComment) {
         res.status(403).json({ error: "Only the comment author can cancel queued comments" });
         return;
       }
 
-      if (!activeRun) {
-        res.status(409).json({ error: "Queued comment can no longer be canceled" });
-        return;
-      }
-
-      if (!isQueuedComment) {
-        res.status(409).json({ error: "Only queued comments can be canceled" });
-        return;
-      }
-
-      const removed = await svc.removeComment(commentId);
+      const queueWakeForCancellation = deleteMode === "cancel"
+        ? authoritativeQueueWake
+        : pendingQueueWake;
+      const removed = queueWakeForCancellation
+        ? (await discardQueuedComment({
+          issue,
+          actor,
+          commentId,
+          queueId: queueWakeForCancellation.id,
+        })).deleted
+        : activeRun && isLegacyQueuedComment
+          ? await svc.removeComment(commentId)
+          : null;
       if (!removed) {
-        res.status(404).json({ error: "Comment not found" });
+        res.status(409).json({
+          error: activeRun
+            ? "Only queued comments can be canceled"
+            : "Queued comment can no longer be canceled",
+        });
         return;
       }
 
@@ -11607,7 +13162,8 @@ export function issueRoutes(
           identifier: issue.identifier,
           issueTitle: issue.title,
           source: "queue_cancel",
-          queueTargetRunId: activeRun.id,
+          queueId: queueWakeForCancellation?.id ?? null,
+          queueTargetRunId: activeRun?.id ?? queueWakeForCancellation?.runId ?? null,
         },
       });
 
@@ -11870,13 +13426,28 @@ export function issueRoutes(
       return;
     }
     if (!(await assertCrossIssueInfluenceWithinRunCap(req, res, issue, "comment"))) return;
+    const willTransitionIssueOutOfTerminalStatus =
+      effectiveMoveToTodoRequested &&
+      (isClosed || (isBlocked && !hasUnresolvedFirstClassBlockers) || shouldResumeInProgressScheduledRetry);
+    // An issue that isn't currently closed or blocked always reopens its
+    // closed workspace on comment, unchanged from prior behavior. An issue
+    // that IS closed or blocked only needs the workspace rebuilt when the
+    // comment will actually move it out of that terminal status -- that's the
+    // only path below that can dispatch a run against the workspace
+    // afterward. A plain evidence/status comment on an already-blocked or
+    // already-closed issue (no reopen/resume intent, or still-unresolved
+    // blockers) leaves the issue terminal and never touches the workspace, so
+    // forcing a rebuild here just turns an unrelated git/provisioning failure
+    // into a 503 that blocks posting the comment at all (BLA-1027).
+    const needsWorkspaceReopenForComment =
+      !(isClosed || isBlocked) || willTransitionIssueOutOfTerminalStatus;
     // Reopen the closed isolated workspace only after every access, resume-intent,
     // blocker, and run-cap gate passes. A rejected comment must not rebuild and
     // republish the workspace as active, because the issue stays terminal and the
     // reaper then skips the leaked workspace.
     let reopenedWorkspace: Pick<ExecutionWorkspace, "id"> | null = null;
     let reopenedGeneration: number | null = null;
-    if (closedExecutionWorkspace) {
+    if (closedExecutionWorkspace && needsWorkspaceReopenForComment) {
       const reopenOutcome = await reopenClosedIssueExecutionWorkspaceOrRespond(
         req,
         res,
@@ -11918,10 +13489,7 @@ export function issueRoutes(
 
     let scheduledRetrySupersededByComment = false;
     let cancelledScheduledRetryRunId: string | null = null;
-    if (
-      effectiveMoveToTodoRequested &&
-      (isClosed || (isBlocked && !hasUnresolvedFirstClassBlockers) || shouldResumeInProgressScheduledRetry)
-    ) {
+    if (willTransitionIssueOutOfTerminalStatus) {
       scheduledRetrySupersededByComment = shouldResumeInProgressScheduledRetry && issue.status === "in_progress";
       cancelledScheduledRetryRunId = scheduledRetrySupersededByComment
         ? await cancelScheduledRetrySupersededByComment({
@@ -12057,6 +13625,7 @@ export function issueRoutes(
       };
       let txResult: { comment: Awaited<ReturnType<typeof svc.addComment>>; issue: NonNullable<Awaited<ReturnType<typeof svc.update>>> };
       const postCommitActivityPublications: ActivityPublication[] = [];
+      const postCommitIssueActions: IssuePostCommitAction[] = [];
       try {
         txResult = await db.transaction(async (tx) => {
           const insertedComment = await svc.addComment(
@@ -12072,8 +13641,8 @@ export function issueRoutes(
             tx,
           );
           const updated = actor.actorType === "user" && currentIssue.status !== "done"
-            ? await svc.update(id, updatePatch, tx, postCommitActivityPublications)
-            : await svc.update(id, updatePatch, tx);
+            ? await svc.update(id, updatePatch, tx, postCommitActivityPublications, postCommitIssueActions)
+            : await svc.update(id, updatePatch, tx, undefined, postCommitIssueActions);
           // Throw (not return null) so drizzle rolls back the inserted comment when the issue
           // has been concurrently deleted between the initial fetch and the in-transaction update.
           if (!updated) throw new AutoApprovalIssueMissingError();
@@ -12103,6 +13672,7 @@ export function issueRoutes(
         throw err;
       }
       for (const publication of postCommitActivityPublications) publishActivity(publication);
+      await flushIssuePostCommitActions(postCommitIssueActions);
       comment = txResult.comment;
       currentIssue = txResult.issue;
       // Mirror the normal status-change audit trail: every other in_review -> done path
@@ -12227,6 +13797,11 @@ export function issueRoutes(
       }
     }
 
+    const commentIsFromAssigneeRun = await commentWasCreatedByAssigneeRun(
+      comment,
+      currentIssue.assigneeAgentId,
+    );
+
     await revalidateActiveSourceRecoveryAfterCommittedWrite({
       issue: currentIssue,
       trigger: "comment",
@@ -12255,15 +13830,19 @@ export function issueRoutes(
         dependentIssueId: string;
         resolvedBlockerIssueId: string;
         blockerIssueIds: string[];
+        blockedTransitionAt?: Date | string | null;
       }) => {
-        const idempotencyKey = buildIssueBlockersResolvedWakeIdempotencyKey({
+        const idempotencyKey = buildIssueBlockersResolvedWakeStateKey({
           dependentIssueId: input.dependentIssueId,
-          resolvedBlockerIssueId: input.resolvedBlockerIssueId,
+          blockerIssueIds: input.blockerIssueIds,
+          blockedTransitionAt: input.blockedTransitionAt,
         });
         try {
-          const existingWake = await findExistingIssueBlockersResolvedWake(db, {
+          const existingWake = await findExistingIssueBlockersResolvedWakeForReadyState(db, {
             companyId: currentIssue.companyId,
-            idempotencyKey,
+            dependentIssueId: input.dependentIssueId,
+            blockerIssueIds: input.blockerIssueIds,
+            blockedTransitionAt: input.blockedTransitionAt,
           });
           if (existingWake) return;
         } catch (err) {
@@ -12316,12 +13895,16 @@ export function issueRoutes(
       })) ?? currentIssue;
       const assigneeId = wakeIssueSnapshot.assigneeAgentId;
       const actorIsAgent = actor.actorType === "agent";
-      const selfComment = actorIsAgent && actor.actorId === assigneeId;
+      const selfComment =
+        (actorIsAgent && actor.actorId === assigneeId) ||
+        commentIsFromAssigneeRun;
       // Re-derive closed-ness from the post-mutation issue so the auto-approval
       // transition (in_review -> done) suppresses a stale `issue_commented` wake
       // to the returnAssignee for an already-completed issue.
-      const skipWake = selfComment || isClosedIssueStatus(wakeIssueSnapshot.status);
-      if (assigneeId && (reopened || !skipWake)) {
+      const shouldWakeAssigneeForComment =
+        !(selfComment && resumeRequested !== true) &&
+        (reopened || !isClosedIssueStatus(wakeIssueSnapshot.status));
+      if (assigneeId && shouldWakeAssigneeForComment) {
         if (reopened) {
           addWakeup(assigneeId, {
             source: "automation",
@@ -12399,7 +13982,10 @@ export function issueRoutes(
       }
 
       for (const mentionedId of mentionedIds) {
-        if (actorIsAgent && actor.actorId === mentionedId) continue;
+        if (
+          (actorIsAgent && actor.actorId === mentionedId) ||
+          (commentIsFromAssigneeRun && mentionedId === assigneeId)
+        ) continue;
         addWakeup(mentionedId, {
           source: "automation",
           triggerDetail: "system",
@@ -12427,6 +14013,7 @@ export function issueRoutes(
             dependentIssueId: dependent.id,
             resolvedBlockerIssueId: currentIssue.id,
             blockerIssueIds: dependent.blockerIssueIds,
+            blockedTransitionAt: dependent.blockedTransitionAt,
           });
         }
       }
@@ -12636,15 +14223,14 @@ export function issueRoutes(
     if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
     if (!(await assertDeliverableMutationAllowedByRunContext(req, res, issue))) return;
 
-    const company = await companiesSvc.getById(companyId);
-    const attachmentMaxBytes = normalizeIssueAttachmentMaxBytes(company?.attachmentMaxBytes);
-
     try {
-      await runSingleFileUpload(req, res, attachmentMaxBytes);
+      await runSingleFileUpload(req, res, MAX_ATTACHMENT_BYTES);
     } catch (err) {
       if (err instanceof multer.MulterError) {
         if (err.code === "LIMIT_FILE_SIZE") {
-          res.status(422).json({ error: `Attachment exceeds ${attachmentMaxBytes} bytes` });
+          res.status(422).json({
+            error: `Attachment is larger than the ${formatAttachmentSize(MAX_ATTACHMENT_BYTES)} limit`,
+          });
           return;
         }
         res.status(400).json({ error: err.message });
@@ -12693,6 +14279,7 @@ export function issueRoutes(
       originalFilename: stored.originalFilename,
       createdByAgentId: actor.agentId,
       createdByUserId: actor.actorType === "user" ? actor.actorId : null,
+      createdByRunId: actor.runId,
     });
 
     await logActivity(db, {
@@ -12713,7 +14300,28 @@ export function issueRoutes(
       },
     });
 
-    res.status(201).json(withContentPath(attachment));
+    if (attachment.artifactWorkProductId) {
+      await logActivity(db, {
+        companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
+        action: "issue.work_product_created",
+        entityType: "issue",
+        entityId: issueId,
+        details: {
+          workProductId: attachment.artifactWorkProductId,
+          type: "artifact",
+          provider: "paperclip",
+          source: "run_attachment_upload",
+        },
+      });
+    }
+
+    const { artifactWorkProductId: _artifactWorkProductId, ...attachmentResponse } = attachment;
+    res.status(201).json(withContentPath(attachmentResponse));
   });
 
   router.get("/attachments/:attachmentId/content", async (req, res, next) => {
@@ -12749,7 +14357,16 @@ export function issueRoutes(
       objectContentType: object.contentType,
       originalFilename: attachment.originalFilename,
     });
-    res.setHeader("Content-Type", responseContentType);
+    // Markdown bodies are stored as UTF-8; declare the charset so inline
+    // (raw) views do not mojibake. SVG/inline checks below stay on the bare type.
+    const isMarkdownResponse = isMarkdownAttachmentContent({
+      contentType: responseContentType,
+      originalFilename: attachment.originalFilename,
+    });
+    res.setHeader(
+      "Content-Type",
+      isMarkdownResponse ? `${responseContentType}; charset=utf-8` : responseContentType,
+    );
     res.setHeader("Cache-Control", "private, max-age=60");
     res.setHeader("X-Content-Type-Options", "nosniff");
     if (responseContentType === SVG_CONTENT_TYPE) {

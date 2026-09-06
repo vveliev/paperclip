@@ -24,6 +24,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   SETUP_TOKEN_SESSION_NOT_FOUND,
   SETUP_TOKEN_PROVIDER_UNSUPPORTED,
+  isTerminalSessionState,
   type SetupTokenCleanupRecord,
   type SetupTokenCleanupStore,
   type SetupTokenLeaseManager,
@@ -105,6 +106,20 @@ const mockRunSecretRedactionRegistry = vi.hoisted(() => ({
 const mockSecretService = vi.hoisted(() => ({
   readClaudeOAuthUserSecretStatus: vi.fn(),
 }));
+// The registry lookup the start-route guard reads. A `beforeEach` sets the
+// default so `claude_local` declares the setup-token capability. A test overrides
+// it to prove the guard reads the capability, not the adapter name.
+const mockFindActiveServerAdapter = vi.hoisted(() => vi.fn());
+
+// The Claude setup-token login capability the registry declares for the built-in
+// adapter. The guard requires the stored-session completion claim.
+const CLAUDE_LOGIN_CAPABILITY = {
+  panelMode: "submitted_browser_code",
+  timeoutPolicy: "fixed",
+  completionClaim: "storedSessionId",
+  getCommand: () => "",
+  parsePrompt: () => null,
+} as const;
 
 function registerModuleMocks(): void {
   vi.doMock("../routes/authz.js", async () => vi.importActual("../routes/authz.js"));
@@ -160,11 +175,16 @@ function registerModuleMocks(): void {
     syncInstructionsBundleConfigFromFilePath: vi.fn((_agent: unknown, config: unknown) => config),
     workspaceOperationService: () => ({}),
   }));
+  // The start-route guard reads the login capability from the registry. The
+  // `beforeEach` default declares the Claude setup-token capability for
+  // `claude_local` and no capability for any other type, so the guard passes for
+  // `claude_local` and fails closed for a different adapter through capability
+  // data alone.
   vi.doMock("../adapters/index.js", () => ({
     findServerAdapter: vi.fn(),
     listAdapterModels: vi.fn(),
     detectAdapterModel: vi.fn(),
-    findActiveServerAdapter: vi.fn(),
+    findActiveServerAdapter: mockFindActiveServerAdapter,
     requireServerAdapter: vi.fn(),
   }));
 }
@@ -269,6 +289,26 @@ function buildTransport(opts: { onSubmit?: "complete" | "throw" | "pending" } = 
       }
       row.boundAt = Date.now();
       return { ...row };
+    },
+    async cancelDurable(identity, cancellableStates) {
+      const row = rows.get(identity.sessionId);
+      if (!row || !cancellableStates.includes(row.state)) return null;
+      row.state = "cancelled";
+      return { ...row };
+    },
+    async findActiveDurable(key, now) {
+      for (const row of rows.values()) {
+        if (
+          row.companyId === key.companyId &&
+          row.ownerUserId === key.ownerUserId &&
+          row.adapterType === key.adapterType &&
+          !isTerminalSessionState(row.state) &&
+          row.deadline > now
+        ) {
+          return { ...row };
+        }
+      }
+      return null;
     },
   };
   const leases: SetupTokenLeaseManager = {
@@ -430,6 +470,12 @@ beforeEach(() => {
   registerModuleMocks();
   vi.clearAllMocks();
   useOwner();
+  // The default registry declares the Claude setup-token capability for
+  // `claude_local` and no capability for any other type. A test overrides this to
+  // prove the guard reads the capability, not the adapter name.
+  mockFindActiveServerAdapter.mockImplementation((type: string) =>
+    type === "claude_local" ? { type, loginCapability: CLAUDE_LOGIN_CAPABILITY } : undefined,
+  );
   // The default owner has no stored Claude value. A test overrides this to prove
   // the status route returns the metadata for a present owner value.
   mockSecretService.readClaudeOAuthUserSecretStatus.mockResolvedValue(null);
@@ -459,7 +505,7 @@ beforeEach(() => {
   mockResolvePluginSandboxProviderDriverByKey.mockImplementation(
     async ({ driverKey }: { driverKey: string }) =>
       driverKey === "daytona"
-        ? { plugin: { id: "plugin-daytona" }, driver: { supportsSetupTokenLogin: true } }
+        ? { plugin: { id: "plugin-daytona" }, driver: { supportsLoginPty: true } }
         : null,
   );
 });
@@ -614,6 +660,50 @@ describe("company-and-environment setup-token route — object-level authorizati
     expect(res.body.error).toBe(SETUP_TOKEN_SESSION_NOT_FOUND);
   });
 
+  it("returns the caller's active session with no session id in the URL", async () => {
+    const transport = buildTransport({ onSubmit: "pending" });
+    const { app } = await createApp({ transport });
+
+    const startRes = await startCompanySession(app);
+    const sessionId = startRes.body.sessionId as string;
+
+    const active = await request(app).get(`${COMPANY_BASE}/active`).send();
+    expect(active.status, JSON.stringify(active.body)).toBe(200);
+    expect(active.body.sessionId).toBe(sessionId);
+    expect(active.body.status).toBe("waiting_for_user");
+    expect(active.body.panelMode).toBe("submitted_browser_code");
+    // The full login URL rides in this owner response, the same way it rides in
+    // the guarded `.../prompt` response — this is not a public, secret-free
+    // surface, so it is not checked against `expectNoSecret`.
+    expect(active.body.prompt).toEqual({ authorizationUrl: FULL_LOGIN_URL, transportAdvisory: null });
+    expect(active.headers["cache-control"]).toBe("no-store, private");
+  });
+
+  it("returns the identical not-found on the active route for no active session, a cross-owner caller, and a cross-company caller", async () => {
+    const transport = buildTransport({ onSubmit: "pending" });
+    const { app } = await createApp({ transport });
+
+    // No session has started yet.
+    const none = await request(app).get(`${COMPANY_BASE}/active`).send();
+    expect(none.status).toBe(404);
+    expect(none.body.error).toBe(SETUP_TOKEN_SESSION_NOT_FOUND);
+
+    await startCompanySession(app);
+
+    // A different board user in the same company holds no active session.
+    useOwner(OTHER_USER_ID);
+    const otherOwner = await request(app).get(`${COMPANY_BASE}/active`).send();
+    expect(otherOwner.status).toBe(404);
+    expect(otherOwner.body.error).toBe(SETUP_TOKEN_SESSION_NOT_FOUND);
+    useOwner();
+
+    // The same owner under a different company holds no active session there.
+    const crossCompanyBase = `/api/companies/${OTHER_COMPANY_ID}/setup-token-login-sessions`;
+    const otherCompany = await request(app).get(`${crossCompanyBase}/active`).send();
+    expect(otherCompany.status).toBe(404);
+    expect(otherCompany.body.error).toBe(SETUP_TOKEN_SESSION_NOT_FOUND);
+  });
+
   it("returns the fixed not-found for a non-member on every action across a company boundary", async () => {
     const transport = buildTransport({ onSubmit: "complete" });
     const { app } = await createApp({ transport });
@@ -651,7 +741,10 @@ describe("company-and-environment setup-token route — object-level authorizati
     expect(transport.submittedCodes).toEqual([]);
   });
 
-  it("rejects an adapter other than claude_local at start", async () => {
+  it("rejects an adapter whose login capability does not match the setup-token guard", async () => {
+    // The Codex adapter declares a streamed-exec device login, not a
+    // pseudo-terminal setup-token login. The guard reads the capability, so it
+    // rejects the adapter with a fixed 400 before any session.
     const transport = buildTransport({ onSubmit: "pending" });
     const { app } = await createApp({ transport });
 
@@ -663,6 +756,39 @@ describe("company-and-environment setup-token route — object-level authorizati
     // The route rejected the adapter before it started a session, so the store
     // holds no record.
     expect(transport.records).toEqual([]);
+  });
+
+  it("rejects a third adapter that declares the capability but is not the served adapter", async () => {
+    // A third adapter, not the Claude adapter, declares the same pseudo-terminal
+    // setup-token capability with the stored-session claim. The five follow-up
+    // routes and the reaper both read only the one served adapter type, so the
+    // guard must reject this adapter even though its capability matches. It
+    // rejects with the same fixed 400 as the capability-mismatch case, before
+    // any sandbox assertion, lease, durable row, or pseudo-terminal.
+    mockFindActiveServerAdapter.mockImplementation((type: string) =>
+      type === "gemini_local"
+        ? {
+            type,
+            loginCapability: { ...CLAUDE_LOGIN_CAPABILITY, panelMode: "displayed_code" },
+          }
+        : undefined,
+    );
+    const transport = buildTransport({ onSubmit: "pending" });
+    const { app } = await createApp({ transport });
+
+    const res = await startCompanySession(app, {
+      environmentId: ENVIRONMENT_ID,
+      adapterType: "gemini_local",
+    });
+    expect(res.status, JSON.stringify(res.body)).toBe(400);
+    expect(res.body.error).toBe("This adapter does not support a setup-token login.");
+    // The route rejected the adapter before any sandbox, lease, or store side
+    // effect: no cleanup record, no lease acquire, no pseudo-terminal start, and
+    // no environment or provider guard call.
+    expect(transport.records).toEqual([]);
+    expect(transport.factoryInvocations.count).toBe(0);
+    expect(mockEnvironmentService.getById).not.toHaveBeenCalled();
+    expect(mockResolvePluginSandboxProviderDriverByKey).not.toHaveBeenCalled();
   });
 });
 
