@@ -639,7 +639,7 @@ describe("remote provider pack manifest", () => {
     const payload = {
       pins: {
         nodeMinimum: "24.11.0",
-        codex: "0.153.4",
+        codex: "0.154.0",
         opencode: "1.18.29",
         acpx: "0.13.1",
         claudeAcp: "0.70.0",
@@ -1626,14 +1626,14 @@ describe("remote preinstalled executable discovery", () => {
       await mkdir(join(root, "workspace", "bin"), { recursive: true });
       const shim = '#!/bin/sh\ncat "$(dirname "$0")/version.txt"\nprintf "%s\\n" "$@"\n';
       await writeFile(source, shim, { mode: 0o755 });
-      await writeFile(join(installation, "version.txt"), "codex-cli 0.153.4\n");
+      await writeFile(join(installation, "version.txt"), "codex-cli 0.154.0\n");
       // Existing deployments may already have the old symlink. Never write
       // through it into the shared installation while upgrading the launcher.
       await symlink(source, target);
       for (let pass = 0; pass < 2; pass++) {
         execFileSync("sh", ["-c", buildRemoteCodexLauncherCommand(source, target)]);
         expect(execFileSync(target, ["--version", "argument with 'quotes'"], { encoding: "utf8" }))
-          .toBe("codex-cli 0.153.4\n--version\nargument with 'quotes'\n");
+          .toBe("codex-cli 0.154.0\n--version\nargument with 'quotes'\n");
         expect(await readFile(source, "utf8")).toBe(shim);
       }
       expect(await readdir(join(root, "workspace", "bin"))).toEqual(["codex"]);
@@ -6739,7 +6739,7 @@ describe("runnerd provider runtime wiring", () => {
           ) {
             throw new Error("reached-preinstalled-codex-verification");
           }
-          stdout = "codex-cli 0.153.4";
+          stdout = "codex-cli 0.154.0";
         } else if (script.includes("command -v paperclip-runnerd")) {
           stdout = "/usr/local/bin/paperclip-runnerd\n";
         } else if (script.includes("command -v codex")) {

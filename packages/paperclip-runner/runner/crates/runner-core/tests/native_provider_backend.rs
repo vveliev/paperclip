@@ -144,7 +144,7 @@ fn prepare_payload(directory: &Path, agent: &str) -> Value {
 fn prepare_payload_with_mode(directory: &Path, agent: &str, mode: &str) -> Value {
     let operations = Vec::new();
     let (runtime_package, runtime_version) = if agent == "codex" {
-        (json!("@openai/codex"), json!("0.153.4"))
+        (json!("@openai/codex"), json!("0.154.0"))
     } else {
         (Value::Null, Value::Null)
     };

@@ -445,7 +445,7 @@ describe("ACPX installation integrity", () => {
       },
       {
         name: "@anthropic-ai/claude-agent-sdk",
-        version: "0.3.263",
+        version: "0.3.267",
         directory: join(dependencyRoot, "claude-agent-sdk"),
       },
       {
@@ -473,7 +473,7 @@ describe("ACPX installation integrity", () => {
           bin: "bin/server.js",
           dependencies: {
             "@agentclientprotocol/sdk": "1.3.0",
-            "@anthropic-ai/claude-agent-sdk": "0.3.263",
+            "@anthropic-ai/claude-agent-sdk": "0.3.267",
             zod: "^3.25.0 || ^4.0.0",
           },
         }),
@@ -544,7 +544,7 @@ describe("ACPX installation integrity", () => {
         bin: "bin/server.js",
         dependencies: {
           "@agentclientprotocol/sdk": "1.3.0",
-          "@anthropic-ai/claude-agent-sdk": "0.3.263",
+          "@anthropic-ai/claude-agent-sdk": "0.3.267",
           zod: "^3.25.0 || ^4.0.0",
         },
       }),
