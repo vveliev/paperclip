@@ -4300,7 +4300,7 @@ export function companySkillService(db: Db) {
       // materialized __runtime__ copy, which is what agents actually load
       // from and is refreshed independently of sourceLocator.
       if (diskContent === null && skill.sourceType === "local_path") {
-        const runtimePath = path.resolve(resolveRuntimeSkillMaterializedPath(companyId, skill), normalizedPath);
+        const runtimePath = path.resolve(resolveRuntimeSkillMaterializedPath(skill.companyId, skill), normalizedPath);
         diskContent = await fs.readFile(runtimePath, "utf8").catch(() => null);
       }
       if (diskContent !== null) {
