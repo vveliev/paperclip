@@ -1466,7 +1466,7 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
     expect(result.map((issue) => issue.id)).toEqual([recentMediumIssueId]);
   });
 
-  it("ranks comment matches ahead of description-only matches", async () => {
+  it("ranks direct description matches ahead of comment-only matches", async () => {
     const companyId = randomUUID();
     const commentMatchId = randomUUID();
     const descriptionMatchId = randomUUID();
@@ -1508,7 +1508,7 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
       includeRoutineExecutions: true,
     });
 
-    expect(result.map((issue) => issue.id)).toEqual([commentMatchId, descriptionMatchId]);
+    expect(result.map((issue) => issue.id)).toEqual([descriptionMatchId, commentMatchId]);
   });
 
   it("filters issue lists to the full descendant tree for a root issue", async () => {
@@ -7517,6 +7517,8 @@ describeEmbeddedPostgres("issueService.assertCheckoutOwner stale checkout adopti
 describeEmbeddedPostgres("issueService.addComment createdByRunId", () => {
   let db!: ReturnType<typeof createDb>;
   let svc!: ReturnType<typeof issueService>;
+  let singleConnectionDb!: ReturnType<typeof createDb>;
+  let singleConnectionSvc!: ReturnType<typeof issueService>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
   let companyId!: string;
   let agentId!: string;
@@ -7526,6 +7528,8 @@ describeEmbeddedPostgres("issueService.addComment createdByRunId", () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-issues-comment-runid-");
     db = createDb(tempDb.connectionString);
     svc = issueService(db);
+    singleConnectionDb = createDb(tempDb.connectionString, { maxConnections: 1 });
+    singleConnectionSvc = issueService(singleConnectionDb);
 
     companyId = randomUUID();
     agentId = randomUUID();
@@ -7568,6 +7572,20 @@ describeEmbeddedPostgres("issueService.addComment createdByRunId", () => {
       .where(eq(issueComments.id, commentId))
       .then((rows) => rows[0]?.createdByRunId ?? null);
   }
+
+  it("keeps addComment transaction reads on a single pooled connection", async () => {
+    const comment = await singleConnectionDb.transaction(async (tx) =>
+      singleConnectionSvc.addComment(
+        issueId,
+        "transaction-safe comment",
+        {},
+        { authorType: "system" },
+        tx,
+      ),
+    );
+
+    expect(comment.body).toBe("transaction-safe comment");
+  });
 
   it("nulls out a non-UUID x-paperclip-run-id instead of 500-ing", async () => {
     const comment = await svc.addComment(issueId, "hello from a synthetic run id", {

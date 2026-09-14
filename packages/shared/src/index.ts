@@ -341,9 +341,9 @@ export {
   SELF_SERVE_MCP_RESEARCH,
 } from "./self-serve-mcp-research.js";
 export * from "./validators/status-card.js";
+export { appDefinitionSchema, appDefinitionsSchema, connectionMethodDefSchema } from "./validators/app-definition.js";
 export * from "./types/chat-channels.js";
 export * from "./validators/chat-channels.js";
-export { appDefinitionSchema, appDefinitionsSchema, connectionMethodDefSchema } from "./validators/app-definition.js";
 export {
   humanizeConnectionDisplayName,
   connectionDisplaySecondaryHint,
@@ -938,6 +938,7 @@ export type {
   AdapterAuthSessionResponse,
   AdapterAuthSessionPrompt,
   AdapterAuthSessionOwnerResponse,
+  CodexAccountBindingClaim,
   StartAdapterAuthSessionRequest,
   AdapterAuthPanelMode,
   ClaudeSetupTokenSessionPrompt,
@@ -1121,8 +1122,6 @@ export type {
   IssueBlockedInboxReason,
   IssueBlockedInboxSeverity,
   IssueBlockedInboxState,
-  IssueProductivityReview,
-  IssueProductivityReviewTrigger,
   IssueRecoveryAction,
   IssueWatchdog,
   IssueWatchdogStatus,
@@ -1253,6 +1252,7 @@ export type {
   FinanceByBiller,
   FinanceByKind,
   AgentWakeupResponse,
+  ChatFailedRunRetryResponse,
   AgentWakeupSkipped,
   GitWorktreeBranchAncestryVerdict,
   GitWorktreeBranchIncoherenceEvidence,
@@ -2147,6 +2147,7 @@ export {
   toolCatalogEntryStatusSchema,
   toolConnectionHealthStatusSchema,
   toolConnectionKindSchema,
+  toolConnectionPurposeSchema,
   toolConnectionTransportSchema,
   toolConnectionStatusSchema,
   toolCredentialPlacementSchema,
@@ -2758,3 +2759,8 @@ export type { ExecutionContinuationEnvelope } from "./types/execution-continuati
 export type { ExecutionProjection, ExecutionReconciliation, ExecutionBlocker } from "./types/execution-projection.js";
 
 export { EXECUTION_RECONCILIATION_CAUSES, requiresExecutionReconciliation } from "./types/execution-projection.js";
+
+export * from "./ai-connections.js";
+export * from "./types/email.js";
+export * from "./validators/email.js";
+export * from "./announcements.js";

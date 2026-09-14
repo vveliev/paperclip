@@ -11,6 +11,12 @@ import {
 import { parseRunnerGoalCommand, TaskChatComposer } from "./TaskChatComposer";
 import { QuestionForm } from "./QuestionForm";
 import { DRAFT_DEBOUNCE_MS } from "../../lib/composer-draft";
+import {
+  loadDraftSubmission,
+  saveDraft,
+  saveDraftSubmission,
+} from "../../lib/composer-draft";
+import { CommentSubmissionUnknownError } from "../../lib/comment-submit-result";
 
 /**
  * MDXEditor-in-jsdom weight (mirrors MarkdownEditor.test.tsx): the real editor
@@ -284,6 +290,452 @@ function autocompleteOption(matchText: string) {
 }
 
 describe("TaskChatComposer", () => {
+  it("settles an acknowledged submission after navigating away", async () => {
+    const key = "navigate-before-save";
+    let resolveSend!: () => void;
+    const onAdd = vi.fn().mockReturnValue(new Promise<void>(resolve => { resolveSend = resolve; }));
+    render(<TaskChatComposer onAdd={onAdd} workMode="standard" draftKey={key} />);
+    typeText("Please write a motto");
+    pressKey("Enter", { metaKey: true });
+    await flushAsync();
+    const intent = loadDraftSubmission(key)!;
+    expect(onAdd.mock.calls[0]?.[4]).toBe(intent.attemptId);
+    render(<div>Another task</div>);
+    resolveSend();
+    await flushAsync();
+    expect(loadDraftSubmission(key)).toBeNull();
+    expect(localStorage.getItem(key)).toBeNull();
+    render(<TaskChatComposer onAdd={onAdd} workMode="standard" draftKey={key} />);
+    expect(container.textContent).not.toContain("couldn’t confirm");
+    expect(editable().textContent).toBe("");
+  });
+
+  it("automatically reconciles a restored submission by its server receipt, not its text", async () => {
+    const key = "saved-receipt";
+    const attemptId = "9af8228f-0be7-45ae-a104-6fbe0af6f1d3";
+    saveDraft(key, "Already answered");
+    saveDraftSubmission(key, { attemptId, reviewed: false });
+    const onAdd = vi.fn();
+    render(<TaskChatComposer onAdd={onAdd} workMode="standard" draftKey={key}
+      confirmedSubmissionIds={new Set(["another-request"])} />);
+    expect(loadDraftSubmission(key)).not.toBeNull();
+    render(<TaskChatComposer onAdd={onAdd} workMode="standard" draftKey={key}
+      confirmedSubmissionIds={new Set([attemptId])} />);
+    await flushAsync();
+    expect(loadDraftSubmission(key)).toBeNull();
+    expect(editable().textContent).toBe("");
+    expect(onAdd).not.toHaveBeenCalled();
+  });
+
+  it("preserves the next draft when an uncertain submission is later confirmed after reload", async () => {
+    const key = "uncertain-with-next-draft";
+    let rejectSend!: (error: Error) => void;
+    const onAdd = vi.fn().mockReturnValue(new Promise<void>((_resolve, reject) => { rejectSend = reject; }));
+    render(<TaskChatComposer onAdd={onAdd} workMode="standard" draftKey={key} />);
+    typeText("First request");
+    pressKey("Enter", { metaKey: true });
+    await flushAsync();
+    const attemptId = loadDraftSubmission(key)!.attemptId;
+    typeText("Keep this next draft");
+    rejectSend(new CommentSubmissionUnknownError());
+    await flushAsync();
+    render(<div>Another task</div>);
+    render(<TaskChatComposer onAdd={onAdd} workMode="standard" draftKey={key}
+      confirmedSubmissionIds={new Set([attemptId])} />);
+    await flushAsync();
+    expect(editable().textContent).toBe("Keep this next draft");
+    expect(localStorage.getItem(key)).toBe("Keep this next draft");
+    expect(loadDraftSubmission(key)).toBeNull();
+    expect(onAdd).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["acknowledgment", "receipt after reload"])("preserves a next draft across navigation before %s", async (confirmation) => {
+    const key = "navigate-with-next-draft";
+    let resolveSend!: () => void;
+    const onAdd = vi.fn().mockReturnValue(new Promise<void>(resolve => { resolveSend = resolve; }));
+    render(<TaskChatComposer onAdd={onAdd} workMode="standard" draftKey={key} />);
+    typeText("First request");
+    pressKey("Enter", { metaKey: true });
+    await flushAsync();
+    const attemptId = loadDraftSubmission(key)!.attemptId;
+    typeText("Keep the unsent next request");
+    render(<div>Another task</div>);
+    if (confirmation === "acknowledgment") {
+      resolveSend();
+      await flushAsync();
+    }
+    render(<TaskChatComposer onAdd={onAdd} workMode="standard" draftKey={key}
+      confirmedSubmissionIds={new Set([attemptId])} />);
+    await flushAsync();
+    expect(editable().textContent).toBe("Keep the unsent next request");
+    expect(localStorage.getItem(key)).toBe("Keep the unsent next request");
+    expect(loadDraftSubmission(key)).toBeNull();
+    expect(onAdd).toHaveBeenCalledTimes(1);
+    resolveSend();
+    await flushAsync();
+    expect(localStorage.getItem(key)).toBe("Keep the unsent next request");
+  });
+
+  it("does not copy another task's draft into a late acknowledged submission", async () => {
+    let resolveSend!: () => void;
+    const onAdd = vi.fn().mockReturnValue(new Promise<void>(resolve => { resolveSend = resolve; }));
+    render(<TaskChatComposer onAdd={onAdd} workMode="standard" draftKey="first-task" />);
+    typeText("First request");
+    pressKey("Enter", { metaKey: true });
+    await flushAsync();
+    render(<TaskChatComposer onAdd={onAdd} workMode="standard" draftKey="second-task" />);
+    typeText("Second task draft");
+    resolveSend();
+    await flushAsync();
+    expect(loadDraftSubmission("first-task")).toBeNull();
+    expect(localStorage.getItem("first-task")).toBeNull();
+    expect(editable().textContent).toBe("Second task draft");
+  });
+
+  it.each(["success", "unknown"])(
+    "does not overwrite another retained attempt after an older %s",
+    async (outcome) => {
+      const key = "exact-attempt-settlement";
+      let settle!: () => void;
+      const onAdd = vi.fn().mockReturnValue(
+        new Promise<void>((resolve, reject) => {
+          settle =
+            outcome === "success"
+              ? resolve
+              : () => reject(new CommentSubmissionUnknownError());
+        }),
+      );
+      render(
+        <TaskChatComposer onAdd={onAdd} workMode="standard" draftKey={key} />,
+      );
+      typeText("Older request");
+      pressKey("Enter", { metaKey: true });
+      await flushAsync();
+      const newer = {
+        version: 1,
+        draftKey: key,
+        attemptId: "aaf8228f-0be7-45ae-a104-6fbe0af6f1d3",
+        reviewed: false,
+      };
+      localStorage.setItem(key, "Newer retained draft");
+      localStorage.setItem(`${key}:attachments:v1`, "newer receipt sentinel");
+      localStorage.setItem(`${key}:submission:v1`, JSON.stringify(newer));
+      settle();
+      await flushAsync();
+      await flushAsync();
+      window.dispatchEvent(new Event("beforeunload"));
+      expect(localStorage.getItem(`${key}:submission:v1`)).toBe(
+        JSON.stringify(newer),
+      );
+      expect(localStorage.getItem(key)).toBe("Newer retained draft");
+      expect(localStorage.getItem(`${key}:attachments:v1`)).toBe(
+        "newer receipt sentinel",
+      );
+    },
+  );
+
+  it("fences an unknown save in memory with disabled storage until a successful explicit review and local discard", async () => {
+    const storage = vi
+      .spyOn(Storage.prototype, "setItem")
+      .mockImplementation(() => {
+        throw new Error("Storage disabled");
+      });
+    const onAdd = vi
+      .fn()
+      .mockRejectedValue(new CommentSubmissionUnknownError());
+    const review = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("Refresh unavailable"))
+      .mockResolvedValue(undefined);
+    try {
+      render(
+        <TaskChatComposer
+          onAdd={onAdd}
+          workMode="standard"
+          draftKey="storage-disabled"
+          onReviewConversation={review}
+        />,
+      );
+      typeText("Do not replay this unknown save");
+      pressKey("Enter", { metaKey: true });
+      await flushAsync();
+      await flushAsync();
+      expect(sendButton().disabled).toBe(true);
+      expect(container.textContent).toContain(
+        "couldn’t confirm whether this comment was saved",
+      );
+      pressKey("Enter", { metaKey: true });
+      await flushAsync();
+      expect(onAdd).toHaveBeenCalledTimes(1);
+      const reviewButton = () =>
+        Array.from(container.querySelectorAll("button")).find(
+          (button) => button.textContent === "Review conversation",
+        )!;
+      flushSync(() => reviewButton().click());
+      await flushAsync();
+      expect(container.textContent).toContain(
+        "Couldn’t refresh the conversation",
+      );
+      expect(container.textContent).not.toContain(
+        "Discard draft and start new",
+      );
+      flushSync(() => reviewButton().click());
+      await flushAsync();
+      expect(review).toHaveBeenCalledTimes(2);
+      const discard = Array.from(container.querySelectorAll("button")).find(
+        (button) => button.textContent === "Discard draft and start new",
+      )!;
+      flushSync(() => discard.click());
+      expect(editable().textContent).toBe("");
+      expect(onAdd).toHaveBeenCalledTimes(1);
+    } finally {
+      storage.mockRestore();
+    }
+  });
+
+  it("restores an in-flight submission as uncertain only for its exact task key", async () => {
+    const key = "uncertain-task-one";
+    const attemptId = "9af8228f-0be7-45ae-a104-6fbe0af6f1d3";
+    saveDraft(key, "Retained unknown draft");
+    saveDraftSubmission(key, { attemptId, reviewed: false });
+    const onAdd = vi.fn();
+    render(
+      <StrictMode>
+        <TaskChatComposer onAdd={onAdd} workMode="standard" draftKey={key} />
+      </StrictMode>,
+    );
+    expect(editable().textContent).toBe("Retained unknown draft");
+    expect(sendButton().disabled).toBe(true);
+    expect(loadDraftSubmission(key)?.attemptId).toBe(attemptId);
+    render(
+      <StrictMode>
+        <TaskChatComposer
+          onAdd={onAdd}
+          workMode="standard"
+          draftKey="uncertain-task-two"
+        />
+      </StrictMode>,
+    );
+    await flushAsync();
+    typeText("Separate task draft");
+    await flushAsync();
+    expect(sendButton().disabled).toBe(false);
+    expect(loadDraftSubmission(key)?.attemptId).toBe(attemptId);
+    expect(onAdd).not.toHaveBeenCalled();
+  });
+  it("retains explicit upload receipt IDs across a failed send without uploading again", async () => {
+    const onAdd = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("try again"))
+      .mockResolvedValue(undefined);
+    const id = "9af8228f-0be7-45ae-a104-6fbe0af6f1d3";
+    const onAttachImage = vi.fn().mockResolvedValue({
+      id,
+      contentPath: `/api/attachments/${id}/content`,
+      originalFilename: "notes.txt",
+    });
+    render(
+      <TaskChatComposer
+        onAdd={onAdd}
+        workMode="standard"
+        onAttachImage={onAttachImage}
+      />,
+    );
+    typeText("Inspect the new file.");
+    pasteFiles([new File(["new bytes"], "notes.txt", { type: "text/plain" })]);
+    await flushAsync();
+    flushSync(() => sendButton().click());
+    await flushAsync();
+    expect(onAdd.mock.calls[0]?.[3]).toEqual([id]);
+    flushSync(() => sendButton().click());
+    await flushAsync();
+    expect(onAdd.mock.calls[1]?.[3]).toEqual([id]);
+    expect(onAttachImage).toHaveBeenCalledTimes(1);
+  });
+
+  it("holds submission while an inline image upload is pending and binds its receipt", async () => {
+    const onAdd = vi.fn().mockResolvedValue(undefined);
+    const id = "5e5f9946-c706-4785-8988-d4d6f0f499ab";
+    let resolveUpload!: (value: unknown) => void;
+    const onAttachImage = vi.fn().mockReturnValue(
+      new Promise((resolve) => {
+        resolveUpload = resolve;
+      }),
+    );
+    render(
+      <TaskChatComposer
+        onAdd={onAdd}
+        workMode="standard"
+        onAttachImage={onAttachImage}
+      />,
+    );
+    typeText("Inspect the picture.");
+    const handler = mdxEditorMockState.imagePluginOptions!.imageUploadHandler!;
+    const upload = handler(
+      new File(["png"], "image.png", { type: "image/png" }),
+    );
+    await flushAsync();
+    expect(sendButton().disabled).toBe(true);
+    pressKey("Enter", { metaKey: true });
+    expect(onAdd).not.toHaveBeenCalled();
+    resolveUpload({
+      id,
+      contentPath: `/api/attachments/${id}/content`,
+      originalFilename: "image.png",
+    });
+    const url = await upload;
+    typeText(`Inspect the picture.\n\n![image](${url})`);
+    await flushAsync();
+    flushSync(() => sendButton().click());
+    await flushAsync();
+    expect(onAdd.mock.calls[0]?.[3]).toEqual([id]);
+  });
+
+  it("does not infer binding from arbitrary pasted attachment Markdown", async () => {
+    const onAdd = vi.fn().mockResolvedValue(undefined);
+    render(<TaskChatComposer onAdd={onAdd} workMode="standard" />);
+    typeText(
+      "[old file](/api/attachments/9af8228f-0be7-45ae-a104-6fbe0af6f1d3/content)",
+    );
+    flushSync(() => sendButton().click());
+    await flushAsync();
+    expect(onAdd.mock.calls[0]?.[3]).toBeUndefined();
+  });
+
+  it("submits multiple retained file and image receipts but not removed selections", async () => {
+    const onAdd = vi.fn().mockResolvedValue(undefined);
+    const receipts = [
+      "9af8228f-0be7-45ae-a104-6fbe0af6f1d3",
+      "5e5f9946-c706-4785-8988-d4d6f0f499ab",
+      "975687b9-d594-46a1-8b9e-707de6480fd7",
+      "0aab5c84-8722-40f6-ae89-4b35040cedcf",
+    ];
+    const onAttachImage = vi.fn().mockImplementation(async (file: File) => {
+      const id = receipts[onAttachImage.mock.calls.length - 1]!;
+      return {
+        id,
+        contentPath: `/api/attachments/${id}/content`,
+        originalFilename: file.name,
+      };
+    });
+    render(
+      <TaskChatComposer
+        onAdd={onAdd}
+        workMode="standard"
+        onAttachImage={onAttachImage}
+      />,
+    );
+    pasteFiles([
+      new File(["one"], "one.txt", { type: "text/plain" }),
+      new File(["two"], "two.txt", { type: "text/plain" }),
+    ]);
+    await flushAsync();
+    const handler = mdxEditorMockState.imagePluginOptions!.imageUploadHandler!;
+    const retainedImage = await handler(
+      new File(["png"], "three.png", { type: "image/png" }),
+    );
+    await handler(new File(["png"], "removed.png", { type: "image/png" }));
+    typeText(`Only this picture remains ![three](${retainedImage})`);
+    await flushAsync();
+    flushSync(() =>
+      container
+        .querySelector<HTMLButtonElement>(
+          'button[aria-label="Remove two.txt"]',
+        )!
+        .click(),
+    );
+    flushSync(() => sendButton().click());
+    await flushAsync();
+    expect(onAdd.mock.calls[0]?.[3]).toEqual([receipts[0], receipts[2]]);
+    expect(onAdd.mock.calls[0]?.[0]).not.toContain("two.txt");
+    expect(onAdd.mock.calls[0]?.[0]).not.toContain("removed.png");
+  });
+
+  it("restores file and inline image receipts after a fresh composer mount", async () => {
+    const onAdd = vi.fn().mockResolvedValue(undefined);
+    const ids = [
+      "9af8228f-0be7-45ae-a104-6fbe0af6f1d3",
+      "5e5f9946-c706-4785-8988-d4d6f0f499ab",
+    ];
+    const onAttachImage = vi.fn().mockImplementation(async (file: File) => {
+      const id = ids[onAttachImage.mock.calls.length - 1]!;
+      return {
+        id,
+        contentPath: `/api/attachments/${id}/content`,
+        originalFilename: file.name,
+      };
+    });
+    const props = {
+      onAdd,
+      workMode: "standard" as const,
+      onAttachImage,
+      draftKey: "receipt-reload",
+    };
+    render(<TaskChatComposer {...props} />);
+    pasteFiles([new File(["text"], "file.txt", { type: "text/plain" })]);
+    await flushAsync();
+    const url = await mdxEditorMockState.imagePluginOptions!
+      .imageUploadHandler!(
+      new File(["png"], "image.png", { type: "image/png" }),
+    );
+    typeText(`Inspect both files ![image](${url})`);
+    await flushAsync();
+    render(<div />);
+    render(<TaskChatComposer {...props} />);
+    await flushAsync();
+    expect(container.textContent).toContain("file.txt");
+    expect(editable().textContent).toContain(url);
+    flushSync(() => sendButton().click());
+    await flushAsync();
+    expect(onAdd.mock.calls[0]?.[3]).toEqual(ids);
+    expect(onAttachImage).toHaveBeenCalledTimes(2);
+    expect(localStorage.getItem("receipt-reload:attachments:v1")).toBeNull();
+  });
+
+  it("removes a pending inline image without a late insertion or restored receipt", async () => {
+    const onAdd = vi.fn().mockResolvedValue(undefined);
+    let resolveUpload!: (value: unknown) => void;
+    const onAttachImage = vi.fn().mockReturnValue(
+      new Promise((resolve) => {
+        resolveUpload = resolve;
+      }),
+    );
+    render(
+      <TaskChatComposer
+        onAdd={onAdd}
+        workMode="standard"
+        onAttachImage={onAttachImage}
+        draftKey="removed-pending"
+      />,
+    );
+    typeText("Keep this text");
+    const upload = mdxEditorMockState.imagePluginOptions!.imageUploadHandler!(
+      new File(["png"], "pending.png", { type: "image/png" }),
+    );
+    const rejected = expect(upload).rejects.toThrow("Attachment was removed");
+    await flushAsync();
+    expect(container.textContent).toContain("pending.png");
+    expect(sendButton().disabled).toBe(true);
+    flushSync(() =>
+      container
+        .querySelector<HTMLButtonElement>(
+          'button[aria-label="Remove pending.png"]',
+        )!
+        .click(),
+    );
+    resolveUpload({
+      id: "9af8228f-0be7-45ae-a104-6fbe0af6f1d3",
+      contentPath:
+        "/api/attachments/9af8228f-0be7-45ae-a104-6fbe0af6f1d3/content",
+    });
+    await rejected;
+    await flushAsync();
+    expect(editable().textContent).toBe("Keep this text");
+    expect(localStorage.getItem("removed-pending:attachments:v1")).toBeNull();
+    flushSync(() => sendButton().click());
+    await flushAsync();
+    expect(onAdd.mock.calls[0]?.[3]).toBeUndefined();
+  });
   it("adds 10px to the composer's original 8px interior padding", () => {
     render(<TaskChatComposer onAdd={async () => {}} workMode="standard" />);
 
@@ -374,7 +826,7 @@ describe("TaskChatComposer", () => {
     await flushAsync();
     await flushAsync();
 
-    expect(onAdd).toHaveBeenCalledWith("hello there", undefined, undefined);
+    expect(onAdd).toHaveBeenCalledWith("hello there", undefined, undefined, undefined, expect.any(String));
     expect(editable().textContent).toBe("");
   });
 
@@ -386,7 +838,7 @@ describe("TaskChatComposer", () => {
     pressKey("Enter", { ctrlKey: true });
     await flushAsync();
 
-    expect(onAdd).toHaveBeenCalledWith("hello", undefined, undefined);
+    expect(onAdd).toHaveBeenCalledWith("hello", undefined, undefined, undefined, expect.any(String));
   });
 
   it("does not submit on plain Enter or Shift+Enter (newline stays with the editor)", async () => {
@@ -428,7 +880,7 @@ describe("TaskChatComposer", () => {
     await flushAsync();
 
     expect(onWorkModeChange).toHaveBeenCalledWith("planning");
-    expect(onAdd).toHaveBeenCalledWith("do the plan", undefined, undefined);
+    expect(onAdd).toHaveBeenCalledWith("do the plan", undefined, undefined, undefined, expect.any(String));
   });
 
   it("cycles Auto, Plan, and Ask modes with Cmd+Period while focused", () => {
@@ -487,8 +939,12 @@ describe("TaskChatComposer", () => {
       />,
     );
 
-    const mode = container.querySelector<HTMLButtonElement>('[data-testid="task-chat-composer-mode"]')!;
-    const assignee = container.querySelector<HTMLButtonElement>('[data-testid="task-chat-composer-assignee"]')!;
+    const mode = container.querySelector<HTMLButtonElement>(
+      '[data-testid="task-chat-composer-mode"]',
+    )!;
+    const assignee = container.querySelector<HTMLButtonElement>(
+      '[data-testid="task-chat-composer-assignee"]',
+    )!;
     const send = sendButton();
 
     expect(mode.classList).not.toContain("border");
@@ -518,7 +974,7 @@ describe("TaskChatComposer", () => {
     pressKey("Enter", { metaKey: true });
     await flushAsync();
 
-    expect(onAdd).toHaveBeenCalledWith("wake up", true, undefined);
+    expect(onAdd).toHaveBeenCalledWith("wake up", true, undefined, undefined, expect.any(String));
   });
 
   it("hides the attach button without an upload handler and shows it with one", () => {
@@ -611,11 +1067,7 @@ describe("TaskChatComposer", () => {
     expect(send.disabled).toBe(false);
     flushSync(() => send.click());
     await flushAsync();
-    expect(onAdd).toHaveBeenCalledWith(
-      "[notes.txt](/attachments/notes.txt)",
-      undefined,
-      undefined,
-    );
+    expect(onAdd).toHaveBeenCalledWith("[notes.txt](/attachments/notes.txt)", undefined, undefined, undefined, expect.any(String));
     // Chips clear once the message posts.
     expect(
       container.querySelector('[data-testid="task-chat-composer-attachments"]'),
@@ -645,11 +1097,7 @@ describe("TaskChatComposer", () => {
     )!;
     flushSync(() => send.click());
     await flushAsync();
-    expect(onAdd).toHaveBeenCalledWith(
-      "Please review this.\n\n[notes.txt](/attachments/notes.txt)",
-      undefined,
-      undefined,
-    );
+    expect(onAdd).toHaveBeenCalledWith("Please review this.\n\n[notes.txt](/attachments/notes.txt)", undefined, undefined, undefined, expect.any(String));
   });
 
   it("blocks send while a file upload is pending, then includes the file once it lands", async () => {
@@ -692,11 +1140,7 @@ describe("TaskChatComposer", () => {
     expect(sendButton().disabled).toBe(false);
     flushSync(() => sendButton().click());
     await flushAsync();
-    expect(onAdd).toHaveBeenCalledWith(
-      "Here is the file.\n\n[notes.txt](/attachments/notes.txt)",
-      undefined,
-      undefined,
-    );
+    expect(onAdd).toHaveBeenCalledWith("Here is the file.\n\n[notes.txt](/attachments/notes.txt)", undefined, undefined, undefined, expect.any(String));
   });
 
   it("blocks send while a failed attachment chip remains, then sends after it is removed", async () => {
@@ -728,11 +1172,7 @@ describe("TaskChatComposer", () => {
     expect(sendButton().disabled).toBe(false);
     flushSync(() => sendButton().click());
     await flushAsync();
-    expect(onAdd).toHaveBeenCalledWith(
-      "Here is the file.",
-      undefined,
-      undefined,
-    );
+    expect(onAdd).toHaveBeenCalledWith("Here is the file.", undefined, undefined, undefined, expect.any(String));
   });
 
   it("removes an attachment chip via its remove button", async () => {
@@ -842,7 +1282,7 @@ describe("TaskChatComposer", () => {
 
     pressKey("Enter", { metaKey: true });
     await flushAsync();
-    expect(onAdd).toHaveBeenCalledWith(expected.trim(), undefined, undefined);
+    expect(onAdd).toHaveBeenCalledWith(expected.trim(), undefined, undefined, undefined, expect.any(String));
   });
 
   it("inserts a /-command from the autocomplete menu", async () => {
@@ -913,9 +1353,10 @@ describe("TaskChatComposer", () => {
           objective: "Confirm the goal state.",
         },
       });
-      expect(
-        parseRunnerGoalCommand("[/goal](/goal%20pause)"),
-      ).toEqual({ matched: true, command: { action: "pause" } });
+      expect(parseRunnerGoalCommand("[/goal](/goal%20pause)")).toEqual({
+        matched: true,
+        command: { action: "pause" },
+      });
       expect(parseRunnerGoalCommand("/goal pause extra")).toEqual({
         matched: true,
         error: "/goal pause does not accept extra arguments.",
@@ -923,8 +1364,12 @@ describe("TaskChatComposer", () => {
       expect(parseRunnerGoalCommand("[goal](/goal Ship it)")).toEqual({
         matched: false,
       });
-      expect(parseRunnerGoalCommand("\\/goal ordinary text")).toEqual({ matched: false });
-      expect(parseRunnerGoalCommand("/goalkeeper ordinary text")).toEqual({ matched: false });
+      expect(parseRunnerGoalCommand("\\/goal ordinary text")).toEqual({
+        matched: false,
+      });
+      expect(parseRunnerGoalCommand("/goalkeeper ordinary text")).toEqual({
+        matched: false,
+      });
     });
 
     it("dispatches a goal action without posting a comment", async () => {
@@ -980,9 +1425,9 @@ describe("TaskChatComposer", () => {
       )!;
       flushSync(() => trigger.click());
       await flushAsync();
-      const option = [...document.body.querySelectorAll<HTMLButtonElement>("button")].find(
-        (button) => button.textContent?.trim() === "Clippy",
-      );
+      const option = [
+        ...document.body.querySelectorAll<HTMLButtonElement>("button"),
+      ].find((button) => button.textContent?.trim() === "Clippy");
       expect(option).toBeDefined();
       flushSync(() => option!.click());
       await flushAsync();
@@ -1223,7 +1668,7 @@ describe("TaskChatComposer", () => {
       }
     });
 
-    it("clears the composer and saved draft while the send is pending", async () => {
+    it("clears the visible composer but retains an uncertain reload draft while sending", async () => {
       localStorage.setItem(draftKey, "queued message");
       const onAdd = vi.fn().mockReturnValue(new Promise<void>(() => {}));
       render(
@@ -1237,13 +1682,12 @@ describe("TaskChatComposer", () => {
       pressKey("Enter", { metaKey: true });
       await flushAsync();
 
-      expect(onAdd).toHaveBeenCalledWith(
-        "queued message",
-        undefined,
-        undefined,
-      );
+      expect(onAdd).toHaveBeenCalledWith("queued message", undefined, undefined, undefined, expect.any(String));
       expect(editable().textContent).toBe("");
-      expect(localStorage.getItem(draftKey)).toBeNull();
+      expect(localStorage.getItem(draftKey)).toBe("queued message");
+      expect(localStorage.getItem(`${draftKey}:submission:v1`)).toContain(
+        '"reviewed":false',
+      );
     });
 
     it("keeps text entered while an earlier send is pending", async () => {
@@ -1269,7 +1713,7 @@ describe("TaskChatComposer", () => {
       await flushAsync();
       await flushAsync();
 
-      expect(onAdd).toHaveBeenCalledWith("first message", undefined, undefined);
+      expect(onAdd).toHaveBeenCalledWith("first message", undefined, undefined, undefined, expect.any(String));
       expect(editable().textContent).toBe("next message");
       expect(localStorage.getItem(draftKey)).toBe("next message");
     });
@@ -1303,7 +1747,7 @@ describe("TaskChatComposer", () => {
       await flushAsync();
       await flushAsync();
 
-      expect(onAdd).toHaveBeenCalledWith("first message", undefined, undefined);
+      expect(onAdd).toHaveBeenCalledWith("first message", undefined, undefined, undefined, expect.any(String));
       expect(
         container.querySelector(
           '[data-testid="task-chat-composer-attachments"]',
@@ -1334,7 +1778,7 @@ describe("TaskChatComposer", () => {
         pressKey("Enter", { metaKey: true });
         await flushAsync();
         expect(editable().textContent).toBe("");
-        expect(localStorage.getItem(draftKey)).toBeNull();
+        expect(localStorage.getItem(draftKey)).toBe("do not lose this");
 
         typeText("next draft");
         rejectSend(new Error("network down"));
@@ -1348,6 +1792,69 @@ describe("TaskChatComposer", () => {
       } finally {
         vi.useRealTimers();
       }
+    });
+  });
+
+  it("gives separate identical chat submissions separate receipt identities", async () => {
+    const onAdd = vi.fn().mockResolvedValue(undefined);
+    render(<TaskChatComposer onAdd={onAdd} conversationMode workMode="standard" />);
+    typeText("Same message");
+    await act(async () => sendButton().click());
+    typeText("Same message");
+    await act(async () => sendButton().click());
+    expect(onAdd.mock.calls).toHaveLength(2);
+    expect(onAdd.mock.calls[0][4]).toEqual(expect.any(String));
+    expect(onAdd.mock.calls[1][4]).not.toBe(onAdd.mock.calls[0][4]);
+  });
+
+  describe("paused task takeover", () => {
+    it("allows only standalone /new to resume a paused conversation through the normal composer", async () => {
+      const onAdd = vi.fn().mockResolvedValue(undefined);
+      render(<TaskChatComposer onAdd={onAdd} conversationMode workMode="standard" pause={{ scope: "leaf" }} />);
+      typeText("Keep working");
+      expect(sendButton().disabled).toBe(true);
+      await act(async () => sendButton().click());
+      expect(onAdd).not.toHaveBeenCalled();
+      typeText("/new");
+      expect(sendButton().disabled).toBe(false);
+      await act(async () => sendButton().click());
+      expect(onAdd).toHaveBeenCalledWith("/new", undefined, undefined, undefined, expect.any(String));
+    });
+
+    it("preserves a typed draft and blocks sending until resume completes", async () => {
+      const onAdd = vi.fn();
+      const onResume = vi.fn();
+      const props = { onAdd, workMode: "standard" as const, draftKey: "paused-draft" };
+      act(() => root!.render(<TaskChatComposer {...props} />));
+      typeText("Please check mobile too.");
+      act(() => root!.render(<TaskChatComposer {...props} pause={{ scope: "leaf", onResume }} />));
+      expect(container.querySelector('[contenteditable="true"]')).toBeNull();
+      expect(container.querySelector('button[aria-label="Send"]')).toBeNull();
+      expect(container.textContent).toContain("Your draft is saved.");
+      act(() => container.querySelector("button")!.click());
+      expect(onResume).toHaveBeenCalledOnce();
+      expect(onAdd).not.toHaveBeenCalled();
+      act(() => root!.render(<TaskChatComposer {...props} pause={{ scope: "leaf", pending: true, onResume }} />));
+      expect(container.querySelector("button")!.disabled).toBe(true);
+      act(() => root!.render(<TaskChatComposer {...props} />));
+      expect(editable().textContent).toBe("Please check mobile too.");
+      await act(async () => sendButton().click());
+      expect(onAdd).toHaveBeenCalledWith("Please check mobile too.", undefined, undefined, undefined, expect.any(String));
+    });
+
+    it("takes precedence over pending questions and queued-message edits", () => {
+      const onSkip = vi.fn();
+      act(() => root!.render(<TaskChatComposer
+        onAdd={vi.fn()} workMode="standard"
+        pause={{ scope: "subtree" }}
+        queuedEdit={{ commentId: "queued", body: "Queued draft" }}
+        takeover={{ id: "question", label: "Pending input", pendingCount: 1, content: <button>Answer question</button>, onDismiss: vi.fn(), onSkip }}
+      />));
+      expect(container.textContent).toContain("Subtree is paused.");
+      expect(container.textContent).not.toContain("Answer question");
+      expect(container.textContent).not.toContain("Skip");
+      expect(container.querySelector('[contenteditable="true"]')).toBeNull();
+      expect(container.querySelector("button")!.disabled).toBe(true);
     });
   });
 
@@ -1658,7 +2165,7 @@ describe("TaskChatComposer", () => {
       });
     });
 
-    it("moves through questions with Next, Skip leaves one unanswered, Submit answers sends", async () => {
+    it("advances single selections, preserves answers when going back, and skips optional answers", async () => {
       const onSubmit = vi.fn();
       render(
         <TaskChatComposer
@@ -1718,14 +2225,16 @@ describe("TaskChatComposer", () => {
       flushSync(() => byLabel("Staging")?.click());
       await flushAsync();
       expect(onSubmit).not.toHaveBeenCalled();
-      expect(byLabel("Next")?.disabled).toBe(false);
-      flushSync(() => byLabel("Next")?.click());
-      await flushAsync();
       expect(container.textContent).toContain("When?");
+      expect(document.activeElement?.textContent).toBe("When?");
 
-      // Page 2: optional. Pick, then Skip anyway — the pick is dropped.
+      // Page 2: pick advances. Go back to confirm it is saved, then skip.
       flushSync(() => byLabel("Today")?.click());
       await flushAsync();
+      expect(container.textContent).toContain("Who?");
+      flushSync(() => container.querySelector<HTMLButtonElement>('button[aria-label="Previous question"]')?.click());
+      await flushAsync();
+      expect(byLabel("Today")?.getAttribute("aria-checked")).toBe("true");
       flushSync(() => byLabel("Skip")?.click());
       await flushAsync();
       expect(container.textContent).toContain("Who?");
@@ -1742,6 +2251,126 @@ describe("TaskChatComposer", () => {
       expect(response.answers.env).toEqual({ selectedOptionIds: ["staging"] });
       expect(response.answers.when).toBeUndefined();
       expect(response.answers.who).toEqual({ selectedOptionIds: ["me"] });
+    });
+
+    it.each(["click", "keyboard"])("advances a single choice by %s, while Other and multi-select stay put", async (input) => {
+      const onSubmit = vi.fn();
+      render(<QuestionForm
+        id="selection-modes"
+        questionSet={{
+          schema: "paperclip.question_set.v1",
+          questions: [
+            { id: "storage", prompt: "Storage?", required: true, answerMode: "single_select",
+              options: [{ id: "sqlite", label: "SQLite" }], customAnswer: { enabled: true } },
+            { id: "features", prompt: "Features?", required: true, answerMode: "multi_select",
+              options: [{ id: "auth", label: "Sign in" }, { id: "search", label: "Search" }] },
+            { id: "notes", prompt: "Notes?", required: false, answerMode: "text" },
+          ],
+        }}
+        initialResponse={{ schema: "paperclip.question_response.v1", answers: { storage: { selectedOptionIds: ["sqlite"] } } }}
+        onSubmit={onSubmit}
+      />);
+      const byLabel = (label: string) => Array.from(container.querySelectorAll<HTMLButtonElement>("button"))
+        .find((button) => button.textContent?.trim() === label)!;
+      // Restoring a selection does not advance. Other needs text first.
+      expect(container.textContent).toContain("1 of 3");
+      flushSync(() => byLabel("Other").click());
+      await flushAsync();
+      expect(container.textContent).toContain("1 of 3");
+      expect(container.querySelector('[data-testid="question-other-answer-composer"]')).not.toBeNull();
+      expect(byLabel("Next").disabled).toBe(true);
+      flushSync(() => {
+        if (input === "click") byLabel("SQLite").click();
+        else byLabel("SQLite").dispatchEvent(new KeyboardEvent("keydown", { key: "1", bubbles: true }));
+      });
+      await flushAsync();
+      expect(container.textContent).toContain("2 of 3");
+      expect(document.activeElement?.textContent).toBe("Features?");
+      flushSync(() => document.activeElement?.dispatchEvent(new KeyboardEvent("keydown", { key: "1", repeat: true, bubbles: true })));
+      expect(byLabel("Sign in").getAttribute("aria-checked")).toBe("false");
+      flushSync(() => byLabel("Sign in").click());
+      flushSync(() => byLabel("Search").click());
+      expect(container.textContent).toContain("2 of 3");
+      expect(byLabel("Sign in").getAttribute("aria-checked")).toBe("true");
+      expect(byLabel("Search").getAttribute("aria-checked")).toBe("true");
+      expect(onSubmit).not.toHaveBeenCalled();
+      flushSync(() => byLabel("Next").click());
+      await flushAsync();
+      expect(container.textContent).toContain("3 of 3");
+      flushSync(() => byLabel("Submit answers").click());
+      await flushAsync();
+      expect(onSubmit).toHaveBeenCalledExactlyOnceWith({
+        schema: "paperclip.question_response.v1",
+        answers: { storage: { selectedOptionIds: ["sqlite"] }, features: { selectedOptionIds: ["auth", "search"] } },
+      });
+    });
+
+    describe("single-choice confirmation animation", () => {
+      const questionSet = {
+        schema: "paperclip.question_set.v1" as const,
+        questions: ["First", "Second", "Third"].map((prompt) => ({
+          id: prompt, prompt, required: true, answerMode: "single_select" as const,
+          options: [{ id: "yes", label: "Yes" }], customAnswer: { enabled: true as const },
+        })),
+      };
+      const form = (disabled = false) => (
+        <QuestionForm id="animated" questionSet={questionSet} disabled={disabled} onSubmit={vi.fn()} />
+      );
+      const click = (selector: string) => act(() => {
+        flushSync(() => container.querySelector<HTMLButtonElement>(selector)!.click());
+      });
+      beforeEach(() => {
+        vi.useFakeTimers();
+        document.documentElement.style.setProperty("--motion-question-confirm", "160ms");
+      });
+      afterEach(() => {
+        render(<div />);
+        vi.useRealTimers();
+        document.documentElement.style.removeProperty("--motion-question-confirm");
+      });
+
+      it("shows the selected radio before advancing exactly one page", () => {
+        render(form());
+        click('[role="radio"]');
+        expect(container.querySelector('[role="radio"]')?.getAttribute("aria-checked")).toBe("true");
+        expect(container.querySelector(".tc-question-choice-confirm")).not.toBeNull();
+        expect(container.textContent).toContain("1 of 3");
+        act(() => vi.advanceTimersByTime(159));
+        expect(container.textContent).toContain("1 of 3");
+        act(() => vi.advanceTimersByTime(1));
+        expect(container.textContent).toContain("2 of 3");
+        expect(document.activeElement?.textContent).toBe("Second");
+        act(() => vi.advanceTimersByTime(160));
+        expect(container.textContent).toContain("2 of 3");
+      });
+
+      it.each(["navigation", "custom answer", "disabled", "unmount"])("cancels the pending advance on %s", (reason) => {
+        render(form());
+        click('[role="radio"]');
+        if (reason === "navigation") {
+          click('[aria-label="Next question"]');
+          click('[aria-label="Next question"]');
+        } else if (reason === "custom answer") {
+          click('#animated-First-custom');
+        } else if (reason === "disabled") {
+          render(form(true));
+          render(form(false));
+        } else {
+          render(<div>Closed</div>);
+        }
+        act(() => vi.advanceTimersByTime(160));
+        expect(container.textContent).toContain(
+          reason === "navigation" ? "3 of 3" : reason === "unmount" ? "Closed" : "1 of 3",
+        );
+      });
+
+      it("advances immediately when the motion token is zero", () => {
+        document.documentElement.style.setProperty("--motion-question-confirm", "0ms");
+        render(form());
+        click('[role="radio"]');
+        expect(container.textContent).toContain("2 of 3");
+        expect(container.querySelector(".tc-question-choice-confirm")).toBeNull();
+      });
     });
 
     it("Skip on the last question submits the other answers", async () => {
@@ -1786,11 +2415,10 @@ describe("TaskChatComposer", () => {
       );
 
       const byLabel = (label: string) =>
-        Array.from(container.querySelectorAll<HTMLButtonElement>("button")).find(
-          (button) => button.textContent?.trim() === label,
-        );
+        Array.from(
+          container.querySelectorAll<HTMLButtonElement>("button"),
+        ).find((button) => button.textContent?.trim() === label);
       flushSync(() => byLabel("Staging")?.click());
-      flushSync(() => byLabel("Next")?.click());
       await flushAsync();
       expect(container.textContent).toContain("Anything else?");
       flushSync(() => byLabel("Skip")?.click());
@@ -1843,9 +2471,9 @@ describe("TaskChatComposer", () => {
       );
 
       const byLabel = (label: string) =>
-        Array.from(container.querySelectorAll<HTMLButtonElement>("button")).find(
-          (button) => button.textContent?.trim() === label,
-        );
+        Array.from(
+          container.querySelectorAll<HTMLButtonElement>("button"),
+        ).find((button) => button.textContent?.trim() === label);
       // The pagination arrow browses past the unanswered required question.
       const arrow = container.querySelector<HTMLButtonElement>(
         'button[aria-label="Next question"]',
@@ -1989,7 +2617,7 @@ describe("TaskChatComposer", () => {
 
       flushSync(() => staging?.click());
       expect(staging?.getAttribute("data-selected")).toBe("true");
-      expect(staging?.className.split(" ")).toContain("bg-muted/80");
+      expect(staging?.className.split(" ")).toContain("bg-foreground/5");
     });
 
     it("hides Skip when the takeover already provides a request-changes path", () => {
@@ -2062,7 +2690,7 @@ describe("composer Stop", () => {
     const onStop = vi.fn(async () => {});
     const onAdd = vi.fn(async () => {});
     render(<TaskChatComposer workMode="standard" onAdd={onAdd} onStop={onStop} stopScope="subtree" />);
-    expect(stopButton()?.title).toBe("Stop and pause subtree");
+    expect(stopButton()?.title).toBe("Stop response");
     pressKey("Enter", { metaKey: true });
     expect(onStop).not.toHaveBeenCalled();
     expect(onAdd).not.toHaveBeenCalled();
@@ -2071,7 +2699,7 @@ describe("composer Stop", () => {
     expect(sendButton().disabled).toBe(false);
     flushSync(() => sendButton().click());
     await flushAsync();
-    expect(onAdd).toHaveBeenCalledWith("Check mobile too.", undefined, undefined);
+    expect(onAdd).toHaveBeenCalledWith("Check mobile too.", undefined, undefined, undefined, expect.any(String));
     expect(onStop).not.toHaveBeenCalled();
     typeText(" \n ");
     expect(stopButton()?.disabled).toBe(false);

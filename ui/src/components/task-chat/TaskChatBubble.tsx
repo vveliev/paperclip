@@ -1,4 +1,5 @@
-import { useContext, useState, type ReactNode } from "react";
+import { useCallback, useContext, useState, type ReactNode } from "react";
+import { useEmailComment } from "@/components/EmailMessageCard";
 import type { IssueAttachment } from "@paperclipai/shared";
 import { IssueGalleryContext } from "@/context/IssueGalleryContext";
 import { cn } from "@/lib/utils";
@@ -10,7 +11,6 @@ import {
 } from "@/components/ImageGalleryModal";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { AgentIcon } from "@/components/AgentIconPicker";
-import { CommentAttributionChip } from "@/components/CommentAttributionChip";
 import {
   Attachment,
   AttachmentContent,
@@ -28,6 +28,7 @@ import {
   hydrateAttachmentRefs,
   isImageAttachment,
   stripStandaloneImageEmbeds,
+  type AttachmentRef,
 } from "./task-chat-attachments";
 import { TaskChatSystemNotice } from "./TaskChatSystemNotice";
 import type { TaskChatMessageItem } from "./task-chat-model";
@@ -73,11 +74,9 @@ function initialsForName(name: string) {
 export function TaskChatAgentIdentity({
   agentName,
   agentIcon,
-  onBehalfOfUserName,
 }: {
   agentName: string;
   agentIcon?: string | null;
-  onBehalfOfUserName?: string;
 }) {
   return (
     <span
@@ -98,12 +97,6 @@ export function TaskChatAgentIdentity({
         )}
       </Avatar>
       <span className="text-sm font-semibold text-foreground">{agentName}</span>
-      {onBehalfOfUserName ? (
-        <CommentAttributionChip
-          agentName={agentName}
-          userName={onBehalfOfUserName}
-        />
-      ) : null}
     </span>
   );
 }
@@ -129,7 +122,21 @@ function galleryItemForImage(
   };
 }
 
-export function TaskChatBubble({
+function uniqueAttachmentRefs(refs: AttachmentRef[]): AttachmentRef[] {
+  return refs.filter(
+    (ref, index) =>
+      refs.findIndex(
+        (candidate) =>
+          (ref.id && candidate.id === ref.id) || candidate.url === ref.url,
+      ) === index,
+  );
+}
+
+export function TaskChatBubble(props: TaskChatBubbleProps) {
+  const email = useEmailComment(props.item.id);
+  return email ?? <TaskChatBubbleContent {...props} />;
+}
+function TaskChatBubbleContent({
   item,
   animateEntry = true,
   queuedAction,
@@ -145,9 +152,11 @@ export function TaskChatBubble({
   // Task attachments share the page gallery; standalone images retain the bubble viewer.
   const openIssueGallery = useContext(IssueGalleryContext);
   const [lightboxSrc, setLightboxSrc] = useState<string | null>(null);
-  const openImage = (src: string) => {
+  // Keep MarkdownBody's memo boundary intact when only the live tail changes.
+  // A fresh callback here reparses every historical response on every update.
+  const openImage = useCallback((src: string) => {
     if (!openIssueGallery?.(src)) setLightboxSrc(src);
-  };
+  }, [openIssueGallery]);
   if (item.interstitial) {
     // Interstitial updates are ephemeral (PAP-361): while streaming the text
     // lives on the live parent row's line (TaskChatStatusItem.selfTalk), and
@@ -168,6 +177,7 @@ export function TaskChatBubble({
   }
 
   const isHuman = item.author === "human";
+  const sentFromIMessage = isHuman && item.sourceChannel === "imessage-photon";
   // Non-image file references ("[name](/api/attachments/…/content)") render as
   // attachment chips under the bubble; link-only lines leave the body text.
   const { refs: linkedRefs, text: bodyWithoutAttachmentLinks } =
@@ -179,15 +189,26 @@ export function TaskChatBubble({
     embeddedImageRefs,
     attachments,
   );
-  const imageRefs = [
+  const boundAttachmentRefs: AttachmentRef[] = attachments
+    .filter((attachment) => attachment.issueCommentId === item.id)
+    .map((attachment) => ({
+      id: attachment.id,
+      name: attachment.originalFilename?.trim() || "attachment",
+      url: attachment.contentPath,
+      contentType: attachment.contentType,
+      byteSize: attachment.byteSize,
+      openPath: attachment.openPath,
+      downloadPath: attachment.downloadPath,
+    }));
+  const imageRefs = uniqueAttachmentRefs([
     ...hydratedEmbeddedRefs,
     ...hydratedLinkedRefs.filter(isImageAttachment),
-  ].filter((ref, index, refs) =>
-    refs.findIndex((candidate) => candidate.url === ref.url) === index,
-  );
-  const attachmentRefs = hydratedLinkedRefs.filter(
-    (ref) => !isImageAttachment(ref),
-  );
+    ...boundAttachmentRefs.filter(isImageAttachment),
+  ]);
+  const attachmentRefs = uniqueAttachmentRefs([
+    ...hydratedLinkedRefs.filter((ref) => !isImageAttachment(ref)),
+    ...boundAttachmentRefs.filter((ref) => !isImageAttachment(ref)),
+  ]);
   const galleryItems: GalleryMediaItem[] =
     lightboxSrc !== null && !imageRefs.some((ref) => ref.url === lightboxSrc)
       ? // A clicked image the extractor missed (e.g. inline HTML) still gets a
@@ -211,7 +232,6 @@ export function TaskChatBubble({
         <TaskChatAgentIdentity
           agentName={item.authorName}
           agentIcon={item.agentIcon}
-          onBehalfOfUserName={item.onBehalfOfUserName}
         />
       ) : null}
       {bodyText.length > 0 ? (
@@ -251,7 +271,7 @@ export function TaskChatBubble({
           data-testid="task-chat-bubble-media"
         >
           <span className="text-xs text-muted-foreground">
-            Screenshots · {imageRefs.length}
+            Images · {imageRefs.length}
           </span>
           <div className="grid grid-cols-4 gap-2">
             {imageRefs
@@ -389,9 +409,11 @@ export function TaskChatBubble({
             ) : null}
           </div>
         )
-      ) : item.timestamp ? (
+      ) : item.timestamp || sentFromIMessage ? (
         // Timestamps are always visible (round 9) — no longer hover-revealed.
         <span className="px-1 text-(length:--text-micro) text-muted-foreground">
+          {sentFromIMessage ? "Sent from iMessage" : null}
+          {sentFromIMessage && item.timestamp ? " · " : null}
           {item.timestamp}
         </span>
       ) : null}

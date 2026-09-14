@@ -1,6 +1,8 @@
+import { instanceSettingsService } from "../../../services/instance-settings.js";
 import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import type { Db } from "@paperclipai/db";
 import {
   agentWakeupRequests,
   agents,
@@ -8,14 +10,21 @@ import {
   createDb,
   heartbeatRuns,
   issueComments,
+  issueRecoveryActions,
   issues,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "../../../__tests__/helpers/embedded-postgres.js";
-import { createPostgresWakeQueueAdapter } from "./postgres.js";
+import {
+  createAdmissionTransactionScope,
+  createPostgresWakeQueueAdapter,
+  createWakeAdmissionWriter,
+} from "./postgres.js";
 import type { WakeQueuePostgresAdapterDeps } from "./postgres.js";
+import { createReleaseIssueExecution } from "../application/use-cases.js";
+import type { TransactionScope } from "../application/ports.js";
 
 // Proves the atomicity and company-scope properties the security review
 // requires: every mutation names `companyId` in its own SQL `WHERE` clause,
@@ -52,6 +61,7 @@ describeEmbeddedPostgres("wake-queue postgres adapter", () => {
     // so the run row must go first.
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
+    await db.delete(issueRecoveryActions);
     await db.delete(issues);
     await db.delete(agents);
     await db.delete(companies);
@@ -96,6 +106,8 @@ describeEmbeddedPostgres("wake-queue postgres adapter", () => {
     assigneeAgentId?: string | null;
     executionRunId?: string | null;
     checkoutRunId?: string | null;
+    parentId?: string | null;
+    identifier?: string;
   }): Promise<string> {
     const issueId = input.issueId ?? randomUUID();
     await db.insert(issues).values({
@@ -107,6 +119,8 @@ describeEmbeddedPostgres("wake-queue postgres adapter", () => {
       assigneeAgentId: input.assigneeAgentId ?? null,
       executionRunId: input.executionRunId ?? null,
       checkoutRunId: input.checkoutRunId ?? null,
+      parentId: input.parentId ?? null,
+      identifier: input.identifier,
     });
     return issueId;
   }
@@ -155,8 +169,224 @@ describeEmbeddedPostgres("wake-queue postgres adapter", () => {
     return id;
   }
 
+  it.each([
+    "completed", "multiple_comments", "repeated_reference", "parent_reference", "mixed_issue_references", "mixed_foreign_references", "mixed_unknown_references", "no_comments", "missing_comment",
+    "human_comment", "other_run_comment", "foreign_comment", "other_issue_comment", "deleted_comment",
+    "mixed_human_comments", "mixed_other_run_comments", "mixed_unrelated_comments",
+    "no_reference", "code_reference", "ambiguous_children", "child_open", "child_cancelled",
+    "foreign_child", "unrelated_child", "other_child_assignee", "parent_open",
+    "source_other_task", "source_other_agent", "wrong_company", "wrong_run",
+  ])("proves completed delegation from transactional comment and child rows (%s)", async (scenario) => {
+    const companyId = await seedCompany();
+    const otherCompanyId = await seedCompany();
+    const leadId = await seedAgent({ companyId, name: "Lead" });
+    const workerId = await seedAgent({ companyId, name: "Worker" });
+    const foreignAgentId = await seedAgent({ companyId: otherCompanyId });
+    const issueId = await seedIssue({ companyId, identifier: "QA-1", assigneeAgentId: leadId, status: scenario === "parent_open" ? "in_progress" : "done" });
+    const otherIssueId = await seedIssue({ companyId, identifier: "QA-99" });
+    const foreignIssueId = await seedIssue({ companyId: otherCompanyId, identifier: "QA-98" });
+    const runId = await seedRun({ companyId, agentId: scenario === "source_other_agent" ? workerId : leadId,
+      status: "succeeded", contextSnapshot: { issueId: scenario === "source_other_task" ? otherIssueId : issueId } });
+    await db.update(issues).set({ executionRunId: runId }).where(eq(issues.id, issueId));
+    const otherRunId = await seedRun({ companyId, agentId: leadId, status: "succeeded", contextSnapshot: { issueId } });
+    await seedIssue({
+      companyId: scenario === "foreign_child" ? otherCompanyId : companyId,
+      identifier: "QA-2", parentId: scenario === "unrelated_child" ? otherIssueId : issueId,
+      assigneeAgentId: scenario === "foreign_child" ? foreignAgentId : scenario === "other_child_assignee" ? leadId : workerId,
+      status: scenario === "child_open" ? "in_progress" : scenario === "child_cancelled" ? "cancelled" : "done",
+    });
+    if (scenario === "ambiguous_children") {
+      await seedIssue({ companyId, identifier: "QA-3", parentId: issueId, assigneeAgentId: workerId, status: "done" });
+    }
+    const body = scenario === "parent_reference" ? "QA-1 is done thanks to @Worker completing QA-2"
+      : scenario === "mixed_issue_references" ? "@Worker completed QA-2; now investigate QA-99"
+      : scenario === "mixed_foreign_references" ? "@Worker completed QA-2; also check QA-98"
+      : scenario === "mixed_unknown_references" ? "@Worker completed QA-2; also check QA-999"
+      : scenario === "no_reference" ? "Thanks @Worker" : scenario === "code_reference" ? "Example `QA-2`"
+      : scenario === "ambiguous_children" ? "@Worker completed QA-2 and QA-3"
+      : scenario === "repeated_reference" ? "@Worker completed [QA-2](/issues/QA-2); QA-2 is done"
+      : "@Worker completed QA-2";
+    const [comment] = await db.insert(issueComments).values({
+      companyId: scenario === "foreign_comment" ? otherCompanyId : companyId,
+      issueId: scenario === "foreign_comment" ? foreignIssueId : scenario === "other_issue_comment" ? otherIssueId : issueId,
+      authorAgentId: scenario === "human_comment" ? null : leadId,
+      authorUserId: scenario === "human_comment" ? "responsible-user" : null,
+      createdByRunId: scenario === "human_comment" ? null : scenario === "other_run_comment" ? otherRunId : runId,
+      body, deletedAt: scenario === "deleted_comment" ? new Date() : null,
+    }).returning();
+    const commentIds = scenario === "no_comments" ? [] : [comment.id];
+    if (scenario === "missing_comment") commentIds.push(randomUUID());
+    if (["multiple_comments", "mixed_human_comments", "mixed_other_run_comments", "mixed_unrelated_comments"].includes(scenario)) {
+      const [second] = await db.insert(issueComments).values({ companyId, issueId,
+        authorAgentId: scenario === "mixed_human_comments" ? null : leadId,
+        authorUserId: scenario === "mixed_human_comments" ? "responsible-user" : null,
+        createdByRunId: scenario === "mixed_human_comments" ? null : scenario === "mixed_other_run_comments" ? otherRunId : runId,
+        body: scenario === "mixed_unrelated_comments" ? "@Worker, investigate a new error" : "QA-2 was delivered",
+      }).returning();
+      commentIds.push(second.id);
+    }
+    let checked = false;
+    const adapter = createPostgresWakeQueueAdapter(db, stubDeps);
+    await adapter.withIssueExecutionLock({ companyId, runId, now: new Date() }, async (_locked, ports) => {
+      checked = true;
+      const completed = await ports.transaction.isCompletedDelegationMention({
+        companyId: scenario === "wrong_company" ? otherCompanyId : companyId,
+        issueId, finishingRunId: scenario === "wrong_run" ? otherRunId : runId, wakeAgentId: workerId, commentIds,
+      });
+      expect(completed).toBe(["completed", "multiple_comments", "repeated_reference", "parent_reference"].includes(scenario));
+      return { outcome: { kind: "released" as const }, postCommitEffects: [] };
+    });
+    expect(checked).toBe(true);
+  });
+
+  it.each([false, true])("rechecks disabled chat mode before interrupted queue promotion (conversation=%s)", async (conversation) => {
+    const settings = instanceSettingsService(db);
+    const original = (await settings.getExperimental()).enableAgentChat;
+    const companyId = await seedCompany();
+    const agentId = await seedAgent({ companyId });
+    const issueId = await seedIssue({ companyId, assigneeAgentId: agentId });
+    const runId = await seedRun({ companyId, agentId, status: "cancelled", contextSnapshot: { issueId } });
+    const [comment] = await db.insert(issueComments).values({
+      companyId, issueId, authorUserId: "responsible-user", body: "Pending input",
+    }).returning();
+    const wakeId = await seedDeferredWake({ companyId, agentId, issueId, requestedByActorId: "responsible-user",
+      payload: { commentId: comment.id, _paperclipWakeContext: { issueId, wakeReason: "issue_commented", wakeCommentIds: [comment.id] } },
+    });
+    await db.update(heartbeatRuns).set({ runtimeMode: "legacy", resultJson: {
+      queuedCommentInterruptQueueId: wakeId, executionCancellation: { state: "acknowledged" },
+      conversationContinuation: "continue_conversation_v1",
+    } }).where(eq(heartbeatRuns.id, runId));
+    await db.update(issues).set({ executionRunId: runId, checkoutRunId: runId,
+      ...(conversation ? { conversationAgentId: agentId, conversationUserId: "responsible-user", conversationState: "active" } : {}),
+    }).where(eq(issues.id, issueId));
+    const release = createReleaseIssueExecution({
+      issueLock: createPostgresWakeQueueAdapter(db, stubDeps),
+      recovery: { escalateStrandedAssignedIssue: async () => {}, escalateStrandedRecoveryIssueInPlace: async () => {} },
+    });
+    try {
+      await settings.updateExperimental({ enableAgentChat: false });
+      const result = await release({ companyId, runId, now: new Date() });
+      if (conversation) {
+        expect(result.outcome.kind).toBe("released");
+        expect(result.postCommitEffects).toEqual([]);
+        const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+        expect(issue).toMatchObject({ executionRunId: null, checkoutRunId: null });
+        const [pending] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wakeId));
+        expect(pending).toMatchObject({ status: "deferred_issue_execution", runId: null });
+        expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId))).toHaveLength(1);
+        await settings.updateExperimental({ enableAgentChat: true });
+        expect((await release({ companyId, runId, now: new Date() })).outcome.kind).toBe("promoted");
+      } else {
+        expect(result.outcome.kind).toBe("promoted");
+      }
+    } finally {
+      await settings.updateExperimental({ enableAgentChat: original });
+    }
+  });
+
+  for (const hasDeferredMessage of [false, true]) {
+    it(`plans conversation recovery during owner cleanup without draining messages (queued=${hasDeferredMessage})`, async () => {
+      const companyId = await seedCompany();
+      const agentId = await seedAgent({ companyId });
+      const issueId = await seedIssue({ companyId, assigneeAgentId: agentId });
+      const runId = await seedRun({ companyId, agentId, status: "failed", contextSnapshot: { issueId } });
+      await db.update(heartbeatRuns).set({
+        processPid: process.pid,
+        resultJson: { conversationContinuation: "continue_conversation_v1" },
+      }).where(eq(heartbeatRuns.id, runId));
+      const wakeId = hasDeferredMessage ? await seedDeferredWake({ companyId, agentId, issueId }) : null;
+      const release = createReleaseIssueExecution({
+        issueLock: createPostgresWakeQueueAdapter(db, stubDeps),
+        recovery: {
+          escalateStrandedAssignedIssue: async () => { throw new Error("unexpected escalation"); },
+          escalateStrandedRecoveryIssueInPlace: async () => { throw new Error("unexpected escalation"); },
+        },
+      });
+      const result = await release({ companyId, runId, now: new Date() });
+      expect(result.outcome.kind).toBe("released");
+      expect(result.postCommitEffects.every((effect) => effect.kind === "conversation_retry_requested")).toBe(true);
+      if (!wakeId) expect(result.postCommitEffects).toEqual([
+        { kind: "conversation_retry_requested", companyId, runId, reviewParticipant: false },
+      ]);
+      if (wakeId) {
+        const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wakeId));
+        expect(wake.status).toBe("deferred_issue_execution");
+      }
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId))).toHaveLength(1);
+    });
+  }
+
+  it.each(["queued", "running", "scheduled_retry"])("does not promote another turn behind a %s successor without an execution lock", async (status) => {
+    const companyId = await seedCompany();
+    const agentId = await seedAgent({ companyId });
+    const issueId = await seedIssue({ companyId, assigneeAgentId: agentId });
+    const runId = await seedRun({ companyId, agentId, status: "succeeded", contextSnapshot: { issueId } });
+    await seedRun({ companyId, agentId, status, contextSnapshot: { issueId } });
+    const wakeId = await seedDeferredWake({ companyId, agentId, issueId });
+    const adapter = createPostgresWakeQueueAdapter(db, stubDeps);
+    let drained = false;
+    await adapter.withIssueExecutionLock({ companyId, runId, now: new Date() }, async () => {
+      drained = true;
+      return { outcome: { kind: "released" }, postCommitEffects: [] };
+    });
+    expect(drained).toBe(false);
+    const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wakeId));
+    expect(wake.status).toBe("deferred_issue_execution");
+  });
+
+  it("leaves deferred work untouched until the effective execution hold clears", async () => {
+    const companyId = await seedCompany();
+    const agentId = await seedAgent({ companyId });
+    const issueId = await seedIssue({ companyId, assigneeAgentId: agentId, status: "blocked" });
+    const runId = await seedRun({ companyId, agentId, contextSnapshot: { issueId }, status: "succeeded" });
+    const wakeId = await seedDeferredWake({ companyId, agentId, issueId });
+    const [hold] = await db.insert(issueRecoveryActions).values({
+      companyId, sourceIssueId: issueId, kind: "active_run_watchdog", ownerType: "board",
+      cause: "legacy_execution_requires_reconciliation", status: "resolved",
+      fingerprint: runId, evidence: { automaticRecovery: { replay: "blocked" } },
+      nextAction: "Check the stopped execution.",
+    }).returning();
+    const adapter = createPostgresWakeQueueAdapter(db, stubDeps);
+    let drainCalls = 0;
+    const drain = async () => {
+      drainCalls++;
+      return { outcome: { kind: "released" as const }, postCommitEffects: [] };
+    };
+    for (let i = 0; i < 3; i++) {
+      expect((await adapter.withIssueExecutionLock({ companyId, runId, now: new Date() }, drain)).outcome.kind).toBe("released");
+    }
+    expect(drainCalls).toBe(0);
+    expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wakeId)))[0]).toMatchObject({
+      status: "deferred_issue_execution", runId: null,
+    });
+    await db.update(issueRecoveryActions).set({ evidence: {} }).where(eq(issueRecoveryActions.id, hold!.id));
+    await adapter.withIssueExecutionLock({ companyId, runId, now: new Date() }, drain);
+    expect(drainCalls).toBe(1);
+  });
+
   // Review test (a): a foreign-company agent id produces the current failed
   // wake status and the current error text, and creates no run.
+  it("skips preserved handoff receipts for one drain without changing their durable state", async () => {
+    const companyId = await seedCompany();
+    const agentId = await seedAgent({ companyId });
+    const issueId = await seedIssue({ companyId, assigneeAgentId: agentId });
+    const runId = await seedRun({ companyId, agentId, contextSnapshot: { issueId }, status: "succeeded" });
+    await db.update(issues).set({ executionRunId: runId }).where(eq(issues.id, issueId));
+    const previous = await seedDeferredWake({ companyId, agentId, issueId });
+    const next = await seedDeferredWake({ companyId, agentId, issueId });
+    await db.update(agentWakeupRequests).set({ requestedAt: new Date("2026-01-01") }).where(eq(agentWakeupRequests.id, previous));
+    const adapter = createPostgresWakeQueueAdapter(db, stubDeps);
+    await adapter.withIssueExecutionLock({ companyId, runId, now: new Date() }, async (_locked, ports) => {
+      expect((await ports.transaction.findNextDeferredWake({ companyId, issueId }))?.id).toBe(previous);
+      expect((await ports.transaction.findNextDeferredWake({ companyId, issueId, excludedWakeIds: [previous] }))?.id).toBe(next);
+      expect(await ports.transaction.findNextDeferredWake({ companyId, issueId, excludedWakeIds: [previous, next] })).toBeNull();
+      return { outcome: { kind: "released" as const }, postCommitEffects: [] };
+    });
+    const [preserved] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, previous));
+    expect(preserved.status).toBe("deferred_issue_execution");
+    expect(preserved.runId).toBeNull();
+  });
+
   it("fails a deferred wake whose agent belongs to a different company, without creating a run", async () => {
     const companyId = await seedCompany();
     const otherCompanyId = await seedCompany();
@@ -171,11 +401,11 @@ describeEmbeddedPostgres("wake-queue postgres adapter", () => {
 
     const adapter = createPostgresWakeQueueAdapter(db, stubDeps);
     const result = await adapter.withIssueExecutionLock({ companyId, runId, now: new Date() }, async (locked, ports) => {
-      const candidate = await ports.writer.claimNextDeferredWake({ companyId, issueId: locked.primaryIssue.id });
+      const candidate = await ports.transaction.findNextDeferredWake({ companyId, issueId: locked.primaryIssue.id });
       expect(candidate?.id).toBe(wakeId);
-      const agent = await ports.reader.findInvokableAgent({ companyId, agentId: foreignAgentId });
+      const agent = await ports.transaction.findInvokableAgent({ companyId, agentId: foreignAgentId });
       expect(agent).toBeNull();
-      const failed = await ports.writer.failDeferredWake({ companyId, wakeId: candidate!.id, now: new Date() });
+      const failed = await ports.transaction.failDeferredWake({ companyId, wakeId: candidate!.id, now: new Date() });
       expect(failed).toBe(true);
       return { outcome: { kind: "released" as const }, postCommitEffects: [] };
     });
@@ -205,7 +435,7 @@ describeEmbeddedPostgres("wake-queue postgres adapter", () => {
     await adapter.withIssueExecutionLock(
       { companyId, runId, now: new Date() },
       async (_locked, ports) => {
-        const cancelledUnderWrongCompany = await ports.writer.cancelDeferredWake({
+        const cancelledUnderWrongCompany = await ports.transaction.cancelDeferredWake({
           companyId: otherCompanyId,
           wakeId,
           reason: "cross-company cancel attempt",
@@ -213,14 +443,14 @@ describeEmbeddedPostgres("wake-queue postgres adapter", () => {
         });
         expect(cancelledUnderWrongCompany).toBe(false);
 
-        const failedUnderWrongCompany = await ports.writer.failDeferredWake({
+        const failedUnderWrongCompany = await ports.transaction.failDeferredWake({
           companyId: otherCompanyId,
           wakeId,
           now: new Date(),
         });
         expect(failedUnderWrongCompany).toBe(false);
 
-        const normalizedUnderWrongCompany = await ports.writer.normalizeDeferredWakeCommentIds({
+        const normalizedUnderWrongCompany = await ports.transaction.normalizeDeferredWakeCommentIds({
           companyId: otherCompanyId,
           wakeId,
           payload: { issueId },
@@ -229,7 +459,7 @@ describeEmbeddedPostgres("wake-queue postgres adapter", () => {
         });
         expect(normalizedUnderWrongCompany).toBeNull();
 
-        const reopenedUnderWrongCompany = await ports.writer.reopenIssue({
+        const reopenedUnderWrongCompany = await ports.transaction.reopenIssue({
           companyId: otherCompanyId,
           issueId,
           runId,
@@ -264,7 +494,7 @@ describeEmbeddedPostgres("wake-queue postgres adapter", () => {
       reopened: null,
     };
     await adapter.withIssueExecutionLock({ companyId, runId, now: new Date() }, async (_locked, ports) => {
-      captured.reopened = await ports.writer.reopenIssue({ companyId: otherCompanyId, issueId, runId });
+      captured.reopened = await ports.transaction.reopenIssue({ companyId: otherCompanyId, issueId, runId });
       return { outcome: { kind: "released" as const }, postCommitEffects: [] };
     });
     expect(captured.reopened).toBeNull();
@@ -286,7 +516,7 @@ describeEmbeddedPostgres("wake-queue postgres adapter", () => {
       reopened: null,
     };
     await adapter.withIssueExecutionLock({ companyId, runId, now: new Date() }, async (_locked, ports) => {
-      captured.reopened = await ports.writer.reopenIssue({ companyId, issueId, runId });
+      captured.reopened = await ports.transaction.reopenIssue({ companyId, issueId, runId });
       return { outcome: { kind: "released" as const }, postCommitEffects: [] };
     });
     expect(captured.reopened?.status).toBe("todo");
@@ -310,7 +540,7 @@ describeEmbeddedPostgres("wake-queue postgres adapter", () => {
     const adapter = createPostgresWakeQueueAdapter(db, stubDeps);
     const runId = await seedRun({ companyId, agentId, contextSnapshot: { issueId }, status: "succeeded" });
     const result = await adapter.withIssueExecutionLock({ companyId, runId, now: new Date() }, async (_locked, ports) => {
-      const claimed = await ports.writer.claimDeferredWakeForPromotion({ companyId, wakeId, now: new Date() });
+      const claimed = await ports.transaction.claimDeferredWakeForPromotion({ companyId, wakeId, now: new Date() });
       expect(claimed).toBe(false);
       return { outcome: { kind: "released" as const }, postCommitEffects: [] };
     });
@@ -345,7 +575,7 @@ describeEmbeddedPostgres("wake-queue postgres adapter", () => {
     const adapter = createPostgresWakeQueueAdapter(db, stubDeps);
     await adapter.withIssueExecutionLock({ companyId, runId, now: new Date() }, async (locked, ports) => {
       const finalize = async (wakeId: string) => {
-        const promoted = await ports.writer.finalizePromotedWake({
+        const promoted = await ports.transaction.finalizePromotedWake({
           companyId,
           wakeId,
           deferredAgent,
@@ -435,5 +665,168 @@ describeEmbeddedPostgres("wake-queue postgres adapter", () => {
     // executionRunId already pointed at the retry, not the finishing run, so it must survive.
     expect(issueRow?.executionRunId).toBe(retryRunId);
     expect(issueRow?.checkoutRunId).toBeNull();
+  });
+
+  // The admission half opens no transaction of its own: `heartbeat.ts` still
+  // owns it. These tests drive the admission writer directly against a
+  // transaction they open themselves, the same way `heartbeat.ts` will.
+  describe("wake admission", () => {
+    it("rolls back a deferred merge when its own durable receipt insert fails", async () => {
+      const companyId = await seedCompany();
+      const agentId = await seedAgent({ companyId });
+      const issueId = await seedIssue({ companyId, assigneeAgentId: agentId });
+      const wakeId = await seedDeferredWake({
+        companyId,
+        agentId,
+        issueId,
+        payload: { originalTarget: true },
+      });
+      const occupiedReceiptId = await seedDeferredWake({
+        companyId,
+        agentId,
+        issueId,
+        payload: { originalReceipt: true },
+      });
+      const before = await db
+        .select()
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.companyId, companyId))
+        .orderBy(agentWakeupRequests.id);
+      const writer = createWakeAdmissionWriter();
+
+      await expect(
+        db.transaction(async (tx) => {
+          const scope = createAdmissionTransactionScope(
+            companyId,
+            tx as unknown as Db,
+          );
+          await writer.mergeIntoExistingDeferredWake(scope, {
+            companyId,
+            existingDeferredWakeId: wakeId,
+            mergedPayload: { issueId, changedByMerge: true },
+            nextCoalescedCount: 9,
+            coalescedReceipt: {
+              id: occupiedReceiptId,
+              requestedAt: new Date(),
+              agentId,
+              source: "automation",
+              triggerDetail: "system",
+              reason: "question_response",
+              payload: { issueId, coalescedIntoWakeupRequestId: wakeId },
+              requestedByActorType: "user",
+              requestedByActorId: "actor-1",
+              idempotencyKey: "colliding-receipt",
+              runId: null,
+            },
+          });
+        }),
+      ).rejects.toMatchObject({ cause: { code: "23505" } });
+
+      // The target update precedes the deliberately colliding INSERT. Both
+      // complete rows must be restored, including payload, count and timestamps.
+      const after = await db
+        .select()
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.companyId, companyId))
+        .orderBy(agentWakeupRequests.id);
+      expect(after).toEqual(before);
+      expect(after).toHaveLength(2);
+    });
+
+    // Review test (b): an admission adapter mutation with a foreign company
+    // affects no row.
+    it("refuses to merge into a deferred wake for a company that does not own it, and leaves the wake untouched", async () => {
+      const companyId = await seedCompany();
+      const otherCompanyId = await seedCompany();
+      const agentId = await seedAgent({ companyId });
+      const issueId = await seedIssue({ companyId, assigneeAgentId: agentId });
+      const wakeId = await seedDeferredWake({ companyId, agentId, issueId });
+      const writer = createWakeAdmissionWriter();
+
+      await expect(
+        db.transaction(async (tx) => {
+          const scope = createAdmissionTransactionScope(otherCompanyId, tx as unknown as Db);
+          await writer.mergeIntoExistingDeferredWake(scope, {
+            companyId: otherCompanyId,
+            existingDeferredWakeId: wakeId,
+            mergedPayload: { issueId, foo: "bar" },
+            nextCoalescedCount: 5,
+          });
+        }),
+      ).rejects.toThrow();
+
+      const wakeRow = (await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wakeId)))[0];
+      expect(wakeRow?.status).toBe("deferred_issue_execution");
+      expect(wakeRow?.coalescedCount).not.toBe(5);
+      expect(wakeRow?.payload).not.toHaveProperty("foo");
+    });
+
+    // Review test (b), the coalesce write: a foreign company affects no row
+    // on the active execution run either.
+    it("refuses to coalesce into a run for a company that does not own it, and leaves the run and the wake table untouched", async () => {
+      const companyId = await seedCompany();
+      const otherCompanyId = await seedCompany();
+      const agentId = await seedAgent({ companyId });
+      const runId = await seedRun({ companyId, agentId, status: "running", contextSnapshot: { taskKey: "issue-1" } });
+      const writer = createWakeAdmissionWriter();
+
+      await expect(
+        db.transaction(async (tx) => {
+          const scope = createAdmissionTransactionScope(otherCompanyId, tx as unknown as Db);
+          await writer.coalesceIntoActiveExecutionRun(scope, {
+            companyId: otherCompanyId,
+            activeExecutionRunId: runId,
+            mergedContextSnapshot: { taskKey: "issue-1", commentId: "c1" },
+            agentId,
+            source: "on_demand",
+            triggerDetail: null,
+            payload: null,
+            requestedByActorType: "user",
+            requestedByActorId: null,
+            idempotencyKey: null,
+          });
+        }),
+      ).rejects.toThrow();
+
+      const runRow = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)))[0];
+      expect(runRow?.contextSnapshot).toEqual({ taskKey: "issue-1" });
+      const wakeRows = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, otherCompanyId));
+      expect(wakeRows).toHaveLength(0);
+    });
+
+    // Review test (d): a transaction-port call cannot use the root database
+    // executor. The module rejects a missing scope handle and a mismatched
+    // scope handle, and neither case writes a row.
+    it("rejects a missing transaction scope and a mismatched one, without writing through the root executor", async () => {
+      const companyId = await seedCompany();
+      const otherCompanyId = await seedCompany();
+      const agentId = await seedAgent({ companyId });
+      const issueId = await seedIssue({ companyId, assigneeAgentId: agentId });
+      const writer = createWakeAdmissionWriter();
+      const newWakeInput = {
+        companyId,
+        agentId,
+        source: "automation",
+        triggerDetail: null,
+        payload: { issueId },
+        requestedByActorType: "system",
+        requestedByActorId: null,
+        idempotencyKey: null,
+      };
+
+      await expect(
+        writer.insertNewDeferredWake(undefined as unknown as TransactionScope, newWakeInput),
+      ).rejects.toThrow(/transaction scope/);
+
+      await expect(
+        db.transaction(async (tx) => {
+          const mismatchedScope = createAdmissionTransactionScope(otherCompanyId, tx as unknown as Db);
+          await writer.insertNewDeferredWake(mismatchedScope, newWakeInput);
+        }),
+      ).rejects.toThrow(/different company/);
+
+      const rows = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId));
+      expect(rows).toHaveLength(0);
+    });
   });
 });

@@ -199,6 +199,9 @@ export interface AdapterExecutionContext {
   signal?: AbortSignal;
   /** Opt in to signal-based cancellation before starting provider work. */
   onCancellationReady?: () => Promise<void>;
+  /** Host-owned stop of this run's sandbox during setup. Resolves only after
+   * provider termination is verified; never accepts an agent-selected lease. */
+  stopRemoteStartup?: () => Promise<void>;
   /** Server-owned, actor-attributed snapshot also rendered by legacy wake prompts. */
   executionContinuation?: ExecutionContinuationEnvelope | null;
   runId: string;
@@ -646,7 +649,7 @@ export type TranscriptEntry =
   | { kind: "workspace_change"; ts: string; changeSetId: string; revision: number; source: "harness_reported" | "runner_verified"; complete: boolean; files: TranscriptWorkspaceChangeFile[]; totals: { files: number; additions: number | null; deletions: number | null }; patchArtifactRef: string | null }
   | { kind: "workspace_file_reference"; ts: string; referenceId: string; source: "harness_reported" | "runner_verified"; path: string; displayName: string; mediaType: string | null; presentation: "document" | "code" | "image" | "generic"; line: number | null; preview: string | null; previewTruncated: boolean; contentDigest: string | null }
   | { kind: "runtime_request"; ts: string; requestId: string; requestKind: "runtime" | "command_approval" | "file_approval" | "permission_approval" | "user_input" | "elicitation" | null; turnId: string | null; requestType: "permission" | "input"; status: "pending" | "resolved" | "expired" | "cancelled"; prompt: string; choices: Array<{ key: string; label: string }>; fields: Array<{ name: string; label: string; placeholder: string | null }>; questionSet?: PaperclipQuestionSet | null; resolvedAction?: string | null; response?: PaperclipQuestionResponse | null }
-  | { kind: "run_result"; ts: string; disposition: "done" | "blocked" | "needs_review" | "yielded"; summary: string; objectiveSatisfied: boolean | null; verification: TranscriptRunVerification[]; remainingWork: Array<{ description: string; blocksCompletion: boolean }>; blocker: { reasonCode: string; unblockAction: string; scope: "current_track" | "task_wide" } | null; artifacts: TranscriptRunArtifact[] }
+  | { kind: "run_result"; ts: string; disposition: "done" | "blocked" | "needs_review" | "yielded"; summary: string; objectiveSatisfied: boolean | null; verification: TranscriptRunVerification[]; remainingWork: Array<{ description: string; blocksCompletion: boolean }>; blocker: { reasonCode: string; unblockAction: string; scope: "current_track" | "task_wide" } | null; artifacts: TranscriptRunArtifact[]; acceptedResponseWake?: { runId: string; sourceEventId: string } }
   | { kind: "run_terminal"; ts: string; turnState: "completed" | "failed" | "interrupted" | "cancelled"; runState: "succeeded" | "failed" | "cancelled"; disposition: "done" | "blocked" | "needs_review" | "yielded"; stopReason?: string };
 
 export type StdoutLineParser = (line: string, ts: string) => TranscriptEntry[];

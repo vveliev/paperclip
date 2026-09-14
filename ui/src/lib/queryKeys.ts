@@ -1,4 +1,8 @@
 export const queryKeys = {
+  agentChats: {
+    detail: (companyId: string | null, userId: string | null, agentId: string | undefined) =>
+      ["agent-chat", companyId, userId, agentId] as const,
+  },
   companies: {
     /**
      * Prefix for everything company-shaped. Matches the list, details and stats
@@ -26,6 +30,14 @@ export const queryKeys = {
   apps: {
     gallery: (companyId: string) => ["apps", companyId, "gallery"] as const,
     attention: (companyId: string) => ["apps", companyId, "attention"] as const,
+  },
+  chatEndpoints: {
+    list: (companyId: string) => ["chat-endpoints", companyId] as const,
+    detail: (endpointId: string) => ["chat-endpoints", "detail", endpointId] as const,
+    resources: (endpointId: string) => ["chat-endpoints", endpointId, "resources"] as const,
+    principals: (endpointId: string) => ["chat-endpoints", endpointId, "principals"] as const,
+    conversations: (endpointId: string) => ["chat-endpoints", endpointId, "conversations"] as const,
+    activity: (endpointId: string) => ["chat-endpoints", endpointId, "activity"] as const,
   },
   tools: {
     applications: (companyId: string) =>
@@ -320,6 +332,8 @@ export const queryKeys = {
       ] as const,
     listByParent: (companyId: string, parentId: string) =>
       ["issues", companyId, "parent", parentId] as const,
+    listCreatedFromIssue: (companyId: string, issueId: string) =>
+      ["issues", companyId, "created-from", issueId] as const,
     listByDescendantRoot: (companyId: string, rootIssueId: string) =>
       ["issues", companyId, "descendants", rootIssueId] as const,
     listByExecutionWorkspace: (
