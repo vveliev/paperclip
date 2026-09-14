@@ -750,6 +750,7 @@ describe("startServer feedback export wiring", () => {
     expect(heartbeatServiceMock.reconcileTaskWatchdogs).toHaveBeenCalledTimes(1);
     expect(heartbeatServiceMock.scanSilentActiveRuns).toHaveBeenCalledTimes(1);
     expect(heartbeatServiceMock.sweepStaleIssueLocks).toHaveBeenCalledTimes(1);
+    expect(heartbeatServiceMock.sweepRecoveryActionsForResolvedPlatformCauses).toHaveBeenCalledTimes(1);
   });
 
   it("refuses authenticated public startup without an external database URL", async () => {
