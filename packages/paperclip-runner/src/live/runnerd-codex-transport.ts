@@ -1,3 +1,4 @@
+import { RunnerdTraceFrameIndex } from "./runnerd-trace-frame-index.js";
 import { codexExecutableReadOnlyRoots } from "../drivers/codex/codex-security-config.js";
 import { isCanonicalProviderEventType } from "../provider-events.js";
 import { execFileSync } from "node:child_process";
@@ -1134,6 +1135,9 @@ export interface CapabilityRunnerdCodexTransportOptions {
   turnStartTimeoutMs?: number;
   onDiagnostic?: (message: string) => void;
   onEvidence?: (evidence: Readonly<CapabilityRunnerdProcessEvidence>) => void;
+  /** Persist process ownership immediately after spawn, before waiting for
+   * provider bootstrap or activating a deferred PRP registration. */
+  onSpawn?: (meta: { pid: number; processGroupId: number | null; startedAt: string }) => Promise<void>;
   stateDirectory?: string;
   lifecyclePolicy?:
     | { mode: "per_turn"; idleTimeoutMs: null }
@@ -1509,34 +1513,8 @@ type PendingTraceRehydration = {
 
 type PendingDriverTraceInterpretation = CodexTraceInterpretation;
 
-function locateRunnerdTraceFrame(
-  tracePath: string,
-  sourceEventId: string,
-): { frameId: number | null; nativeChannelSettled: boolean } {
-  const lines = readFileSync(tracePath, "utf8").split("\n");
-  let frameId: number | null = null;
-  let nativeChannelSettled = false;
-  for (let index = lines.length - 1; index >= 0; index -= 1) {
-    if (!lines[index]?.trim()) continue;
-    const entry = record(JSON.parse(lines[index]!));
-    if (entry.kind === "trace_status" && entry.debugChannel === "rust_native") {
-      nativeChannelSettled = true;
-    }
-    if (
-      entry.kind !== "interpretation" ||
-      !Array.isArray(entry.emittedEventIds)
-    ) {
-      continue;
-    }
-    if ((entry.emittedEventIds as unknown[]).includes(sourceEventId)) {
-      frameId = typeof entry.frameId === "number" ? entry.frameId : null;
-      break;
-    }
-  }
-  return { frameId, nativeChannelSettled };
-}
-
 function appendRunnerdRehydrationTrace(
+  index: RunnerdTraceFrameIndex,
   tracePath: string | undefined,
   sourceEventId: string,
   eventType: string,
@@ -1546,7 +1524,7 @@ function appendRunnerdRehydrationTrace(
   if (!tracePath) return "not_applicable";
   if (!existsSync(tracePath)) return "retry";
   try {
-    const { frameId, nativeChannelSettled } = locateRunnerdTraceFrame(
+    const { frameId, nativeChannelSettled } = index.locate(
       tracePath,
       sourceEventId,
     );
@@ -1598,6 +1576,7 @@ function appendRunnerdRehydrationTrace(
 }
 
 function appendCodexDriverInterpretationTrace(
+  index: RunnerdTraceFrameIndex,
   tracePath: string | undefined,
   input: PendingDriverTraceInterpretation,
   debugSequence: number,
@@ -1605,7 +1584,7 @@ function appendCodexDriverInterpretationTrace(
   if (!tracePath) return "not_applicable";
   if (!existsSync(tracePath)) return "retry";
   try {
-    const { frameId, nativeChannelSettled } = locateRunnerdTraceFrame(
+    const { frameId, nativeChannelSettled } = index.locate(
       tracePath,
       input.sourceEventId,
     );
@@ -2012,6 +1991,108 @@ function readMaintenanceState(root: string) {
   };
 }
 
+/** An exact completed receipt is delivery evidence, never launch authority.
+ * The caller must additionally own the preceding retired maintenance epoch. */
+function completedMaintenanceTerminalReceipt(
+  state: ReturnType<typeof readMaintenanceState>,
+) {
+  const pending = record(state.runner.pendingTerminalDelivery);
+  const commands = state.control.commands as Array<Record<string, unknown>>;
+  if (
+    state.runner.lifecycle !== "suspended" ||
+    pending.commandType !== "runner.suspend" ||
+    pending.lifecycle !== "suspended" ||
+    typeof pending.commandId !== "string" ||
+    !pending.commandId ||
+    !Number.isSafeInteger(pending.controllerSeq) ||
+    Number(pending.controllerSeq) <= 0 ||
+    pending.controllerSeq !== state.runner.lastControllerCommandSeq ||
+    state.runner.pendingProviderCleanup != null ||
+    state.provider.lifecycle !== "prepared" ||
+    state.provider.activeProviderTurnId != null ||
+    !Array.isArray(commands)
+  )
+    return null;
+  const matching = commands.filter(
+    (command) => command.commandId === pending.commandId,
+  );
+  const command = matching[0];
+  const result = record(
+    record(state.runner.processedCommands)[pending.commandId],
+  );
+  if (
+    matching.length !== 1 ||
+    !command ||
+    command.type !== pending.commandType ||
+    command.controllerSeq !== pending.controllerSeq ||
+    result.commandId !== pending.commandId ||
+    result.commandType !== pending.commandType ||
+    result.controllerSeq !== pending.controllerSeq ||
+    result.status !== "completed" ||
+    record(result.result).status !== "completed"
+  )
+    return null;
+  // Match Rust's serialized Command, including nullable defaulted fields.
+  const wire = {
+    schema: command.schema,
+    commandId: command.commandId,
+    controllerSeq: command.controllerSeq,
+    type: command.type,
+    issuedAt: command.issuedAt,
+    deadlineAt: command.deadlineAt ?? null,
+    precondition: command.precondition ?? null,
+    payload: command.payload,
+  };
+  if (
+    record(state.runner.processedCommandFingerprints)[pending.commandId] !==
+    commandDigest(wire).slice("sha256:".length)
+  )
+    return null;
+  if (command.status === "pending") {
+    // Welcome advertises only the first pending command. Absence from that
+    // one-element list cannot prove a later terminal result was delivered.
+    if (
+      commands.find((entry) => entry.status === "pending") !== command ||
+      command.result != null
+    )
+      return null;
+  } else if (
+    command.status !== "completed" ||
+    commandDigest(command.result) !== commandDigest(result)
+  ) {
+    return null;
+  }
+  return { commandId: pending.commandId, result };
+}
+
+function completedMaintenanceTerminalReplayMatches(
+  before: ReturnType<typeof readMaintenanceState>,
+  after: ReturnType<typeof readMaintenanceState>,
+) {
+  const receipt = completedMaintenanceTerminalReceipt(before);
+  if (!receipt) return false;
+  const expectedCommands = (
+    before.control.commands as Array<Record<string, unknown>>
+  ).map((command) =>
+    command.commandId === receipt.commandId
+      ? { ...command, status: "completed", result: receipt.result }
+      : command,
+  );
+  return (
+    after.runner.lifecycle === "suspended" &&
+    after.runner.pendingTerminalDelivery == null &&
+    after.runner.pendingProviderCleanup == null &&
+    after.providerFingerprint === before.providerFingerprint &&
+    commandDigest(after.runner.processedCommands) ===
+      commandDigest(before.runner.processedCommands) &&
+    commandDigest(after.runner.processedCommandFingerprints) ===
+      commandDigest(before.runner.processedCommandFingerprints) &&
+    after.runner.lastControllerCommandSeq ===
+      before.runner.lastControllerCommandSeq &&
+    commandDigest(after.control.commands) === commandDigest(expectedCommands)
+  );
+}
+
 function assertMaintenanceBinding(
   state: ReturnType<typeof readMaintenanceState>,
   identity: DurableRecoveryIdentity,
@@ -2229,6 +2310,11 @@ async function settleRetainedRunnerdSessionOwned(
     if (failure) throw failure;
     if (Date.now() >= deadline) throw maintenanceDenied();
     await bounded(input.authorize());
+    // A callback can synchronously revoke/abort and return a resolved promise;
+    // that result must not win Promise.race over the already-latched denial.
+    input.signal?.throwIfAborted();
+    if (failure) throw failure;
+    if (Date.now() >= deadline) throw maintenanceDenied();
   };
   await authorize();
   await bounded(
@@ -2247,6 +2333,7 @@ async function settleRetainedRunnerdSessionOwned(
   // A previously journaled suspend must be honored before a later drain.
   // A second exact-authority connection can then drain the retained provider
   // prefix; no old command is removed, reordered, or treated as completed.
+  let completedTerminalEpochFingerprint: string | null = null;
   for (let epoch = 0; epoch < 4; epoch++) {
     await authorize();
     if (![...pids].every(maintenanceProcessAbsent)) throw maintenanceDenied();
@@ -2254,8 +2341,14 @@ async function settleRetainedRunnerdSessionOwned(
     assertMaintenanceBinding(before, input.identity, input.providerSessionId);
     const terminalOnly = before.runner.pendingTerminalDelivery != null;
     const pendingTerminal = record(before.runner.pendingTerminalDelivery);
+    const completedTerminalOnly =
+      terminalOnly &&
+      completedTerminalEpochFingerprint === before.fingerprint &&
+      completedMaintenanceTerminalReceipt(before) !== null;
+    completedTerminalEpochFingerprint = null;
     if (
       terminalOnly &&
+      !completedTerminalOnly &&
       !(before.control.commands as Array<Record<string, unknown>>).some(
         (command) =>
           command.commandId === pendingTerminal.commandId &&
@@ -2373,6 +2466,7 @@ async function settleRetainedRunnerdSessionOwned(
     let handle: RunnerProcessHandle | null = null;
     let exited = false;
     let epochCompleted = false;
+    let retiredFingerprint: string | null = null;
     const epochIdentity = {
       schema: "paperclip.native_cleanup_runner_epoch.v1" as const,
       requestId: input.requestId,
@@ -2504,14 +2598,29 @@ async function settleRetainedRunnerdSessionOwned(
         );
       }
       await core.stop();
+      let processingDrained = false;
+      try {
+        // Closing sockets does not join already queued JSON/auth callbacks.
+        // No retirement fingerprint or new core may race an old store write.
+        const normalRetirement = epochCompleted && !failure;
+        await bounded(
+          core.drainPendingConnectionProcessing(),
+          normalRetirement ? deadline : Math.min(deadline, Date.now() + 1_000),
+          !normalRetirement,
+        );
+        processingDrained = true;
+      } catch (error) {
+        failure ??= error;
+      }
       // Do not mistake a bounded wait/kill attempt for retirement. Only the
       // exact child's settled completion plus absence of its entire group can
       // produce this durable receipt. A missing receipt remains unknown.
-      if (handle && spawnedReceipt && exited) {
+      if (handle && spawnedReceipt && exited && processingDrained) {
         try {
           const result = await handle.completion;
           if (!maintenanceProcessAbsent(spawnedReceipt.pid))
             throw maintenanceDenied();
+          const finalFingerprint = readMaintenanceState(root).fingerprint;
           await bounded(
             input.recordEpoch({
               ...spawnedReceipt,
@@ -2520,11 +2629,12 @@ async function settleRetainedRunnerdSessionOwned(
               exitSignal: result.signal,
               processGroupAbsent: true,
               retiredAt: new Date().toISOString(),
-              finalFingerprint: readMaintenanceState(root).fingerprint,
+              finalFingerprint,
             }),
             Date.now() + 1_000,
             true,
           );
+          retiredFingerprint = finalFingerprint;
         } catch (error) {
           failure ??= error;
         }
@@ -2565,10 +2675,26 @@ async function settleRetainedRunnerdSessionOwned(
       }
     }
     if (failure) throw failure;
+    // Retirement itself may await durable authorization callbacks. It proves
+    // process exit, not permission to publish a reusable cleanup proof.
+    await authorize();
     const settled = readMaintenanceState(root);
     assertMaintenanceBinding(settled, input.identity, input.providerSessionId);
     if (settled.runner.lifecycle !== "suspended") throw maintenanceDenied();
     if (terminalOnly) {
+      if (completedTerminalOnly) {
+        // The previous epoch durably completed this command but missed its
+        // ACK. This epoch may only deliver that exact result and old outbox;
+        // it cannot restore a provider or count as a new physical stop.
+        if (
+          !completedMaintenanceTerminalReplayMatches(before, settled) ||
+          settled.fingerprint !== retiredFingerprint ||
+          epochProviderPids.size !== 0 ||
+          ![...pids].every(maintenanceProcessAbsent)
+        )
+          throw maintenanceDenied();
+        continue;
+      }
       // This epoch only confirms delivery of a failed old terminal receipt.
       // It cannot count as provider cleanup or create/execute a command. A
       // separate epoch must perform a NEW stop under the persistent marker.
@@ -2655,6 +2781,14 @@ async function settleRetainedRunnerdSessionOwned(
         );
     if (!stopProven || ![...pids].every(maintenanceProcessAbsent))
       throw maintenanceDenied();
+    if (completedMaintenanceTerminalReceipt(settled)) {
+      // Only a joined child whose retirement receipt committed in THIS
+      // invocation can enable the next delivery-only epoch. A copied initial
+      // terminal marker or an interrupted/unknown child remains quarantined.
+      if (!retiredFingerprint || settled.fingerprint !== retiredFingerprint)
+        throw maintenanceDenied();
+      completedTerminalEpochFingerprint = settled.fingerprint;
+    }
     if (
       settled.provider.lifecycle === "prepared" &&
       settled.runner.pendingTerminalDelivery == null &&
@@ -3188,6 +3322,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
   #runAttachTemplate: Record<string, unknown> | null = null;
   #closed = false;
   #closePromise: Promise<void> | null = null;
+  #controllerDetachedForRestart = false;
   #failure: Error | null = null;
   readonly #failureSignal: Promise<never>;
   #rejectFailureSignal!: (error: Error) => void;
@@ -3200,6 +3335,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
   #controlPlaneRelease: (() => Promise<void> | void) | null = null;
   #nextTraceDebugSequence = 1;
   #traceRehydrationSpoolOverflow = false;
+  readonly #traceFrameIndex = new RunnerdTraceFrameIndex();
   #pendingTraceRehydrations: PendingTraceRehydration[] = [];
   #pendingDriverTraceInterpretations: PendingDriverTraceInterpretation[] = [];
   readonly #bridgedRuntimeInputs = new Map<string, { durableTurnId: string }>();
@@ -3754,6 +3890,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     const tracePath = this.options.environment?.PAPERCLIP_PROVIDER_TRACE_PATH;
     if (!tracePath) return;
     const traceResult = appendCodexDriverInterpretationTrace(
+      this.#traceFrameIndex,
       tracePath,
       input,
       this.#nextTraceDebugSequence,
@@ -3779,6 +3916,19 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       exitCode: this.#evidence.runnerExitCode,
       signal: this.#evidence.runnerSignal,
     };
+  }
+
+  async #publishSpawnedProcess(handle: RunnerProcessHandle): Promise<void> {
+    this.#evidence.runnerPid = handle.child.pid ?? null;
+    this.#evidence.runnerProcessGroupId = handle.processGroupId ?? null;
+    this.#publish();
+    if (handle.child.pid !== undefined) {
+      await this.options.onSpawn?.({
+        pid: handle.child.pid,
+        processGroupId: handle.processGroupId ?? null,
+        startedAt: this.#startedAt,
+      });
+    }
   }
 
   async #readDurableRunnerState(): Promise<Record<string, unknown>> {
@@ -3828,9 +3978,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     }
   }
 
-  async #stopActiveProviderTurnBeforeSuspend(
-    deadline: number,
-  ): Promise<boolean> {
+  async #stopActiveProviderTurnBeforeSuspend(deadline: number): Promise<void> {
     const state = this.#providerDrainState();
     const core = this.#core;
     const inferredActiveProviderTurnId =
@@ -3848,7 +3996,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       activeProviderTurnId === null ||
       core === null
     ) {
-      return false;
+      return;
     }
     const commandId = `command_close_stop_${randomUUID().replaceAll("-", "")}`;
     core.queueCommand(
@@ -3866,19 +4014,18 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         this.#diagnostic(
           `stopped active provider turn ${activeProviderTurnId} before runner suspension`,
         );
-        return true;
+        return;
       }
       if (command !== undefined && command.status !== "pending") {
         this.#diagnostic(
           `provider turn stop ${command.status} before runner suspension`,
         );
-        return false;
+        return;
       }
-      if (await this.#runnerHasExited()) return false;
+      if (await this.#runnerHasExited()) return;
       await new Promise((resolveWait) => setTimeout(resolveWait, 5));
     }
     this.#diagnostic("provider turn stop timed out before runner suspension");
-    return false;
   }
 
   async #drainSettledProviderEventsBeforeSuspend(
@@ -3902,13 +4049,26 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       // A failed drain still proceeds through bounded suspension/containment,
       // but can never authorize a reusable checkpoint or deletion of evidence.
     }
+    const lastDrain = [...core.store.state.commands]
+      .reverse()
+      .find((command) => command.type === "runner.drain");
     this.#diagnostic(
-      "provider suffix did not prove durable drain before bounded runner suspension",
+      "provider suffix did not prove durable drain before bounded runner suspension: " +
+        JSON.stringify({
+          providerState: this.#providerDrainState(),
+          semanticResultsSettled: core.semanticToolResultsSettled(),
+          drainStatus: lastDrain?.status ?? null,
+          retainedEventsDrained:
+            record(record(lastDrain?.result).result).retainedEventsDrained ?? null,
+        }),
     );
     return false;
   }
 
   close(reason?: string): Promise<void> {
+    // Detachment relinquishes process ownership. A late execution finalizer
+    // must not suspend or signal the runner now owned by the next controller.
+    if (this.#controllerDetachedForRestart) return Promise.resolve();
     if (reason) {
       this.#diagnostic(
         `runner transport close requested: ${reason.replaceAll(/[\r\n]/g, " ").slice(0, 1_000)}`,
@@ -3920,6 +4080,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
 
   async detachControllerForRestart(): Promise<void> {
     if (this.#closed) return;
+    this.#controllerDetachedForRestart = true;
     this.#closed = true;
     this.#turnStartAdmission?.resolve(false);
     if (this.#pump !== null) clearInterval(this.#pump);
@@ -3982,13 +4143,15 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
           this.#pumpEventsSafely();
           await new Promise((resolveWait) => setTimeout(resolveWait, 5));
         }
-        const stoppedActiveTurn =
-          await this.#stopActiveProviderTurnBeforeSuspend(preparationDeadline);
+        // The drain always needs one real command round trip to the runner
+        // process, whether or not a turn was active: stopping an active
+        // turn only changes how much trailing event traffic that round
+        // trip may need to carry. Give both cases the same budget so a
+        // slow-but-idle runner is not held to a tighter deadline than a
+        // runner that just stopped a turn.
+        await this.#stopActiveProviderTurnBeforeSuspend(preparationDeadline);
         providerDrained = await this.#drainSettledProviderEventsBeforeSuspend(
-          Math.min(
-            stoppedActiveTurn ? 5_000 : 1_000,
-            Math.max(0, preparationDeadline - Date.now()),
-          ),
+          Math.min(5_000, Math.max(0, preparationDeadline - Date.now())),
         );
       }
       // Local durable roots are reused too. Process exit alone cannot prove
@@ -4065,6 +4228,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       }
       this.#pendingTraceRehydrations = [];
       this.#pendingDriverTraceInterpretations = [];
+      this.#traceFrameIndex.clear();
     }
     if (this.#pump !== null) clearInterval(this.#pump);
     this.#pump = null;
@@ -4119,6 +4283,13 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
   ): Promise<Record<string, unknown>> {
     if (this.#core !== null)
       throw new Error("PRP provider thread is already started");
+    if (this.options.adoptExistingRunner) {
+      // A crash can precede the first driver checkpoint even though runnerd
+      // already opened the provider. Exact process adoption must reuse that
+      // authority instead of enqueueing another run.prepare/session.open pair.
+      await this.#resume();
+      return this.#openedThreadResponse(params);
+    }
     const token = randomUUID().replaceAll("-", "");
     const identity = this.options.prpIdentity ?? {
       runnerInstanceId: `runner_lab_${token}`,
@@ -4488,7 +4659,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       ticket: core.issueBootstrapTicket(RUNNER_BOOTSTRAP_TICKET_TTL_MS),
       maxOutboxBytes: RUNNERD_MAX_OUTBOX_BYTES,
       p0ReserveBytes: RUNNERD_P0_RESERVE_BYTES,
-      maxRuntimeMs: 60 * 60 * 1_000,
+      maxRuntimeMs: 0,
       reconnectGraceMs: this.options.runnerReconnectGraceMs,
       lifecyclePolicy: this.options.lifecyclePolicy,
       runnerBinaryPath,
@@ -4517,6 +4688,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     });
     this.#handle = handle;
     this.#watchRunner(handle);
+    await this.#publishSpawnedProcess(handle);
     await registration?.activate?.();
     if (registration?.failure) {
       void registration.failure.catch((error: unknown) => {
@@ -4535,6 +4707,12 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     await this.#waitForProviderIdentity();
     this.#startupComplete = true;
     this.#diagnostic("runnerd authenticated to the durable PRP control plane");
+    return this.#openedThreadResponse(params);
+  }
+
+  #openedThreadResponse(params: Record<string, unknown>): Record<string, unknown> {
+    const provider = this.options.provider ?? "codex";
+    const acpxAgent = this.options.acpxAgent ?? "codex";
     return {
       thread: {
         id: this.#threadId,
@@ -5111,7 +5289,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
           ticket: bootstrapTicket!,
           maxOutboxBytes: RUNNERD_MAX_OUTBOX_BYTES,
           p0ReserveBytes: RUNNERD_P0_RESERVE_BYTES,
-          maxRuntimeMs: 60 * 60 * 1_000,
+          maxRuntimeMs: 0,
           reconnectGraceMs: this.options.runnerReconnectGraceMs,
           lifecyclePolicy: this.options.lifecyclePolicy,
           runnerBinaryPath,
@@ -5140,6 +5318,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     if (handle) {
       this.#handle = handle;
       this.#watchRunner(handle);
+      await this.#publishSpawnedProcess(handle);
     }
     if (oldTransitionRegistration && newTransitionRegistration) {
       await oldTransitionRegistration.activate?.();
@@ -5884,6 +6063,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
           visibleNotificationCount: notifications.length,
         };
         const traceResult = appendRunnerdRehydrationTrace(
+          this.#traceFrameIndex,
           this.options.environment.PAPERCLIP_PROVIDER_TRACE_PATH,
           pending.sourceEventId,
           pending.eventType,
@@ -6034,6 +6214,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     const retry: PendingTraceRehydration[] = [];
     for (const pending of this.#pendingTraceRehydrations) {
       const traceResult = appendRunnerdRehydrationTrace(
+        this.#traceFrameIndex,
         tracePath,
         pending.sourceEventId,
         pending.eventType,
@@ -6048,6 +6229,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     const driverRetry: PendingDriverTraceInterpretation[] = [];
     for (const pending of this.#pendingDriverTraceInterpretations) {
       const traceResult = appendCodexDriverInterpretationTrace(
+        this.#traceFrameIndex,
         tracePath,
         pending,
         this.#nextTraceDebugSequence,
@@ -6403,6 +6585,8 @@ export const runnerdLaunchProfileInternals = Object.freeze({
 });
 
 export const runnerdRecoveryInternals = Object.freeze({
+  completedMaintenanceTerminalReceipt,
+  completedMaintenanceTerminalReplayMatches,
   awaitProviderDrainBarrier,
   awaitAdoptedRunnerAuthentication,
   awaitRunnerSuspensionBarrier,

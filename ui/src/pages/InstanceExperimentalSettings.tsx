@@ -201,6 +201,7 @@ export function InstanceExperimentalSettings() {
   );
   const enableEnvironments = experimentalQuery.data?.enableEnvironments === true;
   const enableNativeRunner = experimentalQuery.data?.enableNativeRunner === true;
+  const enableChatConnectors = experimentalQuery.data?.enableChatConnectors === true;
   const enableManagedSandboxOnly = experimentalQuery.data?.enableManagedSandboxOnly === true;
   const enableIsolatedWorkspaces = experimentalQuery.data?.enableIsolatedWorkspaces === true;
   // Streamlined left navigation is now the standard sidebar (PAP-12472); the
@@ -309,6 +310,29 @@ export function InstanceExperimentalSettings() {
           settingKey="enableCases"
           managed={managedKeys.enableCases}
           ariaLabel="Toggle cases experimental setting"
+        />
+
+        <ExperimentalToggleCard
+          title="Agent Chat"
+          description="Talk to each agent in one ongoing conversation. Clarify goals and create tasks for execution."
+          footnote="Turning this off preserves conversations and lets active runs finish, but prevents new messages."
+          checked={experimentalQuery.data?.enableAgentChat ?? false}
+          onCheckedChange={(checked) => toggleMutation.mutate({ enableAgentChat: checked })}
+          disabled={toggleMutation.isPending}
+          settingKey="enableAgentChat"
+          managed={managedKeys.enableAgentChat}
+          ariaLabel="Toggle agent chat experimental setting"
+        />
+        <ExperimentalToggleCard
+          title="Chat connectors"
+          description="Connect agents to Slack, GitHub, Discord, Microsoft Teams, and Telegram conversations."
+          footnote="Turning this off hides chat setup, channels, and connected-task controls. Existing chat connections keep running. GitHub and other tool connectors stay available."
+          checked={enableChatConnectors}
+          onCheckedChange={(checked) => toggleMutation.mutate({ enableChatConnectors: checked })}
+          disabled={toggleMutation.isPending}
+          settingKey="enableChatConnectors"
+          managed={managedKeys.enableChatConnectors}
+          ariaLabel="Toggle chat connectors experimental setting"
         />
 
         {SHOW_CONFERENCE_ROOM_EXPERIMENTAL_SETTING ? (

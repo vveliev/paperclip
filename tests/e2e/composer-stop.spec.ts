@@ -149,6 +149,41 @@ for (const adapter of ["process", "paperclip_runner"] as const) {
     const originalSettings = await json(
       await request.get("/api/instance/settings/experimental"),
     );
+    const statusMetadata: Record<string, string | null>[] = [];
+    page.on("websocket", (socket) => {
+      socket.on("framereceived", ({ payload: frame }) => {
+        try {
+          const event = JSON.parse(
+            typeof frame === "string" ? frame : frame.toString("utf8"),
+          );
+          if (
+            event.companyId !== company.id ||
+            event.type !== "heartbeat.run.status"
+          )
+            return;
+          // Retain only scalar status routing evidence for this owned company,
+          // never raw frames, provider output, errors, or tool payloads.
+          const entry: Record<string, string | null> = {};
+          for (const key of [
+            "runId",
+            "agentId",
+            "status",
+            "issueId",
+            "deliveryId",
+            "startedAt",
+            "finishedAt",
+          ] as const) {
+            const value = event.payload?.[key];
+            if (value === null || typeof value === "string") entry[key] = value;
+          }
+          if (typeof event.createdAt === "string")
+            entry.eventCreatedAt = event.createdAt;
+          statusMetadata.push(entry);
+        } catch {
+          // Non-JSON frames are irrelevant and are not retained.
+        }
+      });
+    });
     try {
       await json(
         await request.patch("/api/instance/settings/experimental", {
@@ -249,7 +284,7 @@ for (const adapter of ["process", "paperclip_runner"] as const) {
 
       let dispatchedAt = 0;
       page.on("request", (req) => {
-        if (req.method() === "POST" && req.url().endsWith("/tree-holds"))
+        if (req.method() === "POST" && req.url().endsWith(`/heartbeat-runs/${parentRun.id}/cancel`))
           dispatchedAt = Date.now();
       });
       const clickedAt = Date.now();
@@ -258,16 +293,10 @@ for (const adapter of ["process", "paperclip_runner"] as const) {
       await expect(
         page.getByRole("button", { name: "Dismiss notification" }),
       ).toHaveCount(0);
-      for (const run of [parentRun, childRun]) {
-        await expect
-          .poll(
-            async () =>
-              (await json(await request.get(`/api/heartbeat-runs/${run.id}`)))
-                .status,
-            { timeout: 35_000 },
-          )
-          .toBe("cancelled");
-      }
+      await expect.poll(async () =>
+        (await json(await request.get(`/api/heartbeat-runs/${parentRun.id}`))).status,
+        { timeout: 35_000 },
+      ).toBe("cancelled");
       const stoppedAt = Date.now();
       expect(dispatchedAt - clickedAt).toBeLessThan(2000);
       expect(dispatchedAt).toBeGreaterThan(0);
@@ -278,7 +307,7 @@ for (const adapter of ["process", "paperclip_runner"] as const) {
           .toBe(false);
         await expect
           .poll(() => processAlive(childRun.processPid), { timeout: 3000 })
-          .toBe(false);
+          .toBe(true);
       } else {
         const finalRun = await json(
           await request.get(`/api/heartbeat-runs/${parentRun.id}`),
@@ -297,6 +326,20 @@ for (const adapter of ["process", "paperclip_runner"] as const) {
         }),
         contentType: "application/json",
       });
+      expect(
+        (await json(await request.get(`/api/issues/${parent.id}/tree-control/state`))).activePauseHold,
+      ).toBeNull();
+      expect((await json(await request.get(`/api/heartbeat-runs/${childRun.id}`))).status).toBe("running");
+      await expect(editor).toBeVisible();
+      await expect(page.getByText("Subtree is paused.", { exact: true })).toHaveCount(0);
+      // Pausing future work is a separate, explicit subtree action.
+      await menu(page, "Pause subtree");
+      await expect(page.getByRole("dialog")).toHaveCount(0);
+      await expect.poll(async () => (await json(await request.get(`/api/heartbeat-runs/${childRun.id}`))).status,
+        { timeout: 35_000 }).toBe("cancelled");
+      if (adapter === "process") {
+        await expect.poll(() => processAlive(childRun.processPid), { timeout: 3000 }).toBe(false);
+      }
       expect(
         (
           await json(
@@ -340,14 +383,27 @@ for (const adapter of ["process", "paperclip_runner"] as const) {
         .getByRole("button", { name: "Resume subtree", exact: true })
         .click();
       await expect(page.getByRole("dialog")).toHaveCount(0);
-      // The recovery policy parks these stopped tasks. Releasing the hold must
-      // leave them parked, even with Wake agents selected; no implicit replay.
-      expect(await json(await request.get(`/api/issues/${parent.id}/live-runs`))).toEqual([]);
-      expect(await json(await request.get(`/api/issues/${child.id}/live-runs`))).toEqual([]);
-      await reconcileDemoExecution(request, parent.id, parentRun.id);
-      await reconcileDemoExecution(request, child.id, childRun.id);
-      await running(request, parent.id, adapter);
-      await running(request, child.id, adapter);
+      if (adapter === "process") {
+        // Legacy processes lack runner stop/action proof, so releasing the hold
+        // preserves their recovery gate until the fixture reconciles them.
+        expect(await json(await request.get(`/api/issues/${parent.id}/live-runs`))).toEqual([]);
+        expect(await json(await request.get(`/api/issues/${child.id}/live-runs`))).toEqual([]);
+        await reconcileDemoExecution(request, parent.id, parentRun.id);
+        await reconcileDemoExecution(request, child.id, childRun.id);
+      }
+      // A verified stopped native runner can honor the explicitly selected
+      // Wake agents option without another manual reconciliation step.
+      const resumedParentRun = await running(request, parent.id, adapter);
+      const resumedChildRun = await running(request, child.id, adapter);
+      expect(resumedParentRun.id).not.toBe(parentRun.id);
+      expect(resumedChildRun.id).not.toBe(childRun.id);
+      if (adapter === "paperclip_runner") {
+        await expect.poll(async () => {
+          const calls = await readFile(process.env.PAPERCLIP_STOP_CODEX_LOG!, "utf8");
+          return calls.split("turn/start").length - 1;
+        }, { timeout: 30_000 }).toBeGreaterThanOrEqual(5);
+        await page.screenshot({ path: testInfo.outputPath("native-resumed.png"), fullPage: true });
+      }
       await menu(page, "Pause subtree");
       await expect(page.getByRole("dialog")).toHaveCount(0);
       await expect(
@@ -385,10 +441,35 @@ for (const adapter of ["process", "paperclip_runner"] as const) {
         (await json(await request.get(`/api/heartbeat-runs/${otherRun.id}`)))
           .status,
       ).toBe("running");
+      // The child was never opened, so no child run-history cache can hide a
+      // missing task association. Observe this new run's retryable terminal
+      // delivery before judging the final notification state.
+      await expect
+        .poll(
+          () =>
+            statusMetadata.find(
+              (entry) =>
+                entry.runId === resumedChildRun.id &&
+                entry.status === "cancelled" &&
+                typeof entry.deliveryId === "string" &&
+                entry.deliveryId.length > 0,
+            ),
+          // The real status-delivery sweep runs every 15 seconds.
+          { timeout: 20_000 },
+        )
+        .toMatchObject({
+          runId: resumedChildRun.id,
+          issueId: child.id,
+          status: "cancelled",
+        });
+      await expect(
+        page.getByRole("button", { name: "Dismiss notification" }),
+      ).toHaveCount(0);
       await page.screenshot({
         path: testInfo.outputPath(`${adapter}-cancelled.png`),
       });
     } finally {
+      const statusEvidence = JSON.stringify(statusMetadata, null, 2);
       // The company is disposable and scoped to this test invocation.
       await request.patch(`/api/companies/${company.id}`, {
         data: { status: "archived" },
@@ -399,6 +480,10 @@ for (const adapter of ["process", "paperclip_runner"] as const) {
             originalSettings.enableClassicTaskInterface,
           enableNativeRunner: originalSettings.enableNativeRunner,
         },
+      });
+      await testInfo.attach("owned-company-status-metadata", {
+        body: statusEvidence,
+        contentType: "application/json",
       });
     }
   });

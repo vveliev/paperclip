@@ -4277,10 +4277,10 @@ export function companySkillService(db: Db) {
     const skill = await getById(companyId, skillId);
     if (!skill) return null;
 
-    return readLoadedSkillFile(skill, relativePath);
+    return readLoadedSkillFile(companyId, skill, relativePath);
   }
 
-  async function readLoadedSkillFile(skill: CompanySkill, relativePath: string): Promise<CompanySkillFileDetail> {
+  async function readLoadedSkillFile(companyId: string, skill: CompanySkill, relativePath: string): Promise<CompanySkillFileDetail> {
     const normalizedPath = normalizePortablePath(relativePath || "SKILL.md");
     const fileEntry = skill.fileInventory.find((entry) => entry.path === normalizedPath);
     if (!fileEntry) {
@@ -5688,7 +5688,7 @@ export function companySkillService(db: Db) {
     let wroteSkillFile = false;
     for (const entry of skill.fileInventory) {
       const normalizedPath = normalizePortablePath(entry.path);
-      const detail = await readLoadedSkillFile(skill, normalizedPath);
+      const detail = await readLoadedSkillFile(companyId, skill, normalizedPath);
       const content = detail?.content ?? (normalizedPath === "SKILL.md" ? skill.markdown : null);
       if (content === null) throw unprocessable("Declared skill file is unavailable");
       const resolved = resolveVersionSnapshotPath(skillDir, entry.path);
@@ -5839,7 +5839,7 @@ export function companySkillService(db: Db) {
       const cache = runtimeSkillCacheSpec(resolveManagedSkillsRoot(companyId), skill);
       if (cache) {
         const cachedSource = await resolveRuntimeSkillCache(cache,
-          async (relativePath) => (await readLoadedSkillFile(skill, relativePath)).content,
+          async (relativePath) => (await readLoadedSkillFile(companyId, skill, relativePath)).content,
           options.materializeMissing !== false,
           async () => (await getById(companyId, skill.id))?.key === skill.key);
         return cachedSource

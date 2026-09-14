@@ -1,3 +1,5 @@
+import type { ReleaseRecoveryBlockedNoticeKind } from "../domain/policy.js";
+
 export type RunSummary = {
   id: string;
   companyId: string;
@@ -19,9 +21,14 @@ export type RunSnapshot = {
   contextSnapshot: Record<string, unknown>;
   /** `resultJson.configurationIncomplete`, already parsed; non-null only on a configuration-incomplete failed run. */
   configurationIncompletePayload: Record<string, unknown> | null;
+  /** The host schedules failed conversation turns with its durable retry budget. */
+  conversationContinuation?: boolean;
 };
 
 export type IssueSnapshot = {
+  conversationAgentId?: string | null;
+  conversationUserId?: string | null;
+  conversationState?: string | null;
   id: string;
   companyId: string;
   identifier: string;
@@ -65,7 +72,12 @@ export type IssueReopenedEffect = {
 };
 
 /** Explicit post-commit work a caller applies only after the release transaction commits. */
-export type PostCommitEffect = RunQueuedEffect | IssueReopenedEffect;
+export type PostCommitEffect = RunQueuedEffect | IssueReopenedEffect | {
+  kind: "conversation_retry_requested";
+  companyId: string;
+  runId: string;
+  reviewParticipant: boolean;
+};
 
 export type ReleaseOutcome =
   | { kind: "released" }
@@ -76,8 +88,7 @@ export type ReleaseOutcome =
       kind: "blocked";
       issue: IssueSnapshot;
       previousStatus: "todo" | "in_progress" | "in_review";
-      notice: Record<string, unknown>;
-      recoveryCause: string | null;
+      noticeKind: ReleaseRecoveryBlockedNoticeKind;
     }
   | {
       kind: "blocked_recovery_in_place";
@@ -85,7 +96,7 @@ export type ReleaseOutcome =
       previousStatus: "todo" | "in_progress" | "in_review";
     };
 
-export type WakeQueueApplicationErrorCode = "responsible_user_unresolved";
+export type WakeQueueApplicationErrorCode = "responsible_user_unresolved" | "deferred_wake_not_advanced";
 
 export class WakeQueueApplicationError extends Error {
   constructor(

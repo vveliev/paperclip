@@ -3,14 +3,21 @@
 import { act, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { CONNECTABLE_APP_DEFINITIONS } from "@paperclipai/shared";
+import { CONNECTABLE_APP_DEFINITIONS, GOOGLE_WORKSPACE_CONNECTOR_PROFILES, getAppStoreDefinition } from "@paperclipai/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ApiError } from "@/api/client";
+import { aiConnectionsApi } from "@/api/ai-connections";
 import { queryKeys } from "@/lib/queryKeys";
 import { ConnectionSetupFlow } from "@/features/connections/ConnectionSetupFlow";
 import { AppsConnect } from "./AppsConnect";
 
 const listGalleryMock = vi.hoisted(() => vi.fn());
+const experimentalMock = vi.hoisted(() => vi.fn());
+vi.mock("@/api/instanceSettings", () => ({ instanceSettingsApi: {
+  getExperimental: experimentalMock,
+  get: async () => ({ defaultEnvironmentId: "local-env" }),
+  getGeneral: async () => ({}),
+} }));
 const listApplicationsMock = vi.hoisted(() => vi.fn());
 const listConnectionsMock = vi.hoisted(() => vi.fn());
 const getConnectionMock = vi.hoisted(() => vi.fn());
@@ -205,6 +212,7 @@ describe("AppsConnect — Connect with a link (M4 frame)", () => {
 
   beforeEach(() => {
     vi.resetAllMocks();
+    experimentalMock.mockResolvedValue({ enableChatConnectors: false });
     window.sessionStorage.clear();
     mockCompany.value = {
       selectedCompanyId: "company-1",
@@ -386,10 +394,94 @@ describe("AppsConnect — Connect with a link (M4 frame)", () => {
     expect(container.textContent).not.toContain("Does it need a key?");
   });
 
+  it.each([false, true])("gates chat-only cards in the embedded tool gallery without hiding GitHub (%s)", async (enabled) => {
+    experimentalMock.mockResolvedValue({ enableChatConnectors: enabled });
+    listGalleryMock.mockResolvedValue({ apps: [GITHUB, getAppStoreDefinition("discord"), getAppStoreDefinition("telegram")] });
+    await render();
+    expect(container.textContent).toContain("GitHub");
+    expect(container.textContent?.includes("Discord")).toBe(enabled);
+    expect(container.textContent?.includes("Telegram")).toBe(enabled);
+    expect(container.textContent).not.toContain("Chat with an agent");
+  });
+
+  it.each([
+    ["telegram", "Telegram", "https://t.me/example_bot"],
+    ["discord", "Discord", "https://discord.com/channels/example"],
+  ])("does not reveal hidden %s setup from a pasted link or its generic follow-up", async (slug, name, url) => {
+    listGalleryMock.mockResolvedValue({ apps: [GITHUB, getAppStoreDefinition(slug)] });
+    await render();
+    const input = container.querySelector<HTMLInputElement>('input[aria-label="MCP server URL"]')!;
+    await act(async () => setInputValue(input, url));
+    await flushReact();
+    expect(container.textContent).not.toContain(`This looks like ${name}`);
+    expect(buttonByText(`Use ${name}`)).toBeUndefined();
+    await act(async () => buttonByText("Continue")!.click());
+    await flushReact();
+    await passAccessStep();
+    expect(container.textContent).toContain("Connect your own MCP server");
+    expect(container.textContent).not.toContain(`guided setup for ${name}`);
+    expect(buttonByText(`Use ${name}`)).toBeUndefined();
+    expect(connectAppMock).not.toHaveBeenCalled();
+  });
+
+  it("matches GitHub tool URLs independently of gallery search while chat connectors are hidden", async () => {
+    await render();
+    await act(async () => setInputValue(container.querySelector<HTMLInputElement>('input[placeholder="Search apps…"]')!, "no matching cards"));
+    await act(async () => setInputValue(container.querySelector<HTMLInputElement>('input[aria-label="MCP server URL"]')!, "https://github.com/example/repository"));
+    await flushReact();
+    expect(container.textContent).toContain("This looks like GitHub");
+    expect(buttonByText("Use GitHub")).toBeTruthy();
+    await act(async () => buttonByText("Use GitHub")!.click());
+    await flushReact();
+    expect(container.textContent).toContain("Connect GitHub as");
+    expect(container.textContent).toContain("My GitHub account");
+    expect(container.textContent).not.toContain("Chat with an agent");
+  });
+
   // -------------------------------------------------------------------------
   // Access step (PAP-17835). Identity and agent reach are chosen before any
   // credential is entered.
   // -------------------------------------------------------------------------
+
+  it.each([false, true])("offers both Anthropic methods without the obsolete REST option (task repair: %s)", async (taskRepair) => {
+    const createAiAccount = vi.spyOn(aiConnectionsApi, "create").mockResolvedValue({
+      connectionId: "anthropic-ai-account", grantId: "anthropic-ai-grant",
+    });
+    mockParams.appKey = "anthropic";
+    listGalleryMock.mockResolvedValue({ apps: [getAppStoreDefinition("anthropic")] });
+    const client = new QueryClient({ defaultOptions: { queries: {
+      retry: false,
+      staleTime: Infinity,
+    } } });
+    client.setQueryData(queryKeys.environments.list("company-1"), [
+      { id: "local-env", name: "Local", driver: "local", status: "active", config: {} },
+    ]);
+    client.setQueryData(queryKeys.environments.capabilities("company-1"), {});
+    client.setQueryData(queryKeys.instance.settings, { defaultEnvironmentId: "local-env" });
+    client.setQueryData(queryKeys.instance.generalSettings, {});
+    client.setQueryData(queryKeys.health, { deploymentMode: "authenticated", localAiLoginSupported: false });
+    await render(client, false, taskRepair ? <ConnectionSetupFlow host="dialog" serviceSlug="anthropic" interactionId="ai-intent" requestedAgentId="agent-1" aiConnection={{ provider: "anthropic", method: "subscription", mode: "responsible_user" }} /> : undefined);
+    await passAccessStep();
+    expect(container.textContent).toContain("Connect account");
+    expect(container.textContent).toContain("Connection name");
+    expect(container.textContent).not.toContain("How do you want to connect?");
+    expect(radioContaining("Use an API key")).toBeUndefined();
+    expect(container.querySelector('[role="alert"]')).toBeNull();
+    await act(async () => buttonContaining("Use API key instead")!.click());
+    await act(async () => buttonContaining("Claude")!.click());
+    await flushReact();
+    const key = container.querySelector<HTMLInputElement>('input[type="password"]');
+    expect(key).toBeTruthy();
+    await act(async () => setInputValue(key!, "fixture-anthropic-ai-key"));
+    await act(async () => buttonByText("Connect")!.click());
+    await flushReact();
+    expect(createAiAccount).toHaveBeenCalledWith("company-1", expect.objectContaining({
+      provider: "anthropic", method: "api_key", apiKey: "fixture-anthropic-ai-key",
+    }));
+    if (!taskRepair) expect(mockNavigate).toHaveBeenCalledWith("/apps/anthropic-ai-account/permissions");
+    expect(connectAppMock).not.toHaveBeenCalled();
+    expect(container.textContent).not.toContain("Connect for tool access instead");
+  });
 
   it("asks for a GitHub identity and defaults to the current user and every agent", async () => {
     mockParams.appKey = "github";
@@ -982,6 +1074,8 @@ describe("AppsConnect — Connect with a link (M4 frame)", () => {
 
     await render();
 
+    expect(container.textContent).not.toContain("Chat with an agent");
+    expect(container.textContent).not.toContain("GitHub App ID");
     expect(container.textContent).toContain("GitHub sign-in is unavailable");
     expect(container.textContent).not.toContain("Your GitHub key");
     expect(container.querySelector('input[type="password"]')).toBeNull();
@@ -1136,6 +1230,74 @@ describe("AppsConnect — Connect with a link (M4 frame)", () => {
       grantKind: "agent",
       subjectAgentId: "agent-1",
     }));
+  });
+
+  it.each([...new Set(Object.values(GOOGLE_WORKSPACE_CONNECTOR_PROFILES).map((profile) => profile.appSlug))]
+    .flatMap((slug) => [false, true].map((enrollmentReturn) => ({ slug, enrollmentReturn }))))(
+    "preserves personal Workspace access for $slug when changing method (enrollment return: $enrollmentReturn)",
+    async ({ slug, enrollmentReturn }) => {
+      const definition = CONNECTABLE_APP_DEFINITIONS.find((app) => app.slug === slug)!;
+      const readMethod = definition.methods.find((method) => method.key === "paperclip-read")!;
+      mockSearch.value = enrollmentReturn
+        ? `source=${slug}&stage=setup&cloud_connector=enrolled`
+        : `source=${slug}`;
+      if (enrollmentReturn) {
+        window.sessionStorage.setItem(`paperclip.connector-enrollment-access:${slug}`, JSON.stringify({
+          companyId: "company-1", grantKind: "user", installChoice: "all", agentIds: [],
+        }));
+      }
+      listGalleryMock.mockResolvedValue({ apps: [{
+        ...definition, ownershipAvailability: { ...definition.ownershipAvailability, platform_shared: true },
+      }] });
+      await render();
+      if (!enrollmentReturn) {
+        await act(async () => {
+          radioContaining("Just me")?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+        });
+        await passAccessStep();
+      }
+
+      if (definition.methods.some((method) => method.capabilityProfile?.key !== "read")) {
+        const readChoice = radioContaining(readMethod.capabilityProfile!.label);
+        expect(readChoice).not.toBeNull();
+        await act(async () => {
+          readChoice!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+        });
+      }
+      await flushReact();
+      // Change auth methods too, including apps with only one capability.
+      expect(container.textContent).not.toContain("How do you want to connect?");
+      expect(container.textContent).not.toContain("Connect with Paperclip");
+      expect(container.textContent).not.toContain("Your OAuth app");
+      expect(buttonByText("Continue to sign in")?.disabled).toBe(false);
+      const customerAuth = buttonByText("Use your own Google OAuth app");
+      expect(customerAuth).toBeDefined();
+      expect(customerAuth?.getAttribute("aria-expanded")).toBe("false");
+      await act(async () => {
+        customerAuth!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      });
+      await flushReact();
+      expect(container.textContent).toContain("Your OAuth app");
+      expect(container.textContent).toContain("Client ID");
+      expect(buttonByText("Continue to sign in")?.disabled).toBe(true);
+      const managedAuth = buttonByText("Use Paperclip instead");
+      expect(managedAuth).toBeDefined();
+      expect(managedAuth?.getAttribute("aria-expanded")).toBe("true");
+      const fieldsRegion = document.getElementById(managedAuth!.getAttribute("aria-controls")!);
+      expect(fieldsRegion?.getAttribute("role")).toBe("region");
+      expect(fieldsRegion?.textContent).toContain("Client ID");
+      await act(async () => {
+        managedAuth!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      });
+      await flushReact();
+      expect(container.textContent).not.toContain("Your OAuth app");
+      await act(async () => {
+        buttonByText("Continue to sign in")?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      });
+      await flushReact();
+      expect(connectAppMock).toHaveBeenCalledWith("company-1", expect.objectContaining({
+        galleryKey: slug, connectionMethodKey: "paperclip-read", grantKind: "user",
+      }));
   });
 
   it("never renders self-host enrollment when the connector identity is already active", async () => {
