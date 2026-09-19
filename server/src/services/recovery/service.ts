@@ -159,8 +159,6 @@ export const ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS = 4 * 60 * 60 * 1000;
 export const ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS = 30 * 60 * 1000;
 const STRANDED_ISSUE_RECOVERY_ORIGIN_KIND =
   RECOVERY_ORIGIN_KINDS.strandedIssueRecovery;
-const STALE_ACTIVE_RUN_EVALUATION_ORIGIN_KIND =
-  RECOVERY_ORIGIN_KINDS.staleActiveRunEvaluation;
 // BLA-1077: a label named "recovery-cause:<cause>" on a platform/tooling issue
 // declares that issue as a known producer of that recovery `cause`. When such
 // an issue closes `done`, the sweep below re-checks every active recovery
