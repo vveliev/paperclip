@@ -26,7 +26,7 @@ Core fields:
 - instructionsFilePath (string, optional): absolute path to a markdown instructions file. Paperclip stages it into the execution workspace as \`Agents.md\` when safe, otherwise falls back to \`--rules @file\`
 - promptTemplate (string, optional): run prompt template
 - model (string, optional): Grok model id. Defaults to grok-build.
-- permissionMode (string, optional): Grok permission mode. Defaults to \`dontAsk\`
+- permissionMode (string, optional): Grok permission mode passed via \`--permission-mode\`. Unset by default: Grok >= 1.0 enforces \`dontAsk\` as deny-by-default and it overrides \`--always-approve\`, so unattended runs rely on \`--always-approve\` alone unless you explicitly need a mode
 - reasoningEffort (string, optional): Grok reasoning effort passed via \`--reasoning-effort\`
 - maxTurns (number, optional): maximum agent turns for the run
 - command (string, optional): defaults to "grok"
@@ -42,4 +42,6 @@ Notes:
 - Sessions resume with \`--resume <sessionId>\` when the saved session cwd matches the current cwd.
 - Paperclip stages desired runtime skills into \`.claude/skills\` inside the execution workspace so Grok discovers them as project skills.
 - Use \`grok models\` to inspect authentication and available models on the host.
+- Local subscription runs use the host \`grok login\` (\`~/.grok\`) until the company Grok home has a usable \`auth.json\` (sandbox device login). \`XAI_API_KEY\` authenticates without a home. Remote/sandbox runs never fall back to the host login.
+- Without a usable company login, local runs preserve an inherited or configured \`GROK_HOME\`. Managed AI connections keep their selected home. An explicit empty \`XAI_API_KEY\` clears an inherited key and selects subscription authentication.
 `;

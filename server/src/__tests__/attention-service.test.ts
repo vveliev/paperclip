@@ -42,6 +42,7 @@ import {
 import { errorHandler } from "../middleware/index.js";
 import { attentionRoutes } from "../routes/attention.js";
 import { attentionService } from "../services/attention.js";
+import { listAttentionExhaustedRuns } from "../services/attention-exhausted-runs.js";
 import { agentService } from "../services/agents.js";
 import { ROUTABLE_BLOCKED_ROLLOUT_AT } from "../services/routable-blocked.js";
 
@@ -192,7 +193,11 @@ describeEmbeddedPostgres("attention service", () => {
       originId: input.originId ?? null,
       originFingerprint: input.originFingerprint ?? "default",
       executionState: input.executionState ?? null,
-      unblockDescriptor: input.unblockDescriptor ?? null,
+      unblockDescriptor: input.unblockDescriptor !== undefined
+        ? input.unblockDescriptor
+        : input.status === "blocked"
+          ? { owner: "board", action: "Test fixture: pre-existing blocked issue." }
+          : null,
       blockedTransitionAt: input.blockedTransitionAt ?? null,
       harnessKind: input.harnessKind ?? null,
       createdAt: input.createdAt,
@@ -302,6 +307,13 @@ describeEmbeddedPostgres("attention service", () => {
       assigneeAgentId: workerId,
       updatedAt: baseTime,
     });
+    // This fixture used to omit unblockDescriptor entirely to exercise the
+    // BLA-687 "missing descriptor" attention path (the `!descriptor` branch in
+    // attention.ts). issues_blocked_requires_unblock_descriptor_check now makes
+    // that state impossible to insert — there is no non-null value that both
+    // satisfies the constraint and reads as falsy there — so insertIssue's
+    // default board-owned descriptor applies instead, and the assertions below
+    // check the "human-owned descriptor" branch it now takes.
     const blockerParentId = await insertIssue({
       companyId,
       identifier: "ATN-4",
@@ -622,8 +634,13 @@ describeEmbeddedPostgres("attention service", () => {
       issue_thread_interaction: 1,
       join_request: 1,
       recovery_action: 1,
-      productivity_review: 1,
-      blocker_attention: 1,
+      productivity_review: 0,
+      // 2: the pre-existing terminal-blocker item for blockerLeafId, plus the
+      // board-owned-descriptor item for blockerParentId itself (blockerParentId
+      // is blocked with a board-owned unblockDescriptor — see the fixture note
+      // above the seed for why this is no longer the BLA-687 "missing
+      // descriptor" case it originally was).
+      blocker_attention: 2,
       review: 2,
       failed_run: 1,
       budget_alert: 2,
@@ -634,7 +651,6 @@ describeEmbeddedPostgres("attention service", () => {
       "issue_thread_interaction",
       "join_request",
       "recovery_action",
-      "productivity_review",
       "blocker_attention",
       "review",
       "failed_run",
@@ -651,7 +667,14 @@ describeEmbeddedPostgres("attention service", () => {
       expect(item.rank).toBeGreaterThan(0);
     }
     expect(feed.items.some((item) => item.subject.title === "Revision requested")).toBe(false);
+    expect(feed.items.some((item) => item.sourceKind === "productivity_review")).toBe(false);
     expect(feed.items.some((item) => item.subject.title === "Agent productivity review excluded")).toBe(false);
+    const legacyReviews = await db.select().from(issues).where(eq(issues.originKind, "issue_productivity_review"));
+    expect(legacyReviews).toHaveLength(2);
+    expect(legacyReviews).toEqual(expect.arrayContaining([
+      expect.objectContaining({ title: "Human productivity review", status: "todo", assigneeUserId: "board-user", parentId: productivitySourceIssueId }),
+      expect.objectContaining({ title: "Agent productivity review excluded", status: "todo", assigneeAgentId: workerId, parentId: agentProductivitySourceIssueId }),
+    ]));
     expect(feed.items.some((item) => item.subject.title === "Agent review excluded")).toBe(false);
     expect(feed.items.some((item) =>
       item.sourceKind === "failed_run" && item.subject.metadata?.errorCode === "provider_quota"
@@ -665,12 +688,21 @@ describeEmbeddedPostgres("attention service", () => {
       kind: "questions",
       questionCount: 0,
     });
-    expect(feed.items.find((item) => item.sourceKind === "blocker_attention")?.detail).toMatchObject({
+    expect(feed.items.find((item) =>
+      item.sourceKind === "blocker_attention" && item.subject.id === blockerLeafId
+    )?.detail).toMatchObject({
       kind: "blocker",
       blockingIssue: null,
       blockedTaskCount: 1,
     });
-    expect(feed.items.find((item) => item.sourceKind === "blocker_attention")?.subject.id).toBe(blockerLeafId);
+    // blockerParentId is itself blocked with a board-owned unblockDescriptor —
+    // it must surface too, not just the terminal-blocker item above.
+    const boardOwnedDescriptorItem = feed.items.find((item) =>
+      item.sourceKind === "blocker_attention" && item.subject.id === blockerParentId
+    );
+    expect(boardOwnedDescriptorItem).toBeTruthy();
+    expect(boardOwnedDescriptorItem?.entryRule).toBe("blocked issue has a human-owned unblockDescriptor");
+    expect(boardOwnedDescriptorItem?.severity).toBe("high");
     expect(feed.items.find((item) =>
       item.sourceKind === "review" && item.subject.title === "Stalled review blocker"
     )).toMatchObject({
@@ -860,9 +892,23 @@ describeEmbeddedPostgres("attention service", () => {
       addresseeAgentId: reviewerId,
       payload: { version: 1, questions: [] },
     });
+    await db.insert(issueThreadInteractions).values({
+      id: randomUUID(),
+      companyId,
+      issueId,
+      kind: "ask_user_questions",
+      status: "pending",
+      title: "User-addressed question",
+      createdByAgentId: workerId,
+      addresseeUserId: "board-user",
+      requestedResolverPolicy: "human_only",
+      effectiveResolverPolicy: "human_only",
+      payload: { version: 1, questions: [] },
+    });
     await agentService(db).pause(reviewerId);
 
     const feed = await attentionService(db).list(companyId, { userId: "board-user" });
+    const otherUserFeed = await attentionService(db).list(companyId, { userId: "other-user" });
     const audienceByTitle = new Map(feed.items
       .filter((item) => item.sourceKind === "issue_thread_interaction")
       .map((item) => [item.subject.title, item.resolverAudience]));
@@ -888,9 +934,71 @@ describeEmbeddedPostgres("attention service", () => {
       addresseeAgentId: reviewerId,
       addresseeName: "Reviewer",
     });
+    expect(audienceByTitle.get("User-addressed question")).toMatchObject({
+      addresseeUserId: "board-user",
+      effectiveResolverPolicy: "human_only",
+    });
+    expect(otherUserFeed.items.some((item) => item.subject.title === "User-addressed question")).toBe(false);
     // Non-interaction rows carry no resolver policy at all.
     expect(feed.items.find((item) => item.sourceKind !== "issue_thread_interaction")?.resolverAudience)
       .toBeNull();
+  });
+
+  it("reads one compact row per exhausted run despite thousands of historical receipts", async () => {
+    const { companyId, workerId, reviewerId } = await seedCompany("MEM");
+    const other = await seedCompany("OTH");
+    await db.update(agents).set({ status: "terminated" }).where(eq(agents.id, reviewerId));
+    const issueId = await insertIssue({
+      companyId, identifier: "MEM-1", title: "Failed task", status: "in_progress",
+    });
+    const taskId = await insertIssue({
+      companyId, identifier: "MEM-2", title: "Timed out task", status: "in_progress",
+    });
+    const [failedId, timedOutId, succeededId, terminatedId, foreignId, noReceiptId] =
+      Array.from({ length: 6 }, () => randomUUID());
+    const createdAt = new Date("2026-07-09T12:00:00.000Z");
+    await db.insert(heartbeatRuns).values([
+      { id: failedId, companyId, agentId: workerId, status: "failed", contextSnapshot: { issueId, prompt: "x".repeat(32_000) } },
+      { id: timedOutId, companyId, agentId: workerId, status: "timed_out", contextSnapshot: { taskId, prompt: "y".repeat(32_000) } },
+      { id: succeededId, companyId, agentId: workerId, status: "succeeded" },
+      { id: terminatedId, companyId, agentId: reviewerId, status: "failed" },
+      { id: foreignId, companyId: other.companyId, agentId: other.workerId, status: "failed" },
+      { id: noReceiptId, companyId, agentId: workerId, status: "failed" },
+    ].map((run) => ({ ...run, createdAt, updatedAt: createdAt, finishedAt: createdAt })));
+    for (let batch = 0; batch < 5; batch += 1) {
+      await db.insert(heartbeatRunEvents).values(Array.from({ length: 500 }, (_, index) => ({
+        companyId, agentId: workerId, runId: failedId, seq: batch * 500 + index + 1,
+        eventType: "lifecycle", message: `Bounded retry exhausted receipt ${batch * 500 + index + 1}`,
+      })));
+    }
+    await db.insert(heartbeatRunEvents).values([
+      { companyId, agentId: workerId, runId: timedOutId, seq: 1, eventType: "lifecycle", message: "Bounded retry exhausted timeout" },
+      { companyId, agentId: workerId, runId: succeededId, seq: 1, eventType: "lifecycle", message: "Bounded retry exhausted success" },
+      { companyId, agentId: reviewerId, runId: terminatedId, seq: 1, eventType: "lifecycle", message: "Bounded retry exhausted terminated" },
+      { companyId: other.companyId, agentId: other.workerId, runId: foreignId, seq: 1, eventType: "lifecycle", message: "Bounded retry exhausted other company" },
+      // A newer event must not replace the latest matching, company-scoped receipt.
+      { companyId: other.companyId, agentId: other.workerId, runId: failedId, seq: 2501, eventType: "lifecycle", message: "Bounded retry exhausted foreign receipt" },
+      { companyId, agentId: workerId, runId: failedId, seq: 2502, eventType: "stdout", message: "Bounded retry exhausted quoted output" },
+      { companyId, agentId: workerId, runId: failedId, seq: 2503, eventType: "lifecycle", message: "Unrelated lifecycle event" },
+    ]);
+
+    // Assert the database result itself: JavaScript feed deduplication used to
+    // hide the thousands of full run contexts already loaded into memory.
+    const rows = await listAttentionExhaustedRuns(db, companyId);
+    expect(rows).toHaveLength(2);
+    expect(rows.find((row) => row.id === failedId)).toMatchObject({
+      exhaustionMessage: "Bounded retry exhausted receipt 2500",
+      contextSnapshot: { issueId, taskId: null },
+    });
+    expect(rows.find((row) => row.id === timedOutId)?.contextSnapshot).toEqual({ issueId: null, taskId });
+    expect(Buffer.byteLength(JSON.stringify(rows))).toBeLessThan(4096);
+
+    const feed = await attentionService(db).list(companyId, {
+      includeDismissed: true, all: true, allowUnscopedAll: true,
+    });
+    const failures = feed.items.filter((item) => item.sourceKind === "failed_run");
+    expect(failures.map((item) => item.subject.id).sort()).toEqual([failedId, timedOutId].sort());
+    expect(failures.find((item) => item.subject.id === timedOutId)?.relatedIssue?.id).toBe(taskId);
   });
 
   it("suppresses failed-run attention after a newer run for the same issue", async () => {

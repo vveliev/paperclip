@@ -57,7 +57,7 @@ async function waitForText(container: HTMLElement, text: string) {
   await vi.waitFor(() => expect(container.textContent).toContain(text));
 }
 
-function renderGate(container: HTMLElement) {
+function renderGate(container: HTMLElement, allowMembershipRequest = false) {
   const root = createRoot(container);
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false } },
@@ -66,7 +66,7 @@ function renderGate(container: HTMLElement) {
   flushSync(() => {
     root.render(
       <QueryClientProvider client={queryClient}>
-        <CloudAccessGate />
+        <CloudAccessGate allowMembershipRequest={allowMembershipRequest} />
       </QueryClientProvider>,
     );
   });
@@ -115,11 +115,45 @@ describe("CloudAccessGate", () => {
     });
 
     const root = renderGate(container);
-    await waitForText(container, "No company access");
+    await waitForText(container, "No organization access");
 
-    expect(container.textContent).toContain("No company access");
+    expect(container.textContent).toContain("No organization access");
     expect(container.textContent).not.toContain("Outlet content");
 
+    unmountRoot(root);
+  });
+
+  it("admits signed-in nonmembers only for the private invitation landing page", async () => {
+    mockAuthApi.getSession.mockResolvedValue({ user: { id: "invitee" } });
+    mockAccessApi.getCurrentBoardAccess.mockResolvedValue({ isInstanceAdmin: false, companyIds: [] });
+    const root = renderGate(container, true);
+    await waitForText(container, "Outlet content");
+    unmountRoot(root);
+  });
+
+  it("still requires sign-in for the invitation landing page", async () => {
+    mockAuthApi.getSession.mockResolvedValue(null);
+    const root = renderGate(container, true);
+    await waitForText(container, "Navigate:/auth?next=");
+    expect(container.textContent).not.toContain("Outlet content");
+    unmountRoot(root);
+  });
+
+  it("still blocks invitation pages while cloud bootstrap is pending", async () => {
+    mockHealthApi.get.mockResolvedValue({ deploymentMode: "authenticated", deploymentExposure: "public", bootstrapStatus: "bootstrap_pending" });
+    mockAuthApi.getSession.mockResolvedValue({ user: { id: "invitee" } });
+    const root = renderGate(container, true);
+    await waitForText(container, "This Paperclip is waiting on its first admin");
+    expect(container.textContent).not.toContain("Outlet content");
+    unmountRoot(root);
+  });
+
+  it("keeps invitation pages closed when cloud access checks fail", async () => {
+    mockAuthApi.getSession.mockResolvedValue({ user: { id: "invitee" } });
+    mockAccessApi.getCurrentBoardAccess.mockRejectedValueOnce(new Error("Access check unavailable"));
+    const root = renderGate(container, true);
+    await waitForText(container, "Access check unavailable");
+    expect(container.textContent).not.toContain("Outlet content");
     unmountRoot(root);
   });
 
@@ -141,7 +175,7 @@ describe("CloudAccessGate", () => {
     await waitForText(container, "Outlet content");
 
     expect(container.textContent).toContain("Outlet content");
-    expect(container.textContent).not.toContain("No company access");
+    expect(container.textContent).not.toContain("No organization access");
 
     unmountRoot(root);
   });
@@ -245,12 +279,35 @@ describe("Skill Studio routes", () => {
 });
 
 describe("Apps routes", () => {
-  it("uses browse as the Apps landing page and gives connections a canonical URL", () => {
+  it("uses one connector landing page and redirects retired browse, connections, and audit URLs", () => {
     expect(appSource).toContain('<Route path="apps" element={<Browse />} />');
     expect(appSource).toContain('<Route path="apps/browse" element={<Navigate to="/apps" replace />} />');
-    expect(appSource).toContain('<Route path="apps/connections" element={<Connections />} />');
+    expect(appSource).toContain('<Route path="apps/connections" element={<Navigate to="/apps" replace />} />');
+    expect(appSource).toContain('<Route path="apps/advanced/audit" element={<Navigate to="/apps" replace />} />');
+    expect(appSource).toContain('<Route path="apps/advanced/run-your-own" element={<Navigate to="/apps" replace />} />');
+    expect(appSource).not.toContain('import { Connections }');
+    expect(appSource).toContain('<Route path="apps/byo" element={<AppsConnect byoOnly />} />');
+    expect(appSource).toContain('path="apps/vercel-connect"');
+    expect(appSource).toContain('<AppsConnectEntryRoute credentialSource="vercel_connect" />');
+    expect(appSource).toContain('<AppsConnect credentialSource={credentialSource} />');
     expect(appSource).toContain('<Route path="apps/connect/:appKey" element={<Navigate to="/apps" replace />} />');
     expect(appSource).toContain('<Route path="apps/connect/:appKey/:stage" element={<Navigate to="/apps" replace />} />');
+    expect(appSource).toContain('<Route path="apps/advanced/gateways" element={<GatewaysList />} />');
+  });
+
+  it("redirects legacy Rules and Health links to the remaining developer surfaces", () => {
+    expect(appSource).toContain('if (tab === "runtime" || tab === "audit") return "/apps";');
+    expect(appSource).toContain('if (tab === "policies") return "/apps/advanced/profiles";');
+  });
+});
+
+describe("Retired settings routes", () => {
+  it("redirects the removed heartbeats page to the settings root instead of dropping the route", () => {
+    expect(appSource).toContain(
+      '<Route path="company/settings/instance/heartbeats" element={<Navigate to="/company/settings" replace />} />',
+    );
+    expect(appSource).not.toContain("<InstanceSettings");
+    expect(appSource).not.toContain('"./pages/InstanceSettings"');
   });
 });
 

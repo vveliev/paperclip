@@ -1,3 +1,4 @@
+import { AgentAvatar } from "@/components/AgentAvatar";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   WORKSPACE_BRANCH_ROUTINE_VARIABLE,
@@ -12,7 +13,6 @@ import { useQuery } from "@tanstack/react-query";
 import { instanceSettingsApi } from "../api/instanceSettings";
 import { queryKeys } from "../lib/queryKeys";
 import { IssueWorkspaceCard } from "./IssueWorkspaceCard";
-import { AgentIcon } from "./AgentIconPicker";
 import { InlineEntitySelector, type InlineEntityOption } from "./InlineEntitySelector";
 import { getRecentAssigneeIds, sortAgentsByRecency, trackRecentAssignee } from "../lib/recent-assignees";
 import { getRecentProjectIds, trackRecentProject } from "../lib/recent-projects";
@@ -323,15 +323,17 @@ export function RoutineRunVariablesDialog({
   }, []);
 
   const handleWorkspaceDraftChange = useCallback((
-    data: Record<string, unknown>,
+    data: Record<string, unknown> | null,
     meta: { canSave: boolean; workspaceBranchName?: string | null },
   ) => {
-    setWorkspaceConfig((current) => applyWorkspaceDraft(current, data));
+    if (data) {
+      setWorkspaceConfig((current) => applyWorkspaceDraft(current, data));
+    }
     setWorkspaceConfigValid((current) => (current === meta.canSave ? current : meta.canSave));
     setWorkspaceBranchName((current) => {
       const defaultWorkspaceBranchName = defaultExecutionWorkspace?.branchName ?? null;
       const next = meta.workspaceBranchName
-        ?? (data.executionWorkspaceId === defaultExecutionWorkspace?.id ? defaultWorkspaceBranchName : null)
+        ?? (data?.executionWorkspaceId === defaultExecutionWorkspace?.id ? defaultWorkspaceBranchName : null)
         ?? null;
       return current === next ? current : next;
     });
@@ -372,7 +374,7 @@ export function RoutineRunVariablesDialog({
                   option ? (
                     currentAssignee ? (
                       <>
-                        <AgentIcon icon={currentAssignee.icon} className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                        <AgentAvatar agent={currentAssignee} size={16} className="h-3.5 w-3.5 shrink-0 text-muted-foreground"/>
                         <span className="truncate">{option.label}</span>
                       </>
                     ) : (
@@ -387,7 +389,7 @@ export function RoutineRunVariablesDialog({
                   const assignee = agents.find((agent) => agent.id === option.id);
                   return (
                     <>
-                      {assignee ? <AgentIcon icon={assignee.icon} className="h-3.5 w-3.5 shrink-0 text-muted-foreground" /> : null}
+                      {assignee ? <AgentAvatar agent={assignee} size={16} className="h-3.5 w-3.5 shrink-0 text-muted-foreground"/> : null}
                       <span className="truncate">{option.label}</span>
                     </>
                   );

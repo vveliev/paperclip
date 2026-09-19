@@ -1740,7 +1740,10 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
   it("holds Git index and ref locks across terminal cleanup", async () => {
     const seeded = await seedTerminalWorkspace({ mergedPr: true });
     await db.update(executionWorkspaces).set({
-      metadata: { createdByRuntime: true },
+      metadata: {
+        createdByRuntime: true,
+        gitBranchOwnershipVersion: 1,
+      },
     }).where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
     let commitFailure = "";
     let refUpdateFailure = "";
@@ -2153,6 +2156,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       title: "Source task",
       identifier: "PAP-123",
       status: "blocked",
+      unblockDescriptor: { owner: "board", action: "Test fixture: pre-existing blocked issue." },
       priority: "medium",
     });
     await db.insert(executionWorkspaces).values({
@@ -2275,6 +2279,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       title: "Source task",
       identifier: "PAP-124",
       status: "blocked",
+      unblockDescriptor: { owner: "board", action: "Test fixture: pre-existing blocked issue." },
       priority: "medium",
     });
     await db.insert(executionWorkspaces).values({
@@ -2356,6 +2361,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       title: "Source task",
       identifier: "PAP-125",
       status: "blocked",
+      unblockDescriptor: { owner: "board", action: "Test fixture: pre-existing blocked issue." },
       priority: "medium",
     });
     await db.insert(executionWorkspaces).values({
@@ -2429,6 +2435,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       title: "Source task",
       identifier: "PAP-126",
       status: "blocked",
+      unblockDescriptor: { owner: "board", action: "Test fixture: pre-existing blocked issue." },
       priority: "medium",
     });
     await db.insert(executionWorkspaces).values({
@@ -2528,6 +2535,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       title: "Source task",
       identifier: "PAP-124",
       status: "blocked",
+      unblockDescriptor: { owner: "board", action: "Test fixture: pre-existing blocked issue." },
       priority: "medium",
       assigneeAgentId: agentId,
     });
@@ -2668,6 +2676,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       title: "Source task",
       identifier: "PAP-125",
       status: "blocked",
+      unblockDescriptor: { owner: "board", action: "Test fixture: pre-existing blocked issue." },
       priority: "medium",
     });
     await db.insert(executionWorkspaces).values({
@@ -2819,6 +2828,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       title: "Source task awaiting review",
       identifier: "PAP-125",
       status: "blocked",
+      unblockDescriptor: { owner: "board", action: "Test fixture: pre-existing blocked issue." },
       priority: "medium",
       assigneeAgentId: coderAgentId,
       executionPolicy: {
@@ -2999,6 +3009,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
           title: "Source task",
           identifier: "PAP-125",
           status: "blocked",
+          unblockDescriptor: { owner: "board", action: "Test fixture: pre-existing blocked issue." },
           priority: "medium",
           assigneeAgentId: agentId,
         },
@@ -3133,6 +3144,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       projectId,
       title: "Source task",
       status: "blocked",
+      unblockDescriptor: { owner: "board", action: "Test fixture: pre-existing blocked issue." },
       priority: "medium",
     });
     await db.insert(executionWorkspaces).values({
@@ -3218,6 +3230,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       projectId,
       title: "Source task",
       status: "blocked",
+      unblockDescriptor: { owner: "board", action: "Test fixture: pre-existing blocked issue." },
       priority: "medium",
     });
     await db.insert(executionWorkspaces).values({
@@ -3303,6 +3316,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       projectId,
       title: "Source task",
       status: "blocked",
+      unblockDescriptor: { owner: "board", action: "Test fixture: pre-existing blocked issue." },
       priority: "medium",
     });
     await db.insert(executionWorkspaces).values({
@@ -3407,6 +3421,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       projectId,
       title: "Source task",
       status: "blocked",
+      unblockDescriptor: { owner: "board", action: "Test fixture: pre-existing blocked issue." },
       priority: "medium",
     });
     await db.insert(executionWorkspaces).values({
@@ -3514,6 +3529,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       projectId,
       title: "Source task",
       status: "blocked",
+      unblockDescriptor: { owner: "board", action: "Test fixture: pre-existing blocked issue." },
       priority: "medium",
     });
     await db.insert(executionWorkspaces).values({
@@ -3643,6 +3659,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       projectId,
       title: "Source task",
       status: "blocked",
+      unblockDescriptor: { owner: "board", action: "Test fixture: pre-existing blocked issue." },
       priority: "medium",
     });
     await db.insert(executionWorkspaces).values({
@@ -3826,6 +3843,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       projectId,
       title: "Source task",
       status: "blocked",
+      unblockDescriptor: { owner: "board", action: "Test fixture: pre-existing blocked issue." },
       priority: "medium",
     });
     await db.insert(executionWorkspaces).values({
@@ -3873,7 +3891,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     expect(comments).toHaveLength(0);
   }, 20_000);
 
-  it("returns full details at the observed volume without multiplying unconfigured shared service history", async () => {
+  it("keeps a large collection DB-only while a concurrent health-style query remains responsive", async () => {
     const companyId = randomUUID();
     const projectId = randomUUID();
     const projectWorkspaceId = randomUUID();
@@ -3935,9 +3953,21 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       })),
     );
 
-    const workspaces = await svc.list(companyId);
+    const inspectGitCloseReadiness = vi.fn(async () => {
+      throw new Error("collection inventory must not inspect git worktrees");
+    });
+    const inventoryService = executionWorkspaceService(db, { inspectGitCloseReadiness });
+    const inventoryPromise = inventoryService.list(companyId);
+    const healthResponsive = await Promise.race([
+      db.execute(sql`select 1 as ok`).then(() => true),
+      new Promise<false>((resolve) => setTimeout(() => resolve(false), 2_000)),
+    ]);
+    const workspaces = await inventoryPromise;
 
+    expect(healthResponsive).toBe(true);
+    expect(inspectGitCloseReadiness).not.toHaveBeenCalled();
     expect(workspaces).toHaveLength(workspaceCount);
+    expect(workspaces.every((workspace) => workspace.deliveryState === "unknown")).toBe(true);
     expect(workspaces.reduce((count, workspace) => count + (workspace.runtimeServices?.length ?? 0), 0)).toBe(0);
     expect(JSON.stringify(workspaces).length).toBeLessThan(12_000_000);
 
@@ -4486,7 +4516,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       projectUrlKey: "workspaces",
       projectName: "Workspaces",
       branchName: "paperclip/a",
-      serviceCount: 2,
+      serviceCount: 1,
       runningServiceCount: 1,
       primaryServiceUrl: "http://localhost:3100",
       primaryServiceUrlRunning: true,
@@ -4657,6 +4687,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       baseRef: "main",
       metadata: {
         createdByRuntime: true,
+        gitBranchOwnershipVersion: 1,
         config: {
           cleanupCommand: "printf 'workspace cleanup\\n'",
         },
@@ -4695,5 +4726,12 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       "git_worktree_remove",
       "git_branch_delete",
     ]));
+
+    await db.update(executionWorkspaces).set({
+      metadata: { createdByRuntime: true },
+    }).where(eq(executionWorkspaces.id, executionWorkspaceId));
+    const legacyReadiness = await svc.getCloseReadiness(executionWorkspaceId);
+    expect(legacyReadiness?.git?.createdByRuntime).toBe(false);
+    expect(legacyReadiness?.plannedActions.map((action) => action.kind)).not.toContain("git_branch_delete");
   }, 20_000);
 });

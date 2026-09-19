@@ -102,6 +102,12 @@ function createApp(db: any, deploymentMode: "authenticated" | "local_trusted" = 
   app.get("/actor", (req, res) => {
     res.json(req.actor);
   });
+  app.post("/api/routine-triggers/public/:publicId/fire", (req, res) => {
+    res.json({ reachedWebhook: true, actorType: req.actor.type });
+  });
+  app.post("/mcp/gateways/:gatewayPublicId", (req, res) => {
+    res.json({ reachedGatewayProtocol: true, actorType: req.actor.type });
+  });
   app.get("/companies/:companyId/protected", (req, res) => {
     assertCompanyAccess(req, req.params.companyId);
     res.json({ ok: true });
@@ -201,6 +207,54 @@ describe("agent auth middleware", () => {
     expect(res.status).toBe(401);
     expect(res.body.error).toContain(error);
     expect(commentWrites).toBe(0);
+  });
+
+  it.each(["authenticated", "local_trusted"] as const)(
+    "leaves webhook authentication to the trigger in %s mode",
+    async (deploymentMode) => {
+      const { db } = createDbState({ agent: { id: randomUUID(), companyId: randomUUID() } });
+      const res = await request(createApp(db, deploymentMode))
+        .post(`/api/routine-triggers/public/${"a".repeat(24)}/fire`)
+        .set("Authorization", "Bearer routine-secret")
+        .send({ event: "created" });
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({ reachedWebhook: true, actorType: "none" });
+    },
+  );
+
+  it.each([
+    `/api/routine-triggers/public/${"a".repeat(24)}/rotate-secret`,
+    "/api/routine-triggers/public/not-a-public-id/fire",
+    `/api/routine-triggers/public/${"a".repeat(24)}/fire/extra`,
+  ])("does not bypass actor authentication for %s", async (path) => {
+    const { db } = createDbState({ agent: { id: randomUUID(), companyId: randomUUID() } });
+    const res = await request(createApp(db)).post(path).set("Authorization", "Bearer routine-secret");
+    expect(res.status).toBe(401);
+  });
+
+  it("leaves public MCP gateway bearers for the gateway protocol to validate", async () => {
+    const { db } = createDbState({ agent: { id: randomUUID(), companyId: randomUUID() } });
+    const publicId = `gw_${"a".repeat(32)}`;
+
+    const res = await request(createApp(db, "local_trusted"))
+      .post(`/mcp/gateways/${publicId}`)
+      .set("Authorization", "Bearer pcgw_runtime_token")
+      .send({ jsonrpc: "2.0", id: 1, method: "initialize" });
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ reachedGatewayProtocol: true });
+  });
+
+  it("does not bypass actor authentication for lookalike MCP gateway paths", async () => {
+    const { db } = createDbState({ agent: { id: randomUUID(), companyId: randomUUID() } });
+
+    const res = await request(createApp(db, "local_trusted"))
+      .post("/mcp/gateways/not-a-public-id")
+      .set("Authorization", "Bearer pcgw_runtime_token")
+      .send({ jsonrpc: "2.0", id: 1, method: "initialize" });
+
+    expect(res.status).toBe(401);
+    expect(res.body.error).toContain("Agent token did not verify");
   });
 
   it.each([

@@ -112,6 +112,11 @@ describeEmbeddedPostgres("task watchdog scheduler", () => {
       // grace window) so the pending-first-run guard does not defer it. Tests
       // exercising the create-race pass an explicit recent `createdAt`.
       createdAt: overrides.createdAt ?? new Date(Date.now() - 60 * 60 * 1000),
+      unblockDescriptor: overrides.unblockDescriptor !== undefined
+        ? overrides.unblockDescriptor
+        : (overrides.status ?? "done") === "blocked"
+          ? { owner: "board", action: "Test fixture: pre-existing blocked issue." }
+          : null,
     });
     return id;
   }
@@ -425,7 +430,11 @@ describeEmbeddedPostgres("task watchdog scheduler", () => {
 
     await db
       .update(issues)
-      .set({ status: "blocked", updatedAt: new Date(Date.now() + 60_000) })
+      .set({
+        status: "blocked",
+        unblockDescriptor: { owner: "board", action: "Test fixture: pre-existing blocked issue." },
+        updatedAt: new Date(Date.now() + 60_000),
+      })
       .where(eq(issues.id, childId));
     const retriggered = await service.reconcileTaskWatchdogs({ companyId });
 
@@ -512,7 +521,11 @@ describeEmbeddedPostgres("task watchdog scheduler", () => {
 
     await db
       .update(issues)
-      .set({ status: "blocked", updatedAt: new Date(Date.now() + 60_000) })
+      .set({
+        status: "blocked",
+        unblockDescriptor: { owner: "board", action: "Test fixture: pre-existing blocked issue." },
+        updatedAt: new Date(Date.now() + 60_000),
+      })
       .where(eq(issues.id, childId));
     const changedWhileReviewLive = await service.reconcileTaskWatchdogs({ companyId });
     expect(changedWhileReviewLive).toMatchObject({ checked: 1, triggered: 0, live: 1 });

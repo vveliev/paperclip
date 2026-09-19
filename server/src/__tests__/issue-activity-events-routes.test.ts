@@ -46,6 +46,10 @@ const mockInstanceSettingsService = vi.hoisted(() => ({
 const mockRoutineService = vi.hoisted(() => ({
   syncRunStatusForIssue: vi.fn(async () => undefined),
 }));
+const mockRunnerGoalService = vi.hoisted(() => ({
+  projection: vi.fn(async () => null),
+  act: vi.fn(),
+}));
 
 function registerModuleMocks() {
   vi.doMock("../services/access.js", () => ({
@@ -76,9 +80,15 @@ function registerModuleMocks() {
     routineService: () => mockRoutineService,
   }));
 
+  vi.doMock("../services/runner-goals.js", () => ({
+    runnerGoalService: () => mockRunnerGoalService,
+    RunnerGoalActionError: class RunnerGoalActionError extends Error {},
+    RunnerGoalConflictError: class RunnerGoalConflictError extends Error {},
+  }));
+
   vi.doMock("../services/index.js", () => ({
     companyService: () => ({
-      getById: vi.fn(async () => ({ id: "company-1", attachmentMaxBytes: 10 * 1024 * 1024 })),
+      getById: vi.fn(async () => ({ id: "company-1" })),
     }),
     accessService: () => mockAccessService,
     agentService: () => ({
@@ -487,15 +497,19 @@ describe("issue activity event routes", () => {
     const dbMock = {
       select: vi.fn(() => ({
         from: (table: unknown) => ({
-          where: async () => {
+          where: () => {
             const tableName = getTableName(table as Parameters<typeof getTableName>[0]);
-            if (tableName === "project_workspaces") {
-              return [{ id: previousProjectWorkspaceId, name: "Main workspace" }];
-            }
-            if (tableName === "execution_workspaces") {
-              return [{ id: nextExecutionWorkspaceId, name: "Feature workspace" }];
-            }
-            return [];
+            const rows =
+              tableName === "project_workspaces"
+                ? [{ id: previousProjectWorkspaceId, name: "Main workspace" }]
+                : tableName === "execution_workspaces"
+                ? [{ id: nextExecutionWorkspaceId, name: "Feature workspace" }]
+                : [];
+            const query: any = {};
+            query.orderBy = vi.fn(async () => rows);
+            query.then = (resolve: (rows: unknown[]) => unknown, reject?: (error: unknown) => unknown) =>
+              Promise.resolve(rows).then(resolve, reject);
+            return query;
           },
         }),
       })),
