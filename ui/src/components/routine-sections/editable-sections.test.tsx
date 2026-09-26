@@ -82,8 +82,9 @@ describe("TriggersSection", () => {
     await click("Add trigger");
     await choose("When another app sends a webhook");
     await click("Continue");
-    expect(api.createTrigger).toHaveBeenCalledWith("routine-1", { kind: "webhook", signingMode: "bearer", setupPending: true });
-    expect(container.textContent).toContain("Bearer one-time-secret");
+    expect(api.createTrigger).toHaveBeenCalledWith("routine-1", { kind: "webhook", signingMode: "app_webhook", setupPending: true });
+    expect(container.textContent).toContain("one-time-secret");
+    expect(container.textContent).toContain("signing secret field");
     expect(button("Copy for your agent")).toBeTruthy();
     expect(JSON.stringify(Object.values(sessionStorage))).not.toContain("one-time-secret");
     await click("Check connection");
@@ -93,6 +94,22 @@ describe("TriggersSection", () => {
     expect(api.updateTrigger).toHaveBeenCalledWith("trigger-1", { setupPending: false });
     expect(button("Add trigger")).toBeTruthy();
     expect(container.textContent).not.toContain("one-time-secret");
+  });
+
+  it("warns about private URLs without blocking webhook setup or completion", async () => {
+    routine.triggers = [{ id: "trigger-1", kind: "webhook", enabled: true, setupPending: true, signingMode: "bearer", webhookUrl: "https://paperclip.internal/webhook" }] as RoutineTrigger[];
+    await render();
+    await click("Resume setup");
+    expect(container.textContent).toContain("This webhook URL appears to be private");
+    expect(container.querySelector('a[href="https://docs.paperclip.ing/reference/deploy/https/"]')).not.toBeNull();
+    expect(button("Check connection").disabled).toBe(false);
+    await click("Check connection");
+    expect(container.textContent).toContain("This webhook URL appears to be private");
+    expect(button("Finish without checking").disabled).toBe(false);
+    await click("Finish without checking");
+    expect(api.updateTrigger).toHaveBeenCalledWith("trigger-1", { setupPending: false });
+    await click("Edit webhook");
+    expect(container.textContent).toContain("This webhook URL appears to be private");
   });
 
   it("shows polled connection results even when routine context is stale", async () => {

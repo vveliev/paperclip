@@ -1,6 +1,8 @@
+import { RemoteMcpProductionSetup } from "./remote-mcp/RemoteMcpProductionSetup";
+import { useMemoryConnectorsEnabled } from "@/hooks/useMemoryConnectorsEnabled";
 import { AiConnectionCredentialStep } from "@/components/ai-connections/AiConnectionCredentialStep";
 import { ConnectionChoiceList } from "./ConnectionChoiceList";
-import { useCallback, useEffect, useId, useMemo, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState, type ReactNode, type Ref } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import {
   ArrowUpRight,
@@ -19,7 +21,6 @@ import {
   UsersRound,
 } from "lucide-react";
 import type {
-  Agent,
   AppDefinition,
   ConnectionGrantKind,
   ConnectionIntentSetupConnection,
@@ -35,6 +36,9 @@ import type {
 } from "@paperclipai/shared";
 import {
   aiConnectionMetadataSchema,
+  isRemoteMcpConnectorId,
+  isMemoryConnectorId,
+  isRemoteMcpConnectorMethod,
   connectionMethodAcceptsCustomerOAuthClient,
   connectionMethodRequiresConfiguration,
   connectionMethodSupportsAutomaticOAuth,
@@ -56,7 +60,7 @@ import { ApiError } from "@/api/client";
 import { toolsApi } from "@/api/tools";
 import { agentsApi } from "@/api/agents";
 import { appCopyFor, credentialFieldLabel } from "@/lib/app-gallery-copy";
-import { AgentMultiSelect } from "@/components/AgentMultiSelect";
+import { AgentMultiSelect, type AgentMultiSelectOption } from "@/components/AgentMultiSelect";
 import { InlineBanner } from "@/components/InlineBanner";
 import { Button } from "@/components/ui/button";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
@@ -504,6 +508,7 @@ export function readConnectionIntentOAuthOutcome(
 }
 
 export interface ConnectionSetupFlowProps {
+  upstreamServiceName?: string;
   aiConnection?: import("@paperclipai/shared").AiConnectionBinding;
   /** Provider-specific authentication inside the existing access/setup shell. Undefined retains the standard credential form. */
   renderCredentialStep?: (context: { app: AppDefinition; name: string; grantKind: ConnectionGrantKind; agentIds: string[]; allAgents: boolean; onBack: () => void }) => ReactNode;
@@ -529,7 +534,38 @@ export interface ConnectionSetupFlowProps {
  * callbacks; provider fields, validation, OAuth, access, and finishing remain
  * here so a provider can never drift between entry points.
  */
-export function ConnectionSetupFlow({
+export function ConnectionSetupFlow(props: ConnectionSetupFlowProps = {}) {
+  const [searchParams] = useSearchParams();
+  const params = useParams<{ appKey?: string }>();
+  const { selectedCompanyId } = useCompany();
+  const memory = useMemoryConnectorsEnabled();
+  const interactionId = props.interactionId || searchParams.get("intent") || undefined;
+  const source = props.serviceSlug || searchParams.get("source") || params.appKey || searchParams.get("appKey");
+  const draftId = useMemo(() => {
+    if (interactionId && isRemoteMcpConnectorId(source)) {
+      try { return sessionStorage.getItem(`paperclip:mcp-intent-draft:${selectedCompanyId}:${interactionId}`); } catch { /* Storage may be disabled. */ }
+    }
+    return null;
+  }, [interactionId, selectedCompanyId, source]);
+  const existingId = props.configuredConnection?.id || searchParams.get("resume") || searchParams.get("reconnect") || draftId;
+  const lookup = Boolean(existingId && (!source || isRemoteMcpConnectorId(source) || isMemoryConnectorId(source)));
+  const existing = useQuery({ queryKey: ["tools", "connection", existingId], queryFn: () => toolsApi.getConnection(existingId!), enabled: lookup });
+  const provider = source || existing.data?.config?.sourceTemplateKey;
+  const method = searchParams.get("method") || existing.data?.config?.connectionMethodKey;
+  if (lookup && existing.isPending) return <p className="p-6 text-sm text-muted-foreground">Loading connection…</p>;
+  if (lookup && existing.isError) return <div role="alert" className="space-y-3 p-6"><p>Could not load this connection. Your saved access and credentials have not changed.</p><Button variant="outline" onClick={() => void existing.refetch()}>Try again</Button></div>;
+  if (isMemoryConnectorId(provider) && !(existing.data && existing.data.status !== "draft" && existing.data.config?.sourceTemplateKey === provider)) {
+    if (!memory.loaded) return <p className="p-6 text-sm text-muted-foreground">Loading connection settings…</p>;
+    if (!memory.enabled) return <p role="status" className="p-6 text-sm text-muted-foreground">Enable memory connectors in Settings → Experimental to set up this connection.</p>;
+  }
+  if (!props.byoOnly && (props.credentialSource ?? "paperclip_vault") === "paperclip_vault"
+    && isRemoteMcpConnectorId(provider) && (!method || isRemoteMcpConnectorMethod(provider, method))) {
+    return <RemoteMcpProductionSetup key={`${interactionId || "page"}:${provider}`} {...props} interactionId={interactionId} providerId={provider} connection={existing.data} />;
+  }
+  return <StandardConnectionSetupFlow {...props} />;
+}
+
+function StandardConnectionSetupFlow({
   byoOnly = false,
   credentialSource = "paperclip_vault",
   host = "page",
@@ -556,6 +592,7 @@ export function ConnectionSetupFlow({
   const routeParams = useParams<{ appKey?: string }>();
   const { selectedCompany, selectedCompanyId } = useCompany();
   const { enabled: chatConnectorsEnabled } = useChatConnectorsEnabled();
+  const { enabled: memoryConnectorsEnabled } = useMemoryConnectorsEnabled();
   const { setBreadcrumbs } = useBreadcrumbs();
   const { pushToast } = useToast();
   const [searchParams] = useSearchParams();
@@ -850,6 +887,10 @@ export function ConnectionSetupFlow({
    * definition — the generic path stays available either way.
    */
   const useMatchedGalleryEntry = (picked: AppDefinition) => {
+    if (host === "page" && !connectionIntentId && credentialSource === "paperclip_vault" && isRemoteMcpConnectorId(picked.slug)) {
+      navigate(`/apps/connect?source=${picked.slug}`);
+      return;
+    }
     if (picked.slug === "zapier") {
       setEntry(null);
       setGalleryName("");
@@ -930,12 +971,12 @@ export function ConnectionSetupFlow({
   // Use the same visible catalog for cards and every branded URL shortcut.
   // Generic custom URLs remain usable without selecting a hidden provider.
   const visibleGalleryApps = useMemo(
-    () => (galleryQuery.data?.apps ?? []).filter((app) =>
+    () => (galleryQuery.data?.apps ?? []).filter((app) => memoryConnectorsEnabled || !isMemoryConnectorId(app.slug)).filter((app) =>
       chatConnectorsEnabled ||
       !app.methods.some((method) => method.transport === "chat_sdk") ||
       appSupportsToolCatalogSetup(app),
     ),
-    [galleryQuery.data, chatConnectorsEnabled],
+    [galleryQuery.data, chatConnectorsEnabled, memoryConnectorsEnabled],
   );
   const fullRequestedDefinition = requestedAppKey
     ? getConnectableAppDefinition(requestedAppKey)
@@ -2429,7 +2470,9 @@ export function ConnectionSetupFlow({
   );
 }
 
-function StepHeader({
+export function StepHeader({
+  title,
+  headingRef,
   subtitle,
   step,
   activeIndex,
@@ -2438,6 +2481,8 @@ function StepHeader({
   unverifiedHost,
   onCancel,
 }: {
+  title?: string;
+  headingRef?: Ref<HTMLHeadingElement>;
   subtitle: string;
   step: Step;
   activeIndex: number;
@@ -2449,7 +2494,7 @@ function StepHeader({
    * just on the screen where they pasted the address.
    */
   unverifiedHost?: string | null;
-  onCancel: () => void;
+  onCancel?: () => void;
 }) {
   return (
     <div className="mb-6">
@@ -2459,16 +2504,16 @@ function StepHeader({
             <AppLogo name={appIdentity.name} logoUrl={appIdentity.logoUrl} darkLogoUrl={appIdentity.darkLogoUrl} size={44} />
           ) : null}
           <div>
-            <h1 className="text-2xl font-bold tracking-tight">
-              {appIdentity ? `Connect ${appIdentity.name}` : "Connect your own MCP server"}
+            <h1 ref={headingRef} tabIndex={headingRef ? -1 : undefined} className="text-2xl font-bold tracking-tight outline-none">
+              {title ?? (appIdentity ? `Connect ${appIdentity.name}` : "Connect your own MCP server")}
             </h1>
             <p className="mt-1 text-sm text-muted-foreground">{subtitle}</p>
             {unverifiedHost ? <UnverifiedServerBadge host={unverifiedHost} className="mt-2" /> : null}
           </div>
         </div>
-        <Button variant="ghost" size="sm" onClick={onCancel}>
+        {onCancel && <Button variant="ghost" size="sm" onClick={onCancel}>
           Cancel
-        </Button>
+        </Button>}
       </div>
       {step !== "gallery" && (
         // A landmark with stable hooks, so the step model can be read without
@@ -3386,7 +3431,7 @@ function KeyStep({
     : methods;
   const fields = (method?.credentialFields ?? []).map((field) => ({
     ...field,
-    configPath: credentialConfigPath(field),
+    configPath: credentialConfigPath(field, method),
     helpUrl: method?.consoleLinks?.keys ?? method?.consoleLinks?.docs ?? "",
   }));
   const vercelReview = method?.credentialSources?.vercelConnect ?? null;
@@ -3674,12 +3719,12 @@ function KeyStep({
                 {credentialFieldLabel(entry.name, field.label, fields.length)}
               </label>
               <Input
-                type="password"
+                type={field.type === "text" && field.secret === false ? "text" : "password"}
                 aria-label={credentialFieldLabel(entry.name, field.label, fields.length)}
                 autoComplete="off"
                 value={values[field.configPath] ?? ""}
                 onChange={(e) => onChange({ ...values, [field.configPath]: e.target.value })}
-                placeholder="••••••••••••••••"
+                placeholder={field.type === "text" && field.secret === false ? field.placeholder : "••••••••••••••••"}
                 className="mt-2 h-11 font-mono"
               />
               {field.helpUrl && (
@@ -3886,8 +3931,18 @@ function MethodConfigField({
  * so the reader understands the identity and the reach the secret is about to
  * get. Hick's Law: two choices, not a matrix. Both use full-row radio targets.
  */
-export function AccessStep({
-  companyId,
+export function AccessStep({ companyId, ...props }: Omit<Parameters<typeof AccessStepContent>[0], "agents" | "agentsLoading"> & { companyId: string }) {
+  const agentsQuery = useQuery({
+    queryKey: queryKeys.agents.list(companyId),
+    queryFn: () => agentsApi.list(companyId),
+  });
+  return <AccessStepContent {...props} agents={(agentsQuery.data ?? []).filter((agent) => agent.status !== "terminated")} agentsLoading={agentsQuery.isLoading} />;
+}
+
+/** Shared Gmail access presentation; callers supply agents so review stories stay offline. */
+export function AccessStepContent({
+  agents: allAgents,
+  agentsLoading = false,
   authKind,
   grantKinds,
   grantKind,
@@ -3907,7 +3962,8 @@ export function AccessStep({
   onBack,
   onContinue,
 }: {
-  companyId: string;
+  agents: AgentMultiSelectOption[];
+  agentsLoading?: boolean;
   authKind: ToolConnectionAuthKind;
   grantKinds?: ConnectionGrantKind[];
   grantKind: ConnectionGrantKind;
@@ -3935,11 +3991,6 @@ export function AccessStep({
   onBack: () => void;
   onContinue: () => void;
 }) {
-  const agentsQuery = useQuery({
-    queryKey: queryKeys.agents.list(companyId),
-    queryFn: () => agentsApi.list(companyId),
-  });
-  const allAgents: Agent[] = (agentsQuery.data ?? []).filter((a) => a.status !== "terminated");
   // "Only agents I choose" / "Just agents I pick" means agents this person may actually edit. When the server
   // has not told us, fall back to every live agent rather than an empty list —
   // an empty picker would read as "you have no agents".
@@ -4144,7 +4195,7 @@ export function AccessStep({
                   onChange={(next) => setInstallAgentIds(
                     grantKind === "agent" && next.size > 1 ? new Set([[...next].at(-1)!]) : next,
                   )}
-                  loading={agentsQuery.isLoading}
+                  loading={agentsLoading}
                   emptyMessage="You cannot edit any agents yet."
                   showSelectionPreview={false}
                 />

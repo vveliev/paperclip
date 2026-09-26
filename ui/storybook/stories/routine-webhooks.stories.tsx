@@ -29,7 +29,7 @@ export const Credentials: Story = {
     await openWebhookForm(context);
     const canvas = within(context.canvasElement);
     await userEvent.click(canvas.getByRole("button", { name: "Continue" }));
-    await expect(await canvas.findByRole("button", { name: "Copy Authorization header value" })).toBeVisible();
+    await expect(await canvas.findByRole("button", { name: "Copy Secret key" })).toBeVisible();
   },
 };
 export const Bearer: Story = { name: "03 · Bearer · After delivery", play: openSavedWebhook };
@@ -55,3 +55,16 @@ export const Activity: Story = {
     await expect(canvas.getByRole("navigation", { name: "Routine navigation" })).toBeVisible();
   },
 };
+
+const warningSetup: NonNullable<Story["play"]> = async (context) => {
+  await Credentials.play!(context);
+  const canvas = within(context.canvasElement);
+  await expect(canvas.getByRole("link", { name: "Learn how to set up HTTPS and public access" })).toBeVisible();
+  await expect(canvas.getByRole("button", { name: "Check connection" })).toBeEnabled();
+};
+const deliveryPath = "/api/routine-triggers/public/0123456789abcdef01234567/fire";
+export const LocalhostWarning: Story = { name: "11 · Localhost warning", args: { state: "credentials", webhookUrl: `http://localhost:3100${deliveryPath}` }, play: warningSetup };
+export const TailscaleWarning: Story = { name: "12 · Tailscale public access warning", args: { state: "credentials", webhookUrl: `https://paperclip.example-tailnet.ts.net${deliveryPath}` }, play: warningSetup };
+export const PrivateNetworkWarning: Story = { name: "13 · Internal domain warning", args: { state: "credentials", webhookUrl: `https://paperclip.internal${deliveryPath}` }, play: warningSetup };
+export const HttpWarning: Story = { name: "14 · HTTP warning", args: { state: "credentials", webhookUrl: `http://paperclip.example.com${deliveryPath}` }, play: warningSetup };
+export const ExistingWebhookWarning: Story = { name: "15 · Existing private webhook warning", args: { webhookUrl: `https://192.168.1.10${deliveryPath}` }, play: openSavedWebhook };

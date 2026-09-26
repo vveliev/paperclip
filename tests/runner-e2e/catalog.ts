@@ -1,8 +1,10 @@
+import { accountingTasks } from "./accounting-cases.js";
 import { continuationTasks } from "./continuation-cases.js";
+import { lifecycleLiveTasks, lifecycleLiveDefinitionDigest } from "./lifecycle-live-cases.js";
 import { everydayTasks, productionStoryProfile } from "./everyday-cases.js";
 
 import { firstTaskTasks } from "./first-task-cases.js";
-import { chatTasks } from "./chat-cases.js";
+import { chatTasks, chatHardeningTasks, chatStoryTasks, chatQualificationTasks } from "./chat-cases.js";
 import { createHash } from "node:crypto";
 import { createAgentSchema } from "../../packages/shared/src/validators/agent.js";
 import { createEnvironmentSchema } from "../../packages/shared/src/validators/environment.js";
@@ -193,6 +195,19 @@ function nativeProfile(input: {
             : {}),
         },
       });
+    },
+  };
+}
+
+/** Chat acceptance exercises the shipped provider defaults, not full-auto fixtures. */
+function defaultPermissionProfile(profile: RunnerProfileFixture): RunnerProfileFixture {
+  if (profile.generation !== "native") return profile;
+  return {
+    ...profile,
+    buildAgent(input) {
+      const payload = profile.buildAgent(input);
+      const { codexPermissionMode: _codex, acpxPermissionMode: _acpx, ...adapterConfig } = payload.adapterConfig as Record<string, unknown>;
+      return { ...payload, adapterConfig };
     },
   };
 }
@@ -798,6 +813,10 @@ function warmTurnInstructions(turn: 1 | 2 | 3, nonce: string) {
   );
   const marker = warmTurnMarker(turn, nonce);
   const finalTurn = turn === 3;
+  const reviewRequests = finalTurn ? [] : [{
+    kind: "review", ownerClass: "human",
+    summary: `Review the verified turn ${turn} workspace file and decide whether this task is ready to complete or needs another revision.`,
+  }];
   const legacyCompletion = finalTurn
     ? `In a legacy runner, make exactly one public-API completion write after verification: PATCH /api/issues/$PAPERCLIP_TASK_ID with {"status":"done","comment":"${marker}"}. Include Authorization and X-Paperclip-Run-Id. Do not POST a separate comment.`
     : `In a legacy runner, after verification POST exactly one request_confirmation to /api/issues/$PAPERCLIP_TASK_ID/interactions with {"kind":"request_confirmation","idempotencyKey":"daytona-warm-review-T${turn}-${nonce}","resolverPolicy":"human_only","title":"Warm continuity turn ${turn}","summary":"Review completed warm continuity turn ${turn}.","continuationPolicy":"wake_assignee","payload":{"version":1,"prompt":"Is this warm continuity task ready to complete after turn ${turn}?","acceptLabel":"Approve completion","rejectLabel":"Continue work","rejectRequiresReason":true,"allowDeclineReason":true,"supersedeOnUserComment":false,"target":{"type":"custom","key":"daytona_warm_turn_${turn}","revisionId":"${nonce}-T${turn}","label":"Warm continuity turn ${turn}"}}}. Capture the returned interaction id. Then make exactly one issue PATCH with {"status":"in_review","comment":"${marker}","reviewInteractionId":"<returned interaction id>"}. Include Authorization and X-Paperclip-Run-Id on both writes. If the issue PATCH fails, retry only that PATCH and never create another interaction. Do not POST a separate comment. After both writes succeed, end the response and heartbeat immediately; do not wait or poll because the reviewer action will start the next turn.`;
@@ -807,7 +826,7 @@ function warmTurnInstructions(turn: 1 | 2 | 3, nonce: string) {
       ? `Create ${file} with exactly this one line followed by a newline: ${lines[0]}`
       : `Before changing anything, read ${file} and verify its content is exactly ${lines.slice(0, -1).join("\\n")} followed by a newline. Then append exactly ${lines.at(-1)} followed by a newline.`,
     `After the write, verify ${file} contains exactly these lines, once each and in order: ${lines.join(" | ")}.`,
-    `In a native runner, use the current turn completion revision and criterion IDs (CURRENT_TURN_REVISION below is a placeholder, not a literal), then call paperclip_finish exactly once with {reportedWorkDisposition:"${finalTurn ? "done" : "needs_review"}",summary:"${marker}",completionClaim:{contractRevision:CURRENT_TURN_REVISION,objectiveSatisfied:true,criteria:[{criterionId:"objective",status:"satisfied",evidenceRefs:[]}],remainingWork:[]},evidence:[],verification:[{commandOrCheck:"read ${file}",status:"passed"}]}. Wait for that tool call to succeed, then emit exactly ${marker} once as the complete user-facing final response.`,
+    `In a native runner, use the current turn completion revision and criterion IDs (CURRENT_TURN_REVISION below is a placeholder, not a literal), then call paperclip_finish exactly once with {reportedWorkDisposition:"${finalTurn ? "done" : "needs_review"}",summary:"${marker}",completionClaim:{contractRevision:CURRENT_TURN_REVISION,objectiveSatisfied:true,criteria:[{criterionId:"objective",status:"satisfied",evidenceRefs:[]}],remainingWork:[]},attentionRequests:${JSON.stringify(reviewRequests)},evidence:[],verification:[{commandOrCheck:"read ${file}",status:"passed"}]}. Wait for that tool call to succeed, then emit exactly ${marker} once as the complete user-facing final response.`,
     legacyCompletion,
     `In a legacy runner, the PATCH comment is the complete visible response. After its 2xx response, finish silently: do not print, echo, or emit ${marker} again as assistant text.`,
     `Do not include ${marker} in any other visible response or write. Do not recreate, truncate, reorder, or duplicate prior lines.`,
@@ -832,16 +851,14 @@ export const daytonaWarmContinuityTask: RunnerTaskFixture = {
     warmTurnInstructions(3, nonce),
   ],
   buildMatchers(nonce, execution) {
-    const markers = ([1, 2, 3] as const).map((turn) =>
-      warmTurnMarker(turn, nonce),
-    );
+    // Workspace persistence is the oracle for this story. Exact response text
+    // formatting must not mask a valid workspace, but every warm turn still
+    // needs one visible marker in chronological order. Surrounding provider
+    // prose is allowed; the occurrence and order matchers grade only markers.
+    const markers = ([1, 2, 3] as const).map((turn) => warmTurnMarker(turn, nonce));
     return [
-      { kind: "message_exact", expected: markers[2] },
-      ...markers.map(
-        (expected) =>
-          ({ kind: "message_occurrences", expected, count: 1 }) as const,
-      ),
-      { kind: "message_ordered", expected: markers },
+      ...markers.map((marker) => ({ kind: "message_occurrences" as const, expected: marker, count: 1 })),
+      { kind: "message_ordered" as const, expected: markers },
       {
         kind: "file_exact",
         path: `daytona-warm-${nonce}.txt`,
@@ -895,6 +912,26 @@ const everydayProfiles = [
 
 export const runnerSuites: readonly RunnerSuiteFixture[] = [
   {
+    id: "continuation-accounting", label: "Continuation accounting baseline", manualOnly: true,
+    description: "Structured productive steps, bounded repair, restart and late gates; comments cannot buy more attempts.",
+    groups: ["local"], environments: [localEnvironment], profiles: codexContinuityProfiles.map(productionStoryProfile),
+    tasks: accountingTasks, expectedMatrixSize: 8,
+    excludedExecutionIds: accountingTasks.filter(t => !t.id.includes("productive")).map(t => `continuation-accounting.runner-codex.local.${t.id}`),
+    definitionMetadata: { version: 4, grading: "accounting-v4-cancellation-evidence", scheduling: "explicit-only", providerTurns: "five productive, three repair, two executed plus one cancelled for Stop" },
+  },
+  {
+    id: "lifecycle-baseline", label: "Lifecycle authority baseline", manualOnly: true,
+    description: "Paired narrative probes plus real stop/resume and governed-action controls; live browser/server/database/provider execution.",
+    groups: ["local"], environments: [localEnvironment],
+    profiles: codexContinuityProfiles.map(productionStoryProfile),
+    tasks: [...lifecycleLiveTasks,
+      ...chatTasks.filter(task => ["clarify-reuse", "stop-new-resume"].includes(task.id)),
+      ...connectionReviewSuite.tasks],
+    expectedMatrixSize: 46,
+    excludedExecutionIds: ["neutral", "challenge"].map(variant => `lifecycle-baseline.runner-codex.local.lifecycle-repair-${variant}`),
+    definitionMetadata: { version: 1, narrativeDigest: lifecycleLiveDefinitionDigest, grading: "durable-state-and-attributed-narrative", scheduling: "explicit-only" },
+  },
+  {
     id: "continuation", label: "Task continuation",
     description: "Human direction, approval boundaries, untrusted evidence, and completed actions across turns.",
     groups: ["local"], environments: [localEnvironment],
@@ -904,13 +941,13 @@ export const runnerSuites: readonly RunnerSuiteFixture[] = [
       ...["legacy-codex", "legacy-claude"].map(profile => `continuation.${profile}.local.question-tool-documentation`),
       ...["legacy-codex", "legacy-claude", "runner-codex"].map(profile => `continuation.${profile}.local.provider-question-bridge`),
     ],
-    definitionMetadata: { version: 3, grading: "durable-state-and-approval-boundaries", instructions: "production" },
+    definitionMetadata: { version: 4, grading: "durable-state-and-approval-boundaries", instructions: "production" },
   },
   {
     id: "everyday-workflows", label: "Everyday Paperclip Work", manualOnly: true,
     description: "Real user requests, useful downloaded work, and durable continuation using production instructions.",
     groups: ["native"], profiles: everydayProfiles, environments: [localEnvironment, daytonaWarmEnvironment],
-    tasks: everydayTasks, expectedMatrixSize: 38,
+    tasks: everydayTasks, expectedMatrixSize: 47,
     excludedExecutionIds: [...everydayProfiles.flatMap(profile => everydayTasks
       .filter(task => !["build-revise", "delegate-feedback", "recover-controller", "create-skill-studio"].includes(task.id))
       .map(task => `everyday-workflows.${profile.id}.daytona.${task.id}`))],
@@ -928,9 +965,39 @@ export const runnerSuites: readonly RunnerSuiteFixture[] = [
     id: "agent-chat", label: "Persistent Agent Chat",
     description: "Task-backed conversations, session resets, and project plan handoff.",
     groups: ["chat"],
-    profiles: runnerProfiles.filter(profile => ["legacy-codex", "legacy-claude", "runner-codex", "runner-acpx-claude"].includes(profile.id)),
-    environments: [localEnvironment], tasks: chatTasks, expectedMatrixSize: 24,
-    definitionMetadata: { version: 1, resetRunsCountedSeparately: true },
+    profiles: runnerProfiles.filter(profile => ["legacy-codex", "legacy-claude", "runner-codex", "runner-acpx-claude"].includes(profile.id)).map(defaultPermissionProfile),
+    environments: [localEnvironment], tasks: chatTasks, expectedMatrixSize: 28,
+    excludedExecutionIds: ["legacy-codex", "legacy-claude"].flatMap(profile => ["reassign-task", "create-backlog"].map(task => `agent-chat.${profile}.local.${task}`)),
+    definitionMetadata: { version: 6, resetRunsCountedSeparately: true, permissions: "production-defaults", stopBoundary: "provider-turn-started", restartMemory: "required-after-restart" },
+  },
+  {
+    id: "agent-chat-hardening", label: "Agent Chat Recovery and Coordination", manualOnly: true,
+    description: "Native chat startup cancellation, committed sends, hiring, grounded status, and remote continuity.",
+    groups: ["chat", "native"],
+    profiles: runnerProfiles.filter(profile => ["runner-codex", "runner-acpx-claude"].includes(profile.id))
+      .map(profile => productionStoryProfile(defaultPermissionProfile(profile))),
+    environments: [localEnvironment, daytonaWarmEnvironment], tasks: chatHardeningTasks, expectedMatrixSize: 18,
+    excludedExecutionIds: ["runner-codex", "runner-acpx-claude"].flatMap(profile =>
+      ["stop-startup-new-resume", "hire-delegate-reuse", "blocked-status-review"].map(task => `agent-chat-hardening.${profile}.daytona.${task}`)),
+    definitionMetadata: { version: 5, permissions: "production-defaults", instructions: "production", grading: "durable-state-and-source-evidence", scheduling: "explicit-only", restartMemory: "required-after-restart", statusEvidence: "structured-current-blocker-and-active-run-count", readOnlyState: "public-mutation-contract-and-relations", hiringReference: "neutral-document-reference-line" },
+  },
+  {
+    id: "agent-chat-stories", label: "Agent Chat Setup and Interruptions", manualOnly: true,
+    description: "Experimental settings lifecycle and user follow-ups during active native work.",
+    groups: ["chat", "native"],
+    profiles: runnerProfiles.filter(profile => ["runner-codex", "runner-acpx-claude"].includes(profile.id))
+      .map(profile => productionStoryProfile(defaultPermissionProfile(profile))),
+    environments: [localEnvironment], tasks: chatStoryTasks, expectedMatrixSize: 6,
+    definitionMetadata: { version: 3, setup: "configured-native-agent", permissions: "production-defaults", interruptionBoundary: "provider-file-wait-in-agent-workspace", grading: "persisted-comments-and-plan-run-attributed", scheduling: "explicit-only" },
+  },
+  {
+    id: "agent-chat-qualification", label: "Agent Chat Remaining Qualification", manualOnly: true,
+    description: "Active ownership transfer, user recovery after worker loss, and grounded answer quality.",
+    groups: ["chat", "native"],
+    profiles: runnerProfiles.filter(profile => ["runner-codex", "runner-acpx-claude"].includes(profile.id))
+      .map(profile => productionStoryProfile(defaultPermissionProfile(profile))),
+    environments: [localEnvironment], tasks: chatQualificationTasks, expectedMatrixSize: 6,
+    definitionMetadata: { version: 9, permissions: "production-defaults", instructions: "production", crashBoundary: "verified-native-worker-pid-at-file-wait", recovery: "new-user-message-after-verified-cleanup", answerGrading: "exact-grounded-propositions-plus-separate-semantic-review", scheduling: "explicit-only" },
   },
   ...(process.env.PAPERCLIP_RUNNER_E2E_CONNECTION_REVIEWS === "1" ? [connectionReviewSuite] : []),
   {
@@ -1006,6 +1073,7 @@ export function suiteDefinitionHash(suite: RunnerSuiteFixture) {
           id: task.id,
           flow: task.flow,
           expectedRunCount: task.expectedRunCount,
+          ...(task.minimumExpectedRunCount === undefined ? {} : { minimumExpectedRunCount: task.minimumExpectedRunCount }),
           restartServerBeforeQuestionAnswer:
             task.restartServerBeforeQuestionAnswer ?? false,
         })),
@@ -1093,6 +1161,8 @@ function assertNoRawSecretValues(value: unknown, label: string) {
 export function validateRunnerCatalog(): MatrixExecution[] {
   const allProfiles = [...runnerProfiles, ...openRouterBreadthProfiles, ...everydayProfiles.filter(p => !runnerProfiles.some(existing => existing.id === p.id))];
   const allTasks = [
+    ...accountingTasks,
+    ...lifecycleLiveTasks,
     ...continuationTasks,
     ...everydayTasks,
     ...runnerTasks,

@@ -1,3 +1,4 @@
+import { reassignTaskAction } from "../protocol-actions/reassign-task.js";
 import type {
   PaperclipJsonSchema,
   PaperclipSemanticActionDescriptor,
@@ -323,6 +324,30 @@ const descriptors: readonly PaperclipSemanticActionDescriptor[] = [
     requiredClaims: ["discovery:agents:read"],
   }),
   descriptor({
+    operationId: "hire_agent",
+    title: "Hire a native agent",
+    description:
+      "Create one native Paperclip Runner teammate for the current company and task. The new agent reports to you, inherits your native runtime, and receives no provider, adapter, environment, or credential configuration from the tool. Reuse an existing teammate when appropriate and follow any approval returned by the API.",
+    placement: "optional",
+    effect: "write",
+    requiredClaims: ["delegation:agents:create"],
+    allowedModes: STANDARD_MODE,
+    inputSchema: object(
+      {
+        name: text("Name for the new teammate.", 200),
+        role: {
+          enum: ["ceo", "cto", "cmo", "cfo", "security", "engineer", "designer", "pm", "qa", "devops", "researcher", "general"],
+          default: "general",
+        },
+        title: nullableText("Optional teammate title.", 300),
+        capabilities: nullableText("Optional concise capability summary.", 2_000),
+        instructions: nullableText("Optional persona or task instructions.", 20_000),
+      },
+      ["name"],
+    ),
+    outputSchema: openObject,
+  }),
+  descriptor({
     operationId: "get_agent",
     title: "Get company agent",
     description: "Read one redacted actor profile in the run company.",
@@ -415,6 +440,9 @@ const descriptors: readonly PaperclipSemanticActionDescriptor[] = [
     outputSchema: operationReceipt,
   }),
   descriptor({
+    ...reassignTaskAction.live.descriptor, placement: "optional", effect: "write",
+  }),
+  descriptor({
     operationId: "set_dependencies",
     title: "Set task dependencies",
     description: "Replace the active task's first-class blocker set.",
@@ -468,7 +496,7 @@ const descriptors: readonly PaperclipSemanticActionDescriptor[] = [
   descriptor({
     operationId: "create_task",
     title: "Create task",
-    description: "Create an assigned task. In a conversation, create a project task with no parent; otherwise create a child of the active task. Include initialPlan to persist its plan before execution.",
+    description: "Create an assigned task. In a conversation, create a project task with no parent; otherwise create a child of the active task. Include initialPlan to persist its plan before execution. Set status to backlog when the user wants to save or plan work without starting it; backlog tasks never wake an agent. Omitted status means todo, subject to blockers.",
     placement: "optional",
     effect: "write",
     requiredClaims: ["delegation:tasks:create"],
@@ -481,6 +509,7 @@ const descriptors: readonly PaperclipSemanticActionDescriptor[] = [
         initialPlan: nullableText("Remaining execution steps to persist as the task plan. Exclude completed planning, approval, and handoff steps; cite the source plan revision and approval. A copied plan is not a new approval gate."),
         description: nullableText("Child task description."),
         assigneeActorId: nullableText("Optional actor assignee.", 200),
+        status: { enum: ["backlog", "todo"], description: "Initial status. Use backlog to save work without execution. Defaults to todo (blocked when dependencies are unresolved)." },
         priority: { enum: ["critical", "high", "medium", "low"] },
         blockedByTaskIds: stringArray("Initial blocker task identifiers."),
       },

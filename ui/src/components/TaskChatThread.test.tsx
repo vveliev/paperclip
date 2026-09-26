@@ -246,6 +246,18 @@ describe.each(["legacy", "native"] as const)("%s task history readiness", (runti
   );
 });
 
+it("preserves the typed disposition notice through the task-chat adapter", () => {
+  render(<TaskChatThread comments={[{
+    id: "typed-recovery", companyId: "company", issueId: "issue", authorType: "system", authorAgentId: null, authorUserId: null,
+    body: "Unrelated prose", createdAt: new Date(), updatedAt: new Date(),
+    presentation: { kind: "system_notice", title: "Different wording", tone: "warning", detailsDefaultOpen: false, density: "compact" },
+    metadata: { version: 1, sections: [], recovery: { kind: "disposition_repair_escalated", actionId: "action", assigneeAgentId: "agent", attemptCount: 2, maxAttempts: 2, reason: "unchanged_source_state_exhausted" } },
+  }]} onAdd={async () => {}} issueStatus="blocked" />);
+  expect(container.querySelector('[data-testid="disposition-recovery-notice"]')).not.toBeNull();
+  expect(container.textContent).toContain("Two automatic attempts");
+  expect(container.textContent).not.toContain("Unrelated prose");
+});
+
 it("keeps an acknowledged optimistic bubble mounted with its canonical comment target", () => {
   const comment = {
     companyId: "company",
@@ -664,6 +676,42 @@ describe("TaskChatThread runtime transcript selection", () => {
     expect(
       container.querySelector('[data-testid="task-chat-runner-turn"]'),
     ).toBeNull();
+  });
+
+
+  it.each(["matching", "document_only", "absent", "other_revision"] as const)("reports a restore failure with %s saved-plan evidence", (evidence) => {
+    if (evidence !== "absent") planState.data = planDocument();
+    render(<TaskChatThread issueId="issue-1" comments={[]} onAdd={async () => {}} issueStatus="blocked"
+      interactions={evidence === "absent" || evidence === "document_only" ? [] : [planReviewInteraction("accepted", evidence === "matching" ? "revision-3" : "revision-2", "restore-run")]}
+      onRetryFailedRun={vi.fn()} linkedRuns={[{
+        runId: "restore-run", runtimeMode: "legacy", status: "failed", errorCode: "workspace_restore_failed",
+        agentId: "agent-1", agentName: "Runner", adapterType: "grok_local",
+        createdAt: "2026-08-25T18:00:00.000Z", startedAt: "2026-08-25T18:00:00.000Z", finishedAt: "2026-08-25T18:00:02.000Z",
+        resultJson: { workspaceRestoreFailure: "restore_unsafe_archive", workspaceRestorePath: ".claude/skills/paperclip", finalResponseRecorded: false,
+          ...(evidence === "document_only" ? { savedPlanRevisionId: "revision-3" } : {}),
+        },
+      }]} />);
+    const marker = container.querySelector('[data-testid="task-chat-collapsible-marker"]');
+    expect(marker?.textContent).toContain("Workspace restore failed");
+    flushSync(() => marker!.querySelector<HTMLButtonElement>('button[aria-expanded]')!.click());
+    expect(marker?.textContent).toContain("Workspace files need recovery");
+    expect(marker?.textContent).toContain("No final response was recorded");
+    expect(marker?.textContent).toContain(".claude/skills/paperclip");
+    expect(marker?.querySelector('a[href*="/runs/restore-run"]')).not.toBeNull();
+    expect(marker?.textContent.includes("after the plan was saved")).toBe(evidence === "matching" || evidence === "document_only");
+    expect(Boolean(marker?.querySelector('a[href*="document-plan"]'))).toBe(evidence === "matching" || evidence === "document_only");
+    expect(marker?.querySelector('[data-testid="task-chat-run-failed-try-again"]')).toBeNull();
+  });
+
+  it("uses neutral wording for an unclassified historical legacy failure", () => {
+    render(<TaskChatThread comments={[]} onAdd={async () => {}} linkedRuns={[{
+      runId: "old-run", runtimeMode: "legacy", status: "failed", errorCode: "adapter_failed",
+      agentId: "agent-1", agentName: "Runner", adapterType: "grok_local",
+      createdAt: "2026-08-25T18:00:00.000Z", startedAt: null, finishedAt: "2026-08-25T18:00:02.000Z",
+    }]} />);
+    expect(container.textContent).toContain("The run failed");
+    expect(container.textContent).not.toContain("before returning an answer");
+    expect(container.textContent).not.toContain("Workspace restore failed");
   });
 
   it("projects the saved Plan inline at its native write_document boundary", () => {
@@ -1170,6 +1218,20 @@ describe("TaskChatThread runtime transcript selection", () => {
     expect(onRetryFailedRun).toHaveBeenCalledExactlyOnceWith("failed-bootstrap");
   });
 
+  it.each([false, true])("never offers the old quarantined run as Try again after continuation: %s", continued => {
+    render(<TaskChatThread comments={[]} onAdd={async () => {}} issueStatus="in_progress"
+      onRetryFailedRun={vi.fn()} linkedRuns={[{
+        runId: "quarantined", runtimeMode: "native", status: "failed", errorCode: "native_session_cleanup_quarantined",
+        agentId: "agent-1", agentName: "Runner", adapterType: "paperclip_runner",
+        createdAt: "2026-08-25T18:00:00.000Z", startedAt: "2026-08-25T18:00:00.000Z", finishedAt: "2026-08-25T18:00:02.000Z",
+        ...(continued ? { execution: { phase: "completed" as const, label: "Continued in another run", cause: "native_session_cleanup_quarantined",
+          lastConfirmedActivityAt: null, retryAt: null, attempt: 2, maxAttempts: 3, recoveryOwner: null, nextAction: null,
+          permittedActions: ["inspect_run" as const], predecessorRunId: null, successorRunId: "fresh-run" } } : {}),
+      }]} />);
+    expect(container.textContent).toContain("Run failed");
+    expect(container.querySelector('[data-testid="task-chat-run-failed-try-again"]')).toBeNull();
+  });
+
   it("explains a native provider usage limit without exposing its error code", async () => {
     const onRetryFailedRun = vi.fn();
     render(
@@ -1529,7 +1591,7 @@ describe("TaskChatThread runtime transcript selection", () => {
       container.querySelector(
         '[data-testid="task-chat-collapsible-marker-details"]',
       )?.textContent,
-    ).toContain("before returning an answer");
+    ).toContain("The runner stopped (provider_transport_failed).");
     expect(
       container.querySelector('[data-testid="task-chat-final-response"]'),
     ).toBeNull();
@@ -2175,10 +2237,74 @@ describe("TaskChatThread runtime transcript selection", () => {
     },
   );
 
-  it.each(["active execution", "pending decision", "recovery hold"] as const)(
-    "does not promise legacy Retry during %s and restores it when the gate clears",
-    (gate) => {
+  it.each(["failed", "timed_out"] as const)(
+    "retries the latest legacy %s attempt even when it has a transcript and final comment",
+    async (status) => {
       const onRetryFailedRun = vi.fn();
+      transcriptState.transcriptByRun.set("latest-attempt", [{
+        kind: "assistant",
+        ts: "2026-08-25T18:01:01.000Z",
+        text: "Starting the requested revision.",
+      }]);
+      const run = {
+        runtimeMode: "legacy" as const,
+        adapterType: "claude_local",
+        agentId: "agent-1",
+        agentName: "Direct agent",
+        startedAt: null,
+      };
+      render(
+        <TaskChatThread
+          comments={[{
+            id: "failure-comment",
+            companyId: "company-1",
+            issueId: "issue-1",
+            authorAgentId: "agent-1",
+            authorUserId: null,
+            authorType: "agent",
+            presentation: null,
+            metadata: null,
+            body: "The startup handshake timed out.",
+            runId: "latest-attempt",
+            createdAt: new Date("2026-08-25T18:01:02.000Z"),
+            updatedAt: new Date("2026-08-25T18:01:02.000Z"),
+          }]}
+          onAdd={async () => {}}
+          issueStatus="todo"
+          onRetryFailedRun={onRetryFailedRun}
+          linkedRuns={[
+            { ...run, runId: "original-failure", status: "failed",
+              createdAt: "2026-08-25T18:00:00.000Z", startedAt: "2026-08-25T18:00:00.000Z",
+              finishedAt: "2026-08-25T18:00:02.000Z" },
+            { ...run, runId: "latest-attempt", status, errorCode: "acpx_handshake_timeout",
+              createdAt: "2026-08-25T18:01:00.000Z", startedAt: "2026-08-25T18:01:00.000Z",
+              finishedAt: "2026-08-25T18:01:02.000Z",
+              resultJson: { presentationDecision: { commentId: "failure-comment" } } },
+            { ...run, runId: "cancelled-automatic-retry", status: "cancelled",
+              errorCode: "execution_reconciliation_required",
+              createdAt: "2026-08-25T18:02:00.000Z", finishedAt: "2026-08-25T18:02:02.000Z" },
+          ]}
+        />,
+      );
+
+      expect(container.textContent).toContain("The startup handshake timed out.");
+      const buttons = container.querySelectorAll<HTMLButtonElement>('[data-testid="task-chat-run-failed-try-again"]');
+      expect(buttons).toHaveLength(1);
+      flushSync(() => buttons[0]!.click());
+      await Promise.resolve();
+      expect(onRetryFailedRun).toHaveBeenCalledExactlyOnceWith("latest-attempt");
+    },
+  );
+
+  it.each(["active execution", "pending decision", "recovery hold"].flatMap(
+    (gate) => [false, true].map((hasTranscript) => ({ gate, hasTranscript })),
+  ))(
+    "does not promise legacy Retry during $gate (transcript: $hasTranscript) and restores it when the gate clears",
+    ({ gate, hasTranscript }) => {
+      const onRetryFailedRun = vi.fn();
+      if (hasTranscript) transcriptState.transcriptByRun.set("legacy-failed", [{
+        kind: "assistant", ts: "2026-08-25T18:00:01.000Z", text: "Starting the task.",
+      }]);
       const failedRun = {
         runId: "legacy-failed",
         runtimeMode: "legacy" as const,

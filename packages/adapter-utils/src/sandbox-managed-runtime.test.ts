@@ -1,6 +1,6 @@
 import { randomBytes } from "node:crypto";
 import { promises as fsPromises } from "node:fs";
-import { lstat, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, readdir, readlink, rm, stat, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { execFile as execFileCallback, spawn } from "node:child_process";
@@ -354,6 +354,10 @@ describe("sandbox managed runtime", () => {
       await git(cwd, ["config", "user.email", "test@example.com"]);
       await writeFile(path.join(cwd, "README.md"), contents!);
       await writeFile(path.join(cwd, ".gitignore"), "secret.txt\n");
+      await mkdir(path.join(cwd, ".claude/skills"), { recursive: true });
+      await mkdir(path.join(cwd, "skills/demo"), { recursive: true });
+      await writeFile(path.join(cwd, "skills/demo/SKILL.md"), "base skill\n");
+      await symlink("../../skills/demo", path.join(cwd, ".claude/skills/demo"));
       await git(cwd, ["add", "."]);
       await git(cwd, ["commit", "-m", contents!]);
       await writeFile(path.join(cwd, "secret.txt"), "must stay local");
@@ -381,8 +385,11 @@ describe("sandbox managed runtime", () => {
     for (const relative of ["", secondPath]) {
       const cwd = path.join(remote, relative);
       expect((await lstat(path.join(cwd, ".git"))).isDirectory()).toBe(true);
+      expect(await readlink(path.join(cwd, ".claude/skills/demo"))).toBe("../../skills/demo");
+      expect(await readFile(path.join(cwd, ".claude/skills/demo/SKILL.md"), "utf8")).toBe("base skill\n");
       await expect(stat(path.join(cwd, "secret.txt"))).rejects.toMatchObject({ code: "ENOENT" });
       await writeFile(path.join(cwd, "README.md"), `updated ${relative}`);
+      await writeFile(path.join(cwd, ".claude/skills/demo/SKILL.md"), "updated skill\n");
       await git(cwd, ["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-am", "remote change"]);
     }
     expect(await readFile(path.join(remote, secondPath, "dirty.txt"), "utf8")).toBe("local edit");
@@ -395,6 +402,8 @@ describe("sandbox managed runtime", () => {
       expect(await readFile(path.join(local, relative, "README.md"), "utf8")).toBe(`updated ${relative}`);
       expect(await git(path.join(local, relative), ["log", "-1", "--format=%s"])).toBe("remote change");
       expect(await readFile(path.join(local, relative, "secret.txt"), "utf8")).toBe("must stay local");
+      expect(await readlink(path.join(local, relative, ".claude/skills/demo"))).toBe("../../skills/demo");
+      expect(await readFile(path.join(local, relative, ".claude/skills/demo/SKILL.md"), "utf8")).toBe("updated skill\n");
     }
   }, 30_000);
 
@@ -3852,6 +3861,34 @@ describe("sandbox managed runtime outbound coordinator", () => {
       settleTick(ms).then(() => false),
     ]);
   }
+
+  it("records each failed restore phase without changing stable failure ordering", async () => {
+    const { workspaceDir, remoteWorkspaceDir, dirOf } = await makeOutboundDirs(["home", "private-asset"]);
+    const { control, gate } = makeOutboundControl();
+    const client = makeGatedOutboundClient(true, gate);
+    const workspaceError = Object.assign(new Error("private workspace path"), { code: "EACCES" });
+    control.failWith("workspace", workspaceError);
+    control.failWith("home", Object.assign(new Error("private credential"), { status: 404 }));
+    control.failWith("private-asset", new Error("private asset error"));
+    const prepared = await prepareSandboxManagedRuntime({
+      spec: makeSpec(remoteWorkspaceDir), adapterKey: "codex", client, workspaceLocalDir: workspaceDir,
+      assets: [
+        makeControlledAsset("home", dirOf("home"), control, gate),
+        makeControlledAsset("private-asset", dirOf("private-asset"), control, gate),
+      ],
+    });
+    const lines: string[] = [];
+    await expect(prepared.restoreWorkspace((line) => { lines.push(line); })).rejects.toBe(workspaceError);
+    const diagnostics = lines.filter((line) => line.includes("Workspace restore diagnostic:"));
+    expect(diagnostics).toHaveLength(3);
+    expect(diagnostics).toEqual(expect.arrayContaining([
+      '[paperclip] Workspace restore diagnostic: {"phase":"workspace","errorCode":"EACCES"}\n',
+      '[paperclip] Workspace restore diagnostic: {"phase":"asset","errorCode":"unknown","httpStatus":404}\n',
+      '[paperclip] Workspace restore diagnostic: {"phase":"asset","errorCode":"unknown"}\n',
+    ]));
+    expect(diagnostics.join("")).not.toContain("private");
+    expect(control.settled).toEqual(expect.arrayContaining(["workspace", "home", "private-asset"]));
+  });
 
   it("with concurrency permitted, an asset restore starts while the workspace restore is held open", async () => {
     const { workspaceDir, remoteWorkspaceDir, dirOf } = await makeOutboundDirs(["home"]);
