@@ -41,3 +41,13 @@ test('findExistingComment: returns null when no signed comment exists', async ()
 
   assert.equal(comment, null);
 });
+
+
+test('findExistingComment: reuses the fork workflow bot comment', async () => {
+  const comment = await findExistingComment(async () => ([{
+    id: 44,
+    user: { login: 'github-actions[bot]' },
+    body: 'Quality gate result.\n\n— commitperclip',
+  }]), 'token', 'vveliev/paperclip', 44);
+  assert.equal(comment.id, 44);
+});

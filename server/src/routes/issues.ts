@@ -1458,6 +1458,9 @@ const ISSUE_WAKE_DIAGNOSTIC_KNOWN_REASONS = new Set([
   "issue_children_completed",
   "issue_execution_promoted",
   "issue_state_guard_mismatch",
+  "native_safe_replacement",
+  "chat_control_completed_source",
+  "chat_control_recovery_proof_unresolved",
 ]);
 
 const ISSUE_WAKE_DIAGNOSTIC_KNOWN_STATUSES = new Set([

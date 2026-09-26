@@ -15106,12 +15106,14 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       sql`create trigger test_native_blocked_wait_fault before insert on issue_comments for each row execute function test_native_blocked_wait_fault()`,
     );
     try {
-      await expect(
-        heartbeatService(db).reconcileStrandedAssignedIssues(),
-      ).rejects.toMatchObject({
-        cause: expect.objectContaining({
-          message: "native_blocked_wait_fixture_fault",
-        }),
+      // Candidate failures are isolated so the sweep can recover other issues.
+      // The failed candidate must still roll back all of its durable effects.
+      const result = await heartbeatService(db).reconcileStrandedAssignedIssues();
+      expect(result).toMatchObject({
+        failed: 1,
+        failedIssueIds: [issueId],
+        escalated: 0,
+        issueIds: [],
       });
     } finally {
       await db.execute(
