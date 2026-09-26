@@ -3,6 +3,7 @@ name: Sentry SDK contract
 on:
   pull_request:
     paths:
+      - pnpm-lock.yaml
       - .github/workflows/sentry-contract.yml
       - server/package.json
       - server/src/sentry*.ts
@@ -11,6 +12,7 @@ on:
   push:
     branches: [master]
     paths:
+      - pnpm-lock.yaml
       - .github/workflows/sentry-contract.yml
       - server/package.json
       - server/src/sentry*.ts

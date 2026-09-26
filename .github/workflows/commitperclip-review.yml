@@ -20,7 +20,9 @@ jobs:
       - name: Checkout base branch (never PR code)
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          ref: ${{ github.event.pull_request.base.sha }}
+          # The fork's prerelease branch is protected. Other PR bases keep the
+          # original master checkout, so an arbitrary base cannot supply code.
+          ref: ${{ github.repository != 'paperclipai/paperclip' && github.event.pull_request.base.ref == 'prerelease' && github.event.pull_request.base.sha || 'master' }}
 
       - name: Dependency Review
         uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
