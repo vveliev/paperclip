@@ -26,12 +26,13 @@ import {
   type TriggerDraft,
 } from "./TriggerWizard";
 import { AgentInstructions, CopyField } from "./WebhookFields";
+import { WebhookUrlWarning } from "./WebhookUrlWarning";
 
 function readDraft(key: string): TriggerDraft | null {
   try {
     const draft = JSON.parse(sessionStorage.getItem(key) ?? "null");
     return draft && ["choose", "schedule", "webhook"].includes(draft.kind)
-      ? { ...defaultTriggerDraft, ...draft }
+      ? { ...defaultTriggerDraft, ...draft, sender: draft.sender === "github" ? "github" : "custom" }
       : null;
   } catch {
     return null;
@@ -339,6 +340,7 @@ function TriggerSetup({
         ...saved,
         kind: "webhook",
         sender: trigger.signingMode === "github_hmac" ? "github" : "custom",
+        signingMode: trigger.signingMode === "bearer" ? "bearer" : trigger.signingMode === "fireflies_hmac" ? "fireflies_hmac" : "app_webhook",
         created: true,
         step: saved?.step ?? 1,
         availableStep: Math.max(1, saved?.availableStep ?? 1),
@@ -356,7 +358,7 @@ function TriggerSetup({
       if (createdRef.current) return;
       const response = await routinesApi.createTrigger(routineId, {
         kind: "webhook",
-        signingMode: draft.sender === "github" ? "github_hmac" : "bearer",
+        signingMode: draft.sender === "github" ? "github_hmac" : "app_webhook",
         setupPending: true,
       });
       createdRef.current = response.trigger;
@@ -521,7 +523,8 @@ function WebhookSettings({
     checkBaseline !== null && delivery && delivery.receivedAt !== checkBaseline;
   return (
     <div className="space-y-4">
-      {secret && (github || trigger.signingMode === "bearer") && (
+      <WebhookUrlWarning url={trigger.webhookUrl ?? ""} />
+      {secret && (github || trigger.signingMode === "bearer" || trigger.signingMode === "app_webhook" || trigger.signingMode === "fireflies_hmac") && (
         <AgentInstructions
           value={webhookAgentInstructions(
             github ? "github" : "custom",
@@ -529,6 +532,7 @@ function WebhookSettings({
             trigger.webhookUrl ?? "",
             secret,
             false,
+            trigger.signingMode === "bearer" ? "bearer" : trigger.signingMode === "fireflies_hmac" ? "fireflies_hmac" : "app_webhook",
           )}
         />
       )}
@@ -540,7 +544,7 @@ function WebhookSettings({
               label={
                 trigger.signingMode === "bearer"
                   ? "Authorization header value"
-                  : "Secret"
+                  : "Secret key"
               }
               value={
                 trigger.signingMode === "bearer" ? `Bearer ${secret}` : secret

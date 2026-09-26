@@ -162,10 +162,12 @@ export function isPaperclipRuntimeEnvKey(key: string): boolean {
 
 // PAPERCLIP_API_KEY is never accepted from adapter/user config env: the
 // harness-minted run token is the only source of Paperclip API identity.
+// PAPERCLIP_WAKE_PAYLOAD_JSON is retired: wake context travels in the prompt,
+// and a configured copy can exceed OS process-launch limits.
 // Other PAPERCLIP_*-named config keys are allowed as long as Paperclip has
 // not assigned the same key for the run (runtime vars always win).
 export function isForbiddenConfigEnvKey(key: string): boolean {
-  return key === "PAPERCLIP_API_KEY";
+  return key === "PAPERCLIP_API_KEY" || key === "PAPERCLIP_WAKE_PAYLOAD_JSON";
 }
 const PAPERCLIP_SKILL_ROOT_RELATIVE_CANDIDATES = [
   "../../skills",
@@ -821,6 +823,7 @@ type PaperclipWakePayload = {
   continuationSummary: PaperclipWakeContinuationSummary | null;
   planReviewContext: PaperclipWakePlanReviewContext | null;
   documentReviewContext: PaperclipWakeDocumentReviewContext | null;
+  dispositionRepair: PaperclipWakeLivenessContinuation | null;
   livenessContinuation: PaperclipWakeLivenessContinuation | null;
   taskWatchdog: PaperclipWakeTaskWatchdogContext | null;
   interactionId: string | null;
@@ -1761,6 +1764,7 @@ export function normalizePaperclipWakePayload(
           Boolean(entry),
         )
     : [];
+  const dispositionRepair = normalizePaperclipWakeLivenessContinuation(payload.dispositionRepair);
   const livenessContinuation = normalizePaperclipWakeLivenessContinuation(
     payload.livenessContinuation,
   );
@@ -1839,6 +1843,7 @@ export function normalizePaperclipWakePayload(
     !continuationSummary &&
     !planReviewContext &&
     !documentReviewContext &&
+    !dispositionRepair &&
     !livenessContinuation &&
     !taskWatchdog &&
     !checkboxSelection &&
@@ -1882,6 +1887,7 @@ export function normalizePaperclipWakePayload(
     planReviewContext,
     documentReviewContext,
     annotationDeltas,
+    dispositionRepair,
     livenessContinuation,
     taskWatchdog,
     interactionId: asString(payload.interactionId, "").trim() || null,
@@ -1919,7 +1925,7 @@ export function stringifyPaperclipWakePayload(
   value: unknown,
   options: {
     // For prompt-embedded copies of the payload on lanes where another prompt
-    // section already carries the issue description; the env-var copy should
+    // section already carries the issue description. Other serialized copies
     // stay complete.
     omitIssueDescription?: boolean;
   } = {},
@@ -1986,6 +1992,7 @@ function hasNormalizedPaperclipExternalChatContext(
     normalized.continuationSummary?.bodyTruncated ||
     normalized.planReviewContext ||
     normalized.documentReviewContext ||
+    normalized.dispositionRepair ||
     normalized.livenessContinuation ||
     normalized.taskWatchdog ||
     normalized.skillTest ||
@@ -2067,6 +2074,7 @@ function isNormalizedPaperclipExternalChatQuestionResponseTurn(
     normalized.continuationSummary?.bodyTruncated ||
     normalized.planReviewContext ||
     normalized.documentReviewContext ||
+    normalized.dispositionRepair ||
     normalized.livenessContinuation ||
     normalized.taskWatchdog ||
     normalized.skillTest ||
@@ -2150,6 +2158,16 @@ export function isAssignmentShapedPaperclipWakeReason(
   );
 }
 
+// Select at the actual provider attempt boundary so a failed resume restores
+// the original snapshot once when retrying with a fresh session.
+export function selectInitialCommunicationGuidance(
+  context: Record<string, unknown> | null | undefined,
+  options: { resumedSession?: boolean } = {},
+): string {
+  return options.resumedSession === true
+    ? "" : asString(context?.paperclipTaskCommunicationGuidance, "").trim();
+}
+
 // Picks the task-context markdown variant for adapters that inject it into the
 // prompt. Fresh sessions, assignment-shaped wakes, and recovery wakes get the
 // full brief; other resume deltas get the compact variant (description
@@ -2157,11 +2175,15 @@ export function isAssignmentShapedPaperclipWakeReason(
 // issue up. Falls back to the full variant when no compact one was provided.
 export function selectPaperclipTaskMarkdown(
   context: Record<string, unknown> | null | undefined,
-  options: { resumedSession?: boolean } = {},
+  options: { resumedSession?: boolean; includeCommunicationGuidance?: boolean } = {},
 ): string {
   const full = asString(context?.paperclipTaskMarkdown, "").trim();
   if (!full) return "";
-  if (options.resumedSession !== true) return full;
+  if (options.resumedSession !== true) {
+    const guidance = options.includeCommunicationGuidance === false
+      ? "" : selectInitialCommunicationGuidance(context, options);
+    return joinPromptSections([guidance, full]);
+  }
   const wake = normalizePaperclipWakePayload(context?.paperclipWake);
   if (!wake) return full;
   if (
@@ -2930,6 +2952,14 @@ function renderPaperclipWakePromptBody(
     if (normalized.continuationSummary.bodyTruncated) {
       lines.push("[continuation summary truncated]");
     }
+  }
+
+  if (normalized.dispositionRepair) {
+    const repair = normalized.dispositionRepair;
+    lines.push("", "Task disposition repair:",
+      `- attempt: ${repair.attempt}/${repair.maxAttempts}`,
+      `- source run: ${repair.sourceRunId}`,
+      `- instruction: ${repair.instruction}`);
   }
 
   if (normalized.livenessContinuation) {

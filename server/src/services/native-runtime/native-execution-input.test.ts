@@ -7,6 +7,28 @@ import { renderPaperclipWakePrompt } from "@paperclipai/adapter-utils/server-uti
 import { buildNativeExecutionInput } from "./native-execution-input.js";
 import { nativeRuntimeContextFixture } from "./runtime-context.test-fixture.js";
 
+describe("LCA-05 explicit native work mode", () => {
+  it.each(["standard", "planning", "ask"])("title and description cannot override %s mode", (workMode) => {
+    for (const text of ["Inspect files", "Making a plan", "Create a report", "Research proposal", "Implement now; no plan needed"]) {
+      const input = buildNativeExecutionInput({
+        companyId: "10000000-0000-4000-8000-000000000001",
+        runId: "50000000-0000-4000-8000-000000000005",
+        agentId: "30000000-0000-4000-8000-000000000003",
+        issue: { id: "20000000-0000-4000-8000-000000000002", identifier: "MODE-1", title: text, description: text, workMode },
+        taskPrompt: text,
+        workspace: { id: "50000000-0000-4000-8000-000000000005", cwd: "/workspace", repoUrl: null, repoRef: null, branchName: null },
+        normalizedSessionId: null,
+        planningContext: workMode === "planning" ? { documentId: null, baseRevisionId: null, baseRevisionNumber: 0, markdown: "", sha256: "a".repeat(64), reviewContext: {} } : null,
+        completionContract: { id: "70000000-0000-4000-8000-000000000007", sha256: `sha256:${"a".repeat(64)}`, schemaVersion: "paperclip.run-result.v1", contract: { revision: "1", objective: "Deliver the requested work", criteria: [{ id: "output", requirement: "Deliver the requested work" }] } },
+        runtimeContext: nativeRuntimeContextFixture(),
+      });
+      expect(input.task.workMode).toBe(workMode);
+      expect(input.executionMode).toBe(workMode === "planning" ? "plan" : "default");
+      expect(input.task.title).toBe(text);
+    }
+  });
+});
+
 describe("native execution input external-chat framing", () => {
   it.each([false, true])(
     "projects the authoritative selected answer into an attested native chat prompt (resumed: %s)",
@@ -61,6 +83,7 @@ describe("native execution input external-chat framing", () => {
         },
         taskPrompt:
           "Continue the user's original request with their selected answer.",
+        initialCommunicationGuidance: "Initial Slack communication preferences.",
         wakePayload,
         resumedSession,
         workspace: {
@@ -102,6 +125,9 @@ describe("native execution input external-chat framing", () => {
         ],
       };
       const input = buildNativeExecutionInput(args);
+      expect(input.initialCommunicationGuidance).toBe("Initial Slack communication preferences.");
+      // The runtime adds this only after deciding whether provider recovery succeeded.
+      expect(input.task.prompt).not.toContain("Initial Slack communication preferences.");
       expect(input.task.title).toBe("External chat follow-up");
       expect(input.task.prompt).toContain("Amber");
       expect(input.task.prompt).not.toContain("## Questions that need a user response");
@@ -451,6 +477,8 @@ describe("native execution input external-chat framing", () => {
     { provider: "codex", resumedSession: true },
     { provider: "acpx", resumedSession: false },
     { provider: "acpx", resumedSession: true },
+    { provider: "opencode", resumedSession: false },
+    { provider: "opencode", resumedSession: true },
   ] as const)("keeps question documentation in the tool on $provider (resumed: $resumedSession)", ({ provider, resumedSession }) => {
     const input = buildNativeExecutionInput({
       companyId: "10000000-0000-4000-8000-000000000001",
@@ -462,13 +490,17 @@ describe("native execution input external-chat framing", () => {
       normalizedSessionId: resumedSession ? "60000000-0000-4000-8000-000000000006" : null,
       provider, resumedSession,
       acpxAgent: "claude",
-      model: provider === "acpx" ? "claude-sonnet-5" : "gpt-5.6-sol",
+      model: provider === "acpx" ? "claude-sonnet-5" : provider === "opencode" ? "openai/gpt-5.5" : "gpt-5.6-sol",
       completionContract: {
         id: "70000000-0000-4000-8000-000000000007", sha256: `sha256:${"a".repeat(64)}`, schemaVersion: "paperclip.run-result.v1",
         contract: { revision: "1", objective: "Write a welcome after the user's answer", criteria: [{ id: "objective", requirement: "Use the selected tone" }] },
       },
       runtimeContext: nativeRuntimeContextFixture(),
     });
+    expect(input.provider).toMatchObject(provider === "acpx"
+      ? { kind: "acpx", permissionMode: "approve-all" }
+      : provider === "opencode" ? { kind: "opencode", permissionMode: "allow" }
+      : { kind: "codex", approvalPolicy: "never" });
     expect(input.task.prompt).not.toContain("## Questions that need a user response");
     expect(input.task.prompt).toContain("Use Paperclip's request_human_input for durable task questions.");
     expect(input.task.prompt).not.toContain("payload.questionSet");

@@ -246,6 +246,8 @@ export interface TaskChatMarkerItem {
   variant: "session_start" | "interrupted" | "turn_boundary";
   label: string;
   detail?: string;
+  /** False when the recorded run cannot be retried, even after the chat continues. */
+  retryable?: boolean;
   /** Renders the marker as a quiet disclosure row with detail beneath it. */
   collapsible?: boolean;
   /** Expected cancellation is neutral; unexpected failures remain destructive. */
@@ -253,6 +255,7 @@ export interface TaskChatMarkerItem {
   runId?: string;
   createdAtIso?: string;
   runHref?: string;
+  planHref?: string;
 }
 
 /** A second-tier live token/cost readout (ACP UsageUpdate). */

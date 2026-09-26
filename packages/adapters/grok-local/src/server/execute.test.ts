@@ -160,6 +160,19 @@ async function makeCtx(runId: string, cwd: string): Promise<AdapterExecutionCont
 }
 
 describe("grok_local execute", () => {
+  it.each(["grok-4.7", "grok-4.6"])("forwards the explicit %s model and xhigh effort", async (model) => {
+    const root = await makeTempRoot();
+    const ctx = await makeCtx("model-selection", root);
+    ctx.config = { cwd: root, model, reasoningEffort: "xhigh" };
+    runProcessMock.mockResolvedValue(makeSuccessfulRunResult());
+
+    await execute(ctx);
+
+    const args = runProcessMock.mock.calls[0][3] as string[];
+    expect(args[args.indexOf("--model") + 1]).toBe(model);
+    expect(args[args.indexOf("--reasoning-effort") + 1]).toBe("xhigh");
+  });
+
   beforeEach(() => {
     mocks.state.isRemote = false;
     mocks.state.prepareRuntimeResult = null;
@@ -744,12 +757,21 @@ describe("grok_local execute", () => {
       expect(await pathExists(stagedDir)).toBe(false);
     });
 
-    it("removes the staged home when the workspace restore rejects during teardown", async () => {
+    it.each(["completed", "failed", "timed_out"])("preserves %s output and removes the staged home when restore fails", async (state) => {
       delete process.env.XAI_API_KEY;
       mocks.state.isRemote = true;
       await seedHostGrokAuth("{}");
       let stagedDir = "";
-      runProcessMock.mockImplementation(async () => makeSuccessfulRunResult());
+      runProcessMock.mockImplementation(async () => ({
+        ...makeSuccessfulRunResult(),
+        exitCode: state === "failed" ? 2 : 0,
+        timedOut: state === "timed_out",
+        stderr: state === "failed" ? "Model request failed." : "",
+        stdout: [JSON.stringify({ type: "text", data: "Saved output." }), JSON.stringify({
+          type: "end", sessionId: "sess-1", requestId: "req-1", stopReason: state === "completed" ? "EndTurn" : null,
+          usage: { input_tokens: 4, output_tokens: 9 },
+        })].join("\n"),
+      }));
       prepareRuntimeMock.mockImplementationOnce(async (input: { assets?: Array<{ localDir: string }> }) => {
         stagedDir = input.assets?.[0]?.localDir ?? "";
         return {
@@ -761,9 +783,17 @@ describe("grok_local execute", () => {
         };
       });
 
-      await expect(execute(await makeCtx("run-remote-teardown-restore-reject", await makeTempRoot()))).rejects.toThrow(
-        "restore failed",
-      );
+      const result = await execute(await makeCtx("run-remote-teardown-restore-reject", await makeTempRoot()));
+      expect(result).toMatchObject({
+        errorCode: "workspace_restore_failed",
+        sessionId: "sess-1",
+        summary: "Saved output.",
+        usage: { inputTokens: 4, outputTokens: 9 },
+        resultJson: { workspaceRestoreFailure: "restore_failed", requestId: "req-1", finalResponseRecorded: state === "completed",
+          executionBeforeRestore: { exitCode: state === "failed" ? 2 : 0, timedOut: state === "timed_out" } },
+      });
+      if (state === "failed") expect(result.errorMessage).toContain("Model request failed.");
+      if (state === "timed_out") expect(result.errorMessage).toContain("Timed out after");
 
       expect(stagedDir).not.toBe("");
       expect(await pathExists(stagedDir)).toBe(false);

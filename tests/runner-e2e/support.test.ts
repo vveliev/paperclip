@@ -18,7 +18,7 @@ import {
 } from "./harness-env.js";
 import { runnerExecutionById, runnerMatrix } from "./catalog.js";
 import { assertEmbeddedDatabaseIsolation } from "./instance-isolation.js";
-import { evaluateMatchers } from "./matchers.js";
+import { evaluateMatchers, persistedFinalRunMessage } from "./matchers.js";
 import {
   assertSecretFree,
   findSecretLeak,
@@ -38,6 +38,7 @@ import {
 } from "./ports.js";
 import {
   acceptedPlanSessionResetFailures,
+  collectRunEvents,
   hasTerminalMalformedPlanConfirmation,
   isControlPlaneGovernedResponseWait,
   isNonExecutingReviewFenceRun,
@@ -48,6 +49,47 @@ import {
 import { runnerE2EWebServerCommand } from "./web-server-command.js";
 
 const cleanupDirectories: string[] = [];
+
+describe("complete run event evidence", () => {
+  const page = Array.from({ length: 1000 }, (_, i) => ({ seq: i + 1, eventType: "item.delta" }));
+  it("reads completion events beyond the first 1000 rows", async () => {
+    const terminal = ["run.result.proposed", "run.result.accepted", "run.terminal"]
+      .map((eventType, i) => ({ seq: 1001 + i, eventType }));
+    const load = vi.fn().mockResolvedValueOnce(page).mockResolvedValueOnce(terminal);
+    const events = await collectRunEvents(load);
+    expect(events).toEqual([...page, ...terminal]);
+    expect(load.mock.calls).toEqual([[0, 1000], [1000, 1000]]);
+  });
+  it("checks for another page even at an exact page boundary", async () => {
+    const load = vi.fn().mockResolvedValueOnce(page).mockResolvedValueOnce([]);
+    expect(await collectRunEvents(load)).toEqual(page);
+    expect(load).toHaveBeenCalledTimes(2);
+  });
+  it.each([
+    null, {}, [{ eventType: "run.terminal" }], [{ seq: 0 }], [{ seq: -1 }],
+    [{ seq: 1.5 }], [{ seq: "1" }], [{ seq: NaN }], [{ seq: Infinity }],
+    [{ seq: 2 }, { seq: 1 }], [{ seq: 1 }, { seq: 1 }], [...page, { seq: 1001 }],
+  ])("rejects malformed evidence page %#", async (malformed) => {
+    await expect(collectRunEvents(async () => malformed)).rejects.toThrow("Run event evidence");
+  });
+  it("rejects a repeated cursor instead of accepting duplicate events", async () => {
+    const load = vi.fn().mockResolvedValue(page);
+    await expect(collectRunEvents(load)).rejects.toThrow("non-increasing sequence");
+    expect(load).toHaveBeenCalledTimes(2);
+  });
+  it("propagates a missing later page without returning partial evidence", async () => {
+    const load = vi.fn().mockResolvedValueOnce(page).mockRejectedValueOnce(new Error("Unavailable"));
+    await expect(collectRunEvents(load)).rejects.toThrow("Unavailable");
+  });
+  it("fails closed when a stream never ends within the bounded capture", async () => {
+    const load = vi.fn(async (afterSeq: number) => page.map((event) => ({ ...event, seq: event.seq + afterSeq })));
+    await expect(collectRunEvents(load)).rejects.toThrow("refusing incomplete evidence");
+    expect(load).toHaveBeenCalledTimes(100);
+  });
+});
+
+
+
 afterEach(async () => {
   vi.unstubAllEnvs();
   vi.unstubAllGlobals();
@@ -705,6 +747,16 @@ describe("runner E2E run observations", () => {
 });
 
 describe("runner E2E failure policy", () => {
+  it("classifies sandbox file-transfer RPC deadlines without hiding other RPC defects", () => {
+    for (const method of ["environmentSyncIn", "environmentSyncOut"]) {
+      expect(classifyFailure(new Error(
+        `Stopped waiting for everyday recover-controller settled: native execution failed native_session_interrupted: RPC call "${method}" timed out after 330000ms`,
+      ))).toBe("transient_infrastructure");
+    }
+    expect(classifyFailure(new Error('RPC call "run.attach" timed out after 330000ms')))
+      .toBe("candidate_failure");
+  });
+
   it.each([
     "native_session_close_unrecoverable: provider transport failed",
     "Provider connection closed: runner did not durably suspend before checkpoint",
@@ -1308,5 +1360,81 @@ describe("runner E2E macOS shared-memory cleanup", () => {
         creatorPid: 52172,
       },
     ]);
+  });
+});
+
+
+describe("persisted final response selection", () => {
+  const comments = [
+    { id: "attachment-comment", body: "Prepared file for this response.", createdByRunId: "run-1" },
+    { id: "reply", body: "FINAL", createdByRunId: "run-1" },
+    { id: "other-run", body: "unrelated", createdByRunId: "run-2" },
+  ];
+  const run = { id: "run-1", resultJson: { presentationDecision: { commentId: "reply" } } };
+  it("grades the real final comment independently from an attachment's preparation comment", () => {
+    expect(persistedFinalRunMessage(comments, run)).toBe("FINAL");
+  });
+  it("fails closed when the selected final comment is missing or belongs to another run", () => {
+    expect(persistedFinalRunMessage(comments.slice(0, 1), run)).toBe("");
+    expect(persistedFinalRunMessage(comments, { ...run, resultJson: { presentationDecision: { commentId: "other-run" } } })).toBe("");
+  });
+  it("keeps legacy fallback and does not replace absent visible text with a summary", () => {
+    expect(persistedFinalRunMessage(comments, { id: "run-1" })).toBe("Prepared file for this response.\nFINAL");
+    expect(persistedFinalRunMessage([], { id: "run-1", resultJson: { summary: "FINAL" } })).toBe("");
+  });
+});
+
+describe("warm continuity grading scope", () => {
+  it("checks workspace bytes, lifecycle, and ordered turn markers without exact response formatting", () => {
+    const execution = runnerMatrix.find((cell) => cell.task.flow === "warm_three_turn")!;
+    const matchers = execution.task.buildMatchers("test-nonce", execution);
+    expect(matchers).toContainEqual({
+      kind: "message_occurrences", expected: "PAPERCLIP_E2E_WARM_T1_test-nonce", count: 1,
+    });
+    expect(matchers).toContainEqual({
+      kind: "message_occurrences", expected: "PAPERCLIP_E2E_WARM_T2_test-nonce", count: 1,
+    });
+    expect(matchers).toContainEqual({
+      kind: "message_occurrences", expected: "PAPERCLIP_E2E_WARM_T3_test-nonce", count: 1,
+    });
+    expect(matchers).toContainEqual({
+      kind: "message_ordered",
+      expected: [
+        "PAPERCLIP_E2E_WARM_T1_test-nonce",
+        "PAPERCLIP_E2E_WARM_T2_test-nonce",
+        "PAPERCLIP_E2E_WARM_T3_test-nonce",
+      ],
+    });
+    expect(matchers).toContainEqual({
+      kind: "file_exact", path: "daytona-warm-test-nonce.txt",
+      expected: "T1-test-nonce\nT2-test-nonce\nT3-test-nonce\n",
+    });
+    expect(matchers).toContainEqual({ kind: "issue_status", expected: "done" });
+    const hello = runnerMatrix.find((cell) => cell.task.id === "hello-complete")!;
+    expect(hello.task.buildMatchers("test-nonce", hello).some((matcher) => matcher.kind === "message_exact")).toBe(true);
+  });
+
+  it("accepts warm-turn prose while rejecting missing, duplicate, or out-of-order markers", async () => {
+    const execution = runnerMatrix.find((cell) => cell.task.flow === "warm_three_turn")!;
+    const matchers = execution.task.buildMatchers("test-nonce", execution)
+      .filter((matcher) => matcher.kind.startsWith("message_"));
+    const passing = await evaluateMatchers(matchers, {
+      message: [
+        "Turn one is complete: PAPERCLIP_E2E_WARM_T1_test-nonce.",
+        "Turn two is complete: PAPERCLIP_E2E_WARM_T2_test-nonce.",
+        "Turn three is complete: PAPERCLIP_E2E_WARM_T3_test-nonce.",
+      ].join("\n"),
+    });
+    expect(passing.every((result) => result.passed)).toBe(true);
+
+    const invalidMessages = [
+      "PAPERCLIP_E2E_WARM_T1_test-nonce PAPERCLIP_E2E_WARM_T1_test-nonce PAPERCLIP_E2E_WARM_T2_test-nonce PAPERCLIP_E2E_WARM_T3_test-nonce",
+      "PAPERCLIP_E2E_WARM_T1_test-nonce PAPERCLIP_E2E_WARM_T3_test-nonce",
+      "PAPERCLIP_E2E_WARM_T3_test-nonce PAPERCLIP_E2E_WARM_T2_test-nonce PAPERCLIP_E2E_WARM_T1_test-nonce",
+    ];
+    for (const message of invalidMessages) {
+      const results = await evaluateMatchers(matchers, { message });
+      expect(results.some((result) => !result.passed)).toBe(true);
+    }
   });
 });

@@ -54,7 +54,7 @@ import {
 import { createWorkspaceRestoreTeardown } from "@paperclipai/adapter-utils/workspace-restore-teardown";
 import { buildLocalAdapterTestProbeEnv } from "./probe-env.js";
 import { detectClaudeLoginRequired, extractClaudeRetryNotBefore, isClaudeProviderQuotaError, parseClaudeStreamJson } from "./parse.js";
-import { buildClaudeProbePermissionArgs } from "./permissions.js";
+import { buildClaudeProbePermissionArgs, claudeSandboxPermissionEnv } from "./permissions.js";
 import { ADAPTER_AUTH_MISSING_CHECK_CODE } from "./auth-check.js";
 import { resolveClaudeModel, SANDBOX_INSTALL_COMMAND } from "../index.js";
 
@@ -324,7 +324,10 @@ export function classifyClaudeTerminalSessionFailure(
   // Only the provider's quota wording qualifies for a quota wait.
   if (failure.category !== "limit") return null;
   const surface = { errorMessage: [failure.title, failure.details].filter(Boolean).join("\n") };
-  if (!isClaudeProviderQuotaError(surface)) return null;
+  // claude-agent-acp uses this exact quota_exhausted fallback when no provider
+  // title is available. It does not match the CLI's usage-limit wording.
+  const isQuotaFallback = failure.title === "The Claude account has no available quota.";
+  if (!isQuotaFallback && !isClaudeProviderQuotaError(surface)) return null;
   const retryNotBefore = extractClaudeRetryNotBefore(surface, now)?.toISOString();
   return {
     errorCode: "provider_quota",
@@ -647,6 +650,9 @@ export async function probeClaudeAcpSandboxLogin(input: {
     cwd = asString(config.cwd, process.cwd());
   }
 
+  Object.assign(env, claudeSandboxPermissionEnv({
+    dangerouslySkipPermissions: asBoolean(config.dangerouslySkipPermissions, true), targetIsSandbox,
+  }));
   const args = ["--print", "-", "--output-format", "stream-json", "--verbose"];
   if (config.managedAiConnection) args.push("--setting-sources", "user");
   args.push(
