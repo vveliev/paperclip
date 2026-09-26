@@ -378,8 +378,25 @@ describe("sandbox callback bridge", () => {
     const directories = sandboxCallbackBridgeDirectories(queueDir);
     const processed: string[] = [];
 
+    const client = createFileSystemSandboxCallbackBridgeQueueClient();
+    let releaseFirstPoll!: () => void;
+    const firstPollGate = new Promise<void>((resolve) => { releaseFirstPoll = resolve; });
+    let markFirstPoll!: () => void;
+    const firstPollStarted = new Promise<void>((resolve) => { markFirstPoll = resolve; });
+    let firstPoll = true;
     const worker = await startSandboxCallbackBridgeWorker({
-      client: createFileSystemSandboxCallbackBridgeQueueClient(),
+      client: {
+        ...client,
+        listJsonFiles: async (directory) => {
+          const files = await client.listJsonFiles(directory);
+          if (firstPoll) {
+            firstPoll = false;
+            markFirstPoll();
+            await firstPollGate;
+          }
+          return files;
+        },
+      },
       queueDir,
       authorizeRequest: async () => null,
       handleRequest: async (request) => {
@@ -391,6 +408,8 @@ describe("sandbox callback bridge", () => {
         };
       },
     });
+
+    await firstPollStarted;
 
     await writeFile(
       path.posix.join(directories.requestsDir, "req-a.json"),
@@ -419,7 +438,9 @@ describe("sandbox callback bridge", () => {
       "utf8",
     );
 
-    await worker.stop({ drainTimeoutMs: 1_000 });
+    const stopped = worker.stop({ drainTimeoutMs: 1_000 });
+    releaseFirstPoll();
+    await stopped;
 
     expect(processed).toEqual(["req-a", "req-b"]);
     await expect(readFile(path.posix.join(directories.responsesDir, "req-a.json"), "utf8")).resolves.toContain("\"req-a\"");

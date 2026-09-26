@@ -116,27 +116,26 @@ function collectWakeupReasonLiterals(): { reason: string; files: string[] }[] {
       if (!callMatch || callMatch.index === undefined) continue;
       const openIdx = m.index + callMatch.index + callMatch[0].length - 1;
       const block = extractBalancedParens(text, openIdx);
+      const reasonExpression = block.match(/reason\s*:\s*([^,}]+)/)?.[1];
       const reasonMatch = block.match(/reason\s*:\s*("([^"]+)"|[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)/);
       if (!reasonMatch) continue;
 
       const relFile = path.relative(REPO_ROOT, file);
-      if (reasonMatch[2]) {
-        if (!found.has(reasonMatch[2])) found.set(reasonMatch[2], new Set());
-        found.get(reasonMatch[2])!.add(relFile);
-        continue;
-      }
-
-      const identifier = reasonMatch[1];
-      if (constMap.has(identifier)) {
-        const literal = constMap.get(identifier)!;
-        if (!found.has(literal)) found.set(literal, new Set());
-        found.get(literal)!.add(relFile);
-      } else if (KNOWN_DYNAMIC_REASON_SOURCES.has(identifier)) {
-        // Deliberately excluded -- see KNOWN_DYNAMIC_REASON_SOURCES above.
-        continue;
-      } else {
-        if (!unresolved.has(identifier)) unresolved.set(identifier, new Set());
-        unresolved.get(identifier)!.add(relFile);
+      // Ignore a conditional's predicate: only its result branches reach the
+      // reason column. Resolve every branch, including mixed constants/literals.
+      const expression = reasonExpression ?? reasonMatch[1];
+      const questionIndex = expression.indexOf("?");
+      const valueExpression = questionIndex < 0 ? expression : expression.slice(questionIndex + 1);
+      for (const token of valueExpression.matchAll(/"([^"]+)"|[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*/g)) {
+        const identifier = token[0];
+        const literal = token[1] ?? constMap.get(identifier);
+        if (literal !== undefined) {
+          if (!found.has(literal)) found.set(literal, new Set());
+          found.get(literal)!.add(relFile);
+        } else if (!KNOWN_DYNAMIC_REASON_SOURCES.has(identifier)) {
+          if (!unresolved.has(identifier)) unresolved.set(identifier, new Set());
+          unresolved.get(identifier)!.add(relFile);
+        }
       }
     }
   }

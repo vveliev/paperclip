@@ -1502,6 +1502,9 @@ export async function startSandboxCallbackBridgeWorker(input: {
       // keeps probing for recovery.
       let consecutivePollFailures = 0;
       while (true) {
+        // A poll started before stop may return an empty snapshot from before
+        // the caller queued its final requests. Drain requires a fresh poll.
+        const pollingDuringStop = stopping;
         let fileNames: string[];
         try {
           fileNames = await withTimeout(
@@ -1541,7 +1544,8 @@ export async function startSandboxCallbackBridgeWorker(input: {
         if (actionableFileNames.length === 0) {
           lastSuccessfulIterationAt = Date.now();
           if (stopping) {
-            break;
+            if (pollingDuringStop || Date.now() >= stopDeadline) break;
+            continue;
           }
           await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
           continue;
