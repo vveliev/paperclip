@@ -18404,7 +18404,12 @@ export function heartbeatService(
     const cutoff = new Date(Date.now() - opts.backoffMs);
 
     const rows = await db
-      .select({ lease: environmentLeases })
+      .select({
+        lease: environmentLeases,
+        processPid: heartbeatRuns.processPid,
+        processGroupId: heartbeatRuns.processGroupId,
+        processStartedAt: heartbeatRuns.processStartedAt,
+      })
       .from(environmentLeases)
       .leftJoin(
         heartbeatRuns,
@@ -18426,7 +18431,8 @@ export function heartbeatService(
       .limit(ORPHANED_ACTIVE_LEASE_SWEEP_PAGE_SIZE);
 
     let recovered = 0;
-    for (const { lease } of rows) {
+    for (const row of rows) {
+      const { lease } = row;
       // A provider resource id names one physical sandbox. A different lease
       // row can still hold that same resource in a live status, so this sweep
       // must not tear down a sandbox that a different lease still owns.
@@ -18454,6 +18460,41 @@ export function heartbeatService(
           await deferOrphanedActiveLease(lease.id);
           continue;
         }
+      }
+
+      // Local execution leases do not own a remote sandbox. If the heartbeat
+      // process died between terminalizing its run and releasing its lease,
+      // there is no provider resource to destroy. Recover the lease directly,
+      // but only after confirming the recorded local process identity is gone.
+      // This prevents the pending-cleanup sandbox path from repeatedly trying
+      // to dispatch provider "local" to a driver that has no sandbox teardown.
+      if (
+        lease.leasePolicy === "ephemeral" &&
+        lease.provider === "local" &&
+        lease.providerLeaseId === null &&
+        lease.metadata?.driver === "local"
+      ) {
+        let processAlive = isProcessAlive(row.processPid);
+        if (processAlive && row.processPid && row.processStartedAt) {
+          const observedStartedAt = await readProcessStartedAt(row.processPid).catch(() => null);
+          if (
+            observedStartedAt &&
+            new Date(observedStartedAt).getTime() !== row.processStartedAt.getTime()
+          ) {
+            processAlive = false;
+          }
+        }
+        const processGroupAlive = isProcessGroupAlive(row.processGroupId);
+        if (processAlive || processGroupAlive) {
+          await deferOrphanedActiveLease(lease.id);
+          continue;
+        }
+        const released = await environmentsSvc.releaseLease(lease.id, "expired", {
+          failureReason: "orphaned_local_lease_recovered",
+          cleanupStatus: "success",
+        });
+        if (released) recovered += 1;
+        continue;
       }
 
       // Keep the row's existing updatedAt value. The select above already

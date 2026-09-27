@@ -72,7 +72,7 @@ describeEmbeddedPostgres("heartbeat sweepOrphanedActiveLeases", () => {
     await tempDb?.cleanup();
   });
 
-  async function seedCompanyAgentAndEnvironment() {
+  async function seedCompanyAgentAndEnvironment(input: { environmentDriver?: "local" | "sandbox" } = {}) {
     const companyId = randomUUID();
     const agentId = randomUUID();
     const environmentId = randomUUID();
@@ -96,10 +96,10 @@ describeEmbeddedPostgres("heartbeat sweepOrphanedActiveLeases", () => {
     await db.insert(environments).values({
       id: environmentId,
       companyId,
-      name: "Fake Sandbox",
-      driver: "sandbox",
+      name: input.environmentDriver === "local" ? "Local" : "Fake Sandbox",
+      driver: input.environmentDriver ?? "sandbox",
       status: "active",
-      config: { provider: "fake", image: "ubuntu:24.04" },
+      config: input.environmentDriver === "local" ? {} : { provider: "fake", image: "ubuntu:24.04" },
     });
     return { companyId, agentId, environmentId };
   }
@@ -127,8 +127,10 @@ describeEmbeddedPostgres("heartbeat sweepOrphanedActiveLeases", () => {
     heartbeatRunId: string | null;
     updatedAt: Date;
     provider?: string;
-    providerLeaseId?: string;
+    providerLeaseId?: string | null;
     status?: string;
+    leasePolicy?: "ephemeral" | "reuse_by_environment";
+    metadata?: Record<string, unknown>;
   }): Promise<string> {
     const id = randomUUID();
     await db.insert(environmentLeases).values({
@@ -137,9 +139,10 @@ describeEmbeddedPostgres("heartbeat sweepOrphanedActiveLeases", () => {
       environmentId: input.environmentId,
       heartbeatRunId: input.heartbeatRunId,
       status: input.status ?? "active",
-      leasePolicy: "reuse_by_environment",
+      leasePolicy: input.leasePolicy ?? "reuse_by_environment",
       provider: input.provider ?? "fake",
-      providerLeaseId: input.providerLeaseId ?? `sandbox://fake/${id}`,
+      providerLeaseId: input.providerLeaseId === null ? null : input.providerLeaseId ?? `sandbox://fake/${id}`,
+      metadata: input.metadata,
       acquiredAt: input.updatedAt,
       lastUsedAt: input.updatedAt,
       createdAt: input.updatedAt,
@@ -208,6 +211,30 @@ describeEmbeddedPostgres("heartbeat sweepOrphanedActiveLeases", () => {
     expect(result).toEqual({ recovered: 1 });
     const row = await leaseRow(leaseId);
     expect(row?.status).toBe("pending_cleanup");
+  });
+
+  it("settles a dead local orphan without routing it through sandbox cleanup", async () => {
+    const { companyId, agentId, environmentId } = await seedCompanyAgentAndEnvironment({ environmentDriver: "local" });
+    const runId = await insertHeartbeatRun({ companyId, agentId, status: "succeeded" });
+    const leaseId = await insertActiveLease({
+      companyId,
+      environmentId,
+      heartbeatRunId: runId,
+      updatedAt: oldEnough(),
+      provider: "local",
+      providerLeaseId: null,
+      leasePolicy: "ephemeral",
+      metadata: { driver: "local" },
+    });
+
+    const result = await heartbeatService(db).sweepOrphanedActiveLeases({ backoffMs: 5 * 60 * 1000 });
+
+    expect(result).toEqual({ recovered: 1 });
+    await expect(leaseRow(leaseId)).resolves.toMatchObject({
+      status: "expired",
+      cleanupStatus: "success",
+      failureReason: "orphaned_local_lease_recovered",
+    });
   });
 
   it("test_keeps_an_active_lease_when_its_run_is_running", async () => {
