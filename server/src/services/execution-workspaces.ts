@@ -2450,13 +2450,13 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           command: projectWorkspace?.cleanupCommand ?? null,
         },
       ];
-      for (const action of configuredCleanupCommands) {
+      for (const action of isSharedWorkspace ? [] : configuredCleanupCommands) {
         if (!action.command) continue;
         plannedActions.push(action);
       }
 
       const teardownCommand = config?.teardownCommand ?? projectPolicy?.workspaceStrategy?.teardownCommand ?? null;
-      if (teardownCommand) {
+      if (teardownCommand && !isSharedWorkspace) {
         plannedActions.push({
           kind: "teardown_command",
           label: "Run teardown command",
@@ -2465,7 +2465,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         });
       }
 
-      if (executionWorkspace.providerType === "git_worktree" && workspacePath) {
+      if (!isSharedWorkspace && executionWorkspace.providerType === "git_worktree" && workspacePath) {
         plannedActions.push({
           kind: "git_worktree_remove",
           label: "Remove git worktree",
@@ -2474,7 +2474,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         });
       }
 
-      if (git?.createdByRuntime && executionWorkspace.branchName) {
+      if (!isSharedWorkspace && git?.createdByRuntime && executionWorkspace.branchName) {
         plannedActions.push({
           kind: "git_branch_delete",
           label: "Delete runtime-created branch",
@@ -2483,7 +2483,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         });
       }
 
-      if (executionWorkspace.providerType === "local_fs" && git?.createdByRuntime && workspacePath) {
+      if (!isSharedWorkspace && executionWorkspace.providerType === "local_fs" && git?.createdByRuntime && workspacePath) {
         const resolvedWorkspacePath = path.resolve(workspacePath);
         const resolvedProjectWorkspacePath = projectWorkspace?.cwd ? path.resolve(projectWorkspace.cwd) : null;
         const containsProjectWorkspace = resolvedProjectWorkspacePath
