@@ -4010,6 +4010,7 @@ async function deleteGitBranchAtVerifiedTip(input: {
 export async function cleanupExecutionWorkspaceArtifacts(input: {
   workspace: {
     id: string;
+    mode?: string;
     cwd: string | null;
     providerType: string;
     providerRef: string | null;
@@ -4036,6 +4037,11 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
 }) {
   const warnings: string[] = [];
   const workspacePath = input.workspace.providerRef ?? input.workspace.cwd;
+  await input.assertSafeToCleanup?.();
+  if (input.workspace.mode === "shared_workspace") {
+    // Shared executions own a session record, not their project's checkout.
+    return { cleanedPath: workspacePath, cleaned: true, warnings };
+  }
   const repoRoot = input.workspace.providerType === "git_worktree" && workspacePath
     ? await resolveGitRepoRootForWorkspaceCleanup(
       workspacePath,
@@ -4048,7 +4054,6 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
   });
   // Callers can require the workspace to match an assessed snapshot before
   // cleanup begins. Destructive paths recheck immediately before removal.
-  await input.assertSafeToCleanup?.();
   let worktreeInstancePointer: WorktreeInstancePointer | null = null;
   let expectedWorktreeInstanceId: string | null = null;
   if (input.workspace.providerType === "git_worktree" && workspacePath) {

@@ -53,7 +53,7 @@ Execution workspaces are durable until a human closes them.
 
 - The UI can archive an execution workspace.
 - Closing an execution workspace stops its runtime services and cleans up its workspace artifacts when allowed.
-- Shared workspaces that point at the project primary checkout are treated more conservatively during cleanup than disposable isolated workspaces.
+- Closing a shared workspace archives its session record and stops any attached runtime services. It keeps the project checkout, Git worktree, branch, and project cleanup commands for other sessions.
 
 ## Resolved workspace logic during heartbeat runs
 
