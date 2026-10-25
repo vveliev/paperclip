@@ -669,6 +669,8 @@ export interface PluginEnvironmentAcquireLeaseParams extends PluginEnvironmentDr
 }
 
 export interface PluginEnvironmentResumeLeaseParams extends PluginEnvironmentDriverBaseParams {
+  /** New run authority for a retained task; omitted by legacy environment consumers. */
+  runId?: string;
   providerLeaseId: string;
   leaseMetadata?: Record<string, unknown>;
 }

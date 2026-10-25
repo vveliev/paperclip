@@ -23,9 +23,11 @@ bounded `read_file` operation for attachments and deliverables.
 
 Core supports per-turn workspace sessions with Codex, OpenCode, and ACPX.
 OpenCode and ACPX require the existing qualified provider profiles.
-Workspace-free providers and warm process retention are not supported here.
+Workspace-free providers are not supported here. Codex warm retention is opt-in through `warmTaskVersion: 1`; ACPX and OpenCode remain per-turn.
 The plugin owns project workspace preparation. Core does not prepare or reuse
 a Core Git worktree for a task-only environment.
+Selecting a plain task directory does not add redundant default configuration.
+Retaining that directory does not itself change the run configuration.
 For plugin-backed project storage, Core uses the workspace provider contract.
 The storage plugin must also provide the selected execution environment.
 Its declared workspace modes and strategies remain in effect.
@@ -161,3 +163,49 @@ Recovery receives the original run and agent context.
 The existing agent-independent `inspect` and `remove` operations continue to
 protect storage maintenance. Providers that do not declare finalization version 1
 retain the inspection-based completion path. No stored binding migration is required.
+
+## Codex warm task retention
+
+A driver declares `warmTaskVersion: 1`, implements `onEnvironmentResumeLease`,
+and returns `warmTaskVersion: 1` from `describe` only when its execution host
+supports authorized run attachment. Select the agent's warm lifecycle or set
+`runnerLifecycleMode: "warm"` and `runnerIdleTimeoutMs` on its plugin environment.
+Core requires an explicitly selected account. Setup probes remain ephemeral.
+
+Plugin task execution does not create a Core-managed GitHub broker. Warm reuse
+and restart recovery use the same broker-ownership rule as initial startup.
+Project authorization is still checked for each new run.
+
+A Launcher task owns one Runner process, independently of Core heartbeat runs.
+Successful warm run completion retains the task and its mounts. The reuse
+fingerprint includes the authorized project set; changing it retires the previous
+task before checkpoint recovery. Adoption and each warm handoff require a current,
+configuration-bound project-auth check against the exact retained mount scope. Core atomically
+hands its retained provider identity to one new run lease, revalidates current
+project authentication, prepares the new run's resources, and uses PRP
+`run.attach`. Preparation includes the exact `priorIdentity` and stable
+`accountIdentity`. The provider journals that transition idempotently before
+allowing the new authority. The original ingress address remains unchanged.
+Runner accepts `connection: { mode: "external" }` on warm attachment to preserve
+the process owner's listener and TLS settings while rotating the run identity.
+
+Idle retirement suspends and stops Runner, saves its exact checkpoint, writes
+credentials through the durable lease handoff, then completes the provider task.
+Core permits read-only suspension proof for the exact saved identity of a
+successful warm run after its reuse lease is retained or superseded. This does
+not authorize new work or file access through that lease.
+Temporary credential homes are not needed after the originating run ends.
+Termination receipts cover all run leases that owned the retired physical task.
+A stopped task gets a new provider task ID for checkpoint resumption. Inspection
+precedes in-memory session selection so a replacement cannot inherit the stopped
+session. Core saves the fresh provider expiry and forwards and enforces any
+caller-imposed deadline. A missing
+or unreachable computer never authorizes a replacement. Controller recovery can
+adopt a verified surviving idle process through its authenticated PRP connection;
+ambiguous transitions remain fenced by the existing durable recovery checks.
+
+Changes to account, credential generation, workspace, runtime or process policy
+retire the old owner before recovery. A new authority epoch archives the stopped
+checkpoint under its stable archive key and preserves provider session files.
+Warm status monitoring relies on PRP after startup and does not poll an idle
+Launcher. General ACPX warm support is deliberately excluded.

@@ -20,9 +20,10 @@ import { realizeExecutionWorkspace, ensurePersistedExecutionWorkspaceAvailable }
 import { executionWorkspaceService } from "../services/execution-workspaces.js";
 import { prepareProjectRepositoryWorkspaces, mergeExecutionWorkspaceMetadataForPersistence } from "../services/heartbeat/workspaces.js";
 import { describeGitExpirationFailure, expireReconstructableGitWorkspace } from "../services/git-workspace-expiration.js";
+import { nestedWorktreeBranchPrefix, restoreNestedRepositoryWorktree, withNestedRepositoryBaseLock } from "../services/nested-repository-worktrees.js";
 import * as activityLog from "../services/activity-log.js";
 import { readGitCacheRestoration } from "../services/git-workspace-restoration.js";
-import { gitCacheExpirationLockLocations, readGitCacheExpiration } from "../services/git-workspace-restoration.js";
+import { assertReproducibleManagedCheckout, gitCacheExpirationLockLocations, readGitCacheExpiration } from "../services/git-workspace-restoration.js";
 
 const gitEnv = { ...process.env, GIT_AUTHOR_NAME: "Fixture", GIT_AUTHOR_EMAIL: "fixture@example.test",
   GIT_COMMITTER_NAME: "Fixture", GIT_COMMITTER_EMAIL: "fixture@example.test", GIT_TERMINAL_PROMPT: "0" };
@@ -153,7 +154,7 @@ describeEmbeddedPostgres("reconstructable Git expiration", () => {
     expect(await fs.readFile(settingsPath, "utf8")).toBe("later task settings\n");
   });
 
-  async function nestedFixture(managed = true) {
+  async function nestedFixture(managed = true, shared = false) {
     const f = await fixture(managed, !managed, true);
     const nestedSource = path.join(path.dirname(f.source), "nested-author");
     const nestedRemote = path.join(path.dirname(f.source), "nested.git");
@@ -166,7 +167,8 @@ describeEmbeddedPostgres("reconstructable Git expiration", () => {
     git(path.dirname(nestedSource), "clone", "--bare", nestedSource, nestedRemote);
     const [source] = await db.insert(projectWorkspaces).values({ companyId: f.companyId, projectId: f.projectId!,
       name: "Nested repository", repoUrl: pathToFileURL(nestedRemote).href, repoRef: "main" }).returning();
-    const preparation = { cwd: f.cwd, anchorRepoUrl: f.base.repoUrl, workspaces: [source!], resolveGitAuth: async () => null };
+    const preparation = { cwd: f.cwd, anchorRepoUrl: f.base.repoUrl, workspaces: [source!], resolveGitAuth: async () => null,
+      ...(shared ? { sharedBase: { companyId: f.companyId, projectId: f.projectId! } } : {}) };
     const [nested] = await prepareProjectRepositoryWorkspaces(preparation);
     const settings = Buffer.from('{"permissions":{"allow":["Read(/user/path)"]},"env":{"LOCAL_SETTING":"preserve-me"}}\n');
     const settingsPath = path.join(f.cwd, ".claude/settings.local.json");
@@ -175,7 +177,8 @@ describeEmbeddedPostgres("reconstructable Git expiration", () => {
     const nestedSettingsPath = path.join(nested!.cwd, ".claude/settings.local.json");
     await fs.mkdir(path.dirname(nestedSettingsPath));
     await fs.writeFile(nestedSettingsPath, settings, { mode: 0o640 });
-    return { ...f, nestedSource, nestedRemote, nestedA, preparation, nested: nested!, settings, settingsPath, nestedSettingsPath };
+    return { ...f, nestedSource, nestedRemote, nestedA, preparation, nested: nested!, settings, settingsPath, nestedSettingsPath,
+      sharedBase: resolveManagedProjectWorkspaceDir({ companyId: f.companyId, projectId: f.projectId!, repoName: "nested" }) };
   }
 
   it("expires a nested workspace and its unused private base with the generated ignore entry", async () => {
@@ -454,7 +457,7 @@ describeEmbeddedPostgres("reconstructable Git expiration", () => {
     expect(await f.expire({ beforeDelete: async () => { throw new Error("stop_before_locks"); } }))
       .toMatchObject({ expired: false, skipReason: "stop_before_locks" });
     const row = await f.row();
-    const locations = gitCacheExpirationLockLocations(row);
+    const locations = await gitCacheExpirationLockLocations(row);
     const token = readGitCacheExpiration(row)!.lockToken!;
     const module = new URL("../services/git-workspace-expiration-locks.ts", import.meta.url).href;
     const child = spawnSync(process.execPath, ["--import", createRequire(import.meta.url).resolve("tsx"), "--input-type=module", "-e", `
@@ -813,7 +816,8 @@ describeEmbeddedPostgres("reconstructable Git expiration", () => {
 
   it("preserves live descendants and pending reopening", async () => {
     const f = await fixture();
-    await db.insert(issues).values({ companyId: f.companyId, title: "Active child", status: "in_progress", parentId: f.issueId });
+    await db.insert(issues).values({ companyId: f.companyId, title: "Active child", status: "in_progress", parentId: f.issueId,
+      executionWorkspaceId: f.workspaceId, executionWorkspacePreference: "reuse_existing" });
     expect((await f.expire()).expired).toBe(false);
     await db.delete(issues).where(eq(issues.parentId, f.issueId));
     const row = await f.row();
@@ -994,6 +998,367 @@ describeEmbeddedPostgres("reconstructable Git expiration", () => {
     expect(await f.expire({ dryRun: true })).toMatchObject({ candidate: true, expired: false, skipReason: "custom_git_metadata" });
     expect(await f.reopen()).toMatchObject({ ok: true });
     expect(git(f.cwd, "rev-parse", "HEAD")).toBe(f.commitA);
+  });
+
+
+  describe("nested checkouts as worktrees of a shared base", () => {
+    const restorePoint = () => ({ storage: getStorageService(), notBefore: new Date(Date.now() - 24 * 3_600_000), keyDurable: true });
+    const worktrees = (base: string) => git(base, "worktree", "list", "--porcelain").split("\n")
+      .filter(line => line.startsWith("worktree ")).map(line => line.slice(9));
+    const real = (target: string) => fs.realpath(target);
+    async function sharedFixture() {
+      const f = await nestedFixture(false, true);
+      const siblingCwd = path.join(path.dirname(f.source), "sibling-task");
+      await fs.mkdir(siblingCwd);
+      const [sibling] = await prepareProjectRepositoryWorkspaces({ ...f.preparation, cwd: siblingCwd });
+      return { ...f, siblingCwd, sibling: sibling! };
+    }
+
+    it("prepares nested checkouts of two tasks as worktrees of one shared clone", async () => {
+      const f = await sharedFixture();
+      const base = await real(f.sharedBase);
+      for (const checkout of [f.nested.cwd, f.sibling.cwd]) {
+        expect((await fs.lstat(path.join(checkout, ".git"))).isFile()).toBe(true);
+        expect(git(checkout, "rev-parse", "--path-format=absolute", "--git-common-dir")).toBe(path.join(base, ".git"));
+        expect(git(checkout, "rev-parse", "HEAD")).toBe(f.nestedA);
+        expect(git(checkout, "remote", "get-url", "origin")).toBe(pathToFileURL(f.nestedRemote).href);
+        expect(git(checkout, "symbolic-ref", "--short", "HEAD")).toMatch(/^paperclip\/[a-f0-9]{12}\/main$/);
+        expect(git(checkout, "rev-parse", "--abbrev-ref", "@{upstream}")).toBe("origin/main");
+      }
+      expect(git(f.nested.cwd, "symbolic-ref", "HEAD")).not.toBe(git(f.sibling.cwd, "symbolic-ref", "HEAD"));
+      expect(await worktrees(base)).toEqual(expect.arrayContaining([await real(f.nested.cwd), await real(f.sibling.cwd)]));
+      expect(await prepareProjectRepositoryWorkspaces(f.preparation)).toMatchObject([{ cwd: f.nested.cwd }]);
+      expect(git(f.nested.cwd, "rev-parse", "HEAD")).toBe(f.nestedA);
+    });
+
+    it("serializes concurrent preparation of tasks sharing one base", async () => {
+      const f = await nestedFixture(false, true);
+      const tasks = await Promise.all([1, 2, 3].map(async index => {
+        const cwd = path.join(path.dirname(f.source), `concurrent-${index}`);
+        await fs.mkdir(cwd);
+        return cwd;
+      }));
+      const prepared = await Promise.all(tasks.map(cwd => prepareProjectRepositoryWorkspaces({ ...f.preparation, cwd })));
+      const base = await real(f.sharedBase);
+      for (const [repository] of prepared) {
+        expect(git(repository!.cwd, "rev-parse", "--path-format=absolute", "--git-common-dir")).toBe(path.join(base, ".git"));
+      }
+      expect(await worktrees(base)).toEqual(expect.arrayContaining(await Promise.all(prepared.map(([repository]) => real(repository!.cwd)))));
+      const waiting = path.join(path.dirname(f.source), "waiting-task");
+      await fs.mkdir(waiting);
+      let release!: () => void;
+      const held = withNestedRepositoryBaseLock(f.sharedBase, () => new Promise<void>(resolve => { release = resolve; }));
+      const pending = prepareProjectRepositoryWorkspaces({ ...f.preparation, cwd: waiting });
+      await new Promise(resolve => setTimeout(resolve, 500));
+      expect(await exists(path.join(waiting, ".paperclip-repositories", path.basename(f.nested.cwd)))).toBe(false);
+      release();
+      await held;
+      const [late] = await pending;
+      expect(git(late!.cwd, "rev-parse", "--path-format=absolute", "--git-common-dir")).toBe(path.join(base, ".git"));
+    });
+
+    it("tracks a dotted branch ref and proves its tracking configuration", async () => {
+      const f = await nestedFixture(false, true);
+      git(f.nestedSource, "push", "-q", f.nestedRemote, "main:release-1.0");
+      const task = path.join(path.dirname(f.source), "dotted-task");
+      await fs.mkdir(task);
+      const [prepared] = await prepareProjectRepositoryWorkspaces({ ...f.preparation, cwd: task,
+        workspaces: [{ ...f.preparation.workspaces[0]!, repoRef: "release-1.0" }] });
+      expect(git(prepared!.cwd, "symbolic-ref", "--short", "HEAD")).toMatch(/^paperclip\/[a-f0-9]{12}\/release-1\.0$/);
+      expect(git(prepared!.cwd, "rev-parse", "--abbrev-ref", "@{upstream}")).toBe("origin/release-1.0");
+      git(prepared!.cwd, "pull", "-q");
+      await expect(assertReproducibleManagedCheckout(prepared!.cwd, { repoUrl: pathToFileURL(f.nestedRemote).href,
+        resolveGitAuth: async () => null, baseCandidates: [f.sharedBase] })).resolves.toMatchObject({ headOnRemote: true });
+    });
+
+    it("prepares a new branch when a retained checkout still holds the original one", async () => {
+      const f = await nestedFixture(false, true);
+      git(f.nestedSource, "push", "-q", f.nestedRemote, "main:other");
+      const original = git(f.nested.cwd, "symbolic-ref", "HEAD");
+      await prepareProjectRepositoryWorkspaces({ ...f.preparation, workspaces: [{ ...f.preparation.workspaces[0]!, repoRef: "other" }] });
+      const detachedRoot = path.join(f.cwd, ".paperclip-runtime", "detached-repositories");
+      const [retained] = await fs.readdir(detachedRoot);
+      expect(git(path.join(detachedRoot, retained!), "symbolic-ref", "HEAD")).toBe(original);
+      const [back] = await prepareProjectRepositoryWorkspaces(f.preparation);
+      expect(back!.cwd).toBe(f.nested.cwd);
+      expect(git(back!.cwd, "symbolic-ref", "HEAD")).toBe(original.replace(/\/main$/, "/r2/main"));
+      expect(git(back!.cwd, "rev-parse", "--abbrev-ref", "@{upstream}")).toBe("origin/main");
+      expect(git(path.join(detachedRoot, retained!), "symbolic-ref", "HEAD")).toBe(original);
+    });
+
+    it("follows a changed remote default branch for new tasks", async () => {
+      const f = await nestedFixture(false, true);
+      git(f.nestedSource, "push", "-q", f.nestedRemote, "main:trunk");
+      git(f.nestedRemote, "symbolic-ref", "HEAD", "refs/heads/trunk");
+      const task = path.join(path.dirname(f.source), "default-branch-task");
+      await fs.mkdir(task);
+      const [prepared] = await prepareProjectRepositoryWorkspaces({ ...f.preparation, cwd: task,
+        workspaces: [{ ...f.preparation.workspaces[0]!, repoRef: null }] });
+      expect(git(prepared!.cwd, "symbolic-ref", "--short", "HEAD")).toMatch(/^paperclip\/[a-f0-9]{12}\/trunk$/);
+      expect(git(prepared!.cwd, "rev-parse", "--abbrev-ref", "@{upstream}")).toBe("origin/trunk");
+    });
+
+    it("restores a renumbered owned branch tracking its source branch, not a same-named remote branch", async () => {
+      const f = await nestedFixture(false, true);
+      git(f.nestedSource, "commit", "-q", "--allow-empty", "-m", "Unrelated r2 branch");
+      git(f.nestedSource, "push", "-q", f.nestedRemote, "HEAD:r2/main");
+      const base = await real(f.sharedBase);
+      git(base, "fetch", "-q", "origin");
+      const target = path.join(path.dirname(f.source), "renumbered-task", "checkout");
+      await fs.mkdir(path.dirname(target));
+      const branchName = `${await nestedWorktreeBranchPrefix(target)}r2/main`;
+      await restoreNestedRepositoryWorktree({ base, cwd: target, commit: f.nestedA, branchName, repoRef: null, afterAdd: async () => undefined });
+      expect(git(target, "symbolic-ref", "--short", "HEAD")).toBe(branchName);
+      expect(git(target, "rev-parse", "--abbrev-ref", "@{upstream}")).toBe("origin/main");
+    });
+
+    it("starts a fully qualified branch ref at the current remote commit and rejects a deleted branch", async () => {
+      const f = await nestedFixture(false, true);
+      await fs.writeFile(path.join(f.nestedSource, "nested.txt"), "nested B\n");
+      git(f.nestedSource, "commit", "-qam", "Nested B");
+      git(f.nestedSource, "push", "-q", f.nestedRemote, "main", "main:short-lived");
+      const nestedB = git(f.nestedSource, "rev-parse", "HEAD");
+      const prepare = async (name: string, repoRef: string) => {
+        const task = path.join(path.dirname(f.source), name);
+        await fs.mkdir(task);
+        return prepareProjectRepositoryWorkspaces({ ...f.preparation, cwd: task, workspaces: [{ ...f.preparation.workspaces[0]!, repoRef }] });
+      };
+      const [qualified] = await prepare("qualified-task", "refs/heads/main");
+      expect(git(qualified!.cwd, "rev-parse", "HEAD")).toBe(nestedB);
+      expect(git(qualified!.cwd, "rev-parse", "--abbrev-ref", "@{upstream}")).toBe("origin/main");
+      await prepare("short-lived-task", "short-lived");
+      git(f.nestedRemote, "branch", "-D", "short-lived");
+      await expect(prepare("deleted-branch-task", "short-lived")).rejects.toThrow('Repository ref "short-lived" was not found');
+    });
+
+    it("never runs hooks planted in the shared clone while preparing or restoring", async () => {
+      const f = await nestedFixture(false, true);
+      const marker = path.join(path.dirname(f.source), "hook-ran");
+      const hooks = path.join(await real(f.sharedBase), ".git", "hooks");
+      for (const hook of ["post-checkout", "reference-transaction"]) {
+        await fs.writeFile(path.join(hooks, hook), `#!/bin/sh\necho ${hook} >> ${JSON.stringify(marker)}\n`, { mode: 0o755 });
+      }
+      const task = path.join(path.dirname(f.source), "hooked-task");
+      await fs.mkdir(task);
+      await prepareProjectRepositoryWorkspaces({ ...f.preparation, cwd: task });
+      const target = path.join(path.dirname(f.source), "hooked-restore", "checkout");
+      await fs.mkdir(path.dirname(target));
+      await restoreNestedRepositoryWorktree({ base: await real(f.sharedBase), cwd: target, commit: f.nestedA,
+        branchName: `${await nestedWorktreeBranchPrefix(target)}main`, repoRef: "main", preserved: [f.nestedA], afterAdd: async () => undefined });
+      expect(await exists(marker)).toBe(false);
+    });
+
+    it("keeps adopting a legacy standalone nested clone", async () => {
+      const f = await nestedFixture(false);
+      const [prepared] = await prepareProjectRepositoryWorkspaces({ ...f.preparation, sharedBase: { companyId: f.companyId, projectId: f.projectId! } });
+      expect(prepared!.cwd).toBe(f.nested.cwd);
+      expect((await fs.lstat(path.join(f.nested.cwd, ".git"))).isDirectory()).toBe(true);
+      expect(await exists(f.sharedBase)).toBe(false);
+    });
+
+    it("expires a clean nested worktree, unregisters only it, and restores it from the base", async () => {
+      const f = await sharedFixture();
+      const base = await real(f.sharedBase);
+      const ownBranch = git(f.nested.cwd, "symbolic-ref", "HEAD");
+      const siblingBranch = git(f.sibling.cwd, "symbolic-ref", "HEAD");
+      const nestedPath = await real(f.nested.cwd);
+      expect(await f.expire({ expireBase: false })).toMatchObject({ expired: true, skipReason: null });
+      expect(await worktrees(base)).not.toContain(nestedPath);
+      expect(await worktrees(base)).toContain(await real(f.sibling.cwd));
+      expect(() => git(base, "rev-parse", "--verify", "-q", ownBranch)).toThrow();
+      expect(git(base, "rev-parse", siblingBranch)).toBe(f.nestedA);
+      const recipe = (await f.row()).metadata?.gitCacheRestoration as Record<string, any>;
+      expect(recipe.contents.checkouts[0]).toMatchObject({ commit: f.nestedA, branchName: ownBranch.slice("refs/heads/".length),
+        worktree: { base, admin: expect.any(String) } });
+      expect(await f.reopen()).toMatchObject({ ok: true, reopened: true });
+      expect((await fs.lstat(path.join(f.nested.cwd, ".git"))).isFile()).toBe(true);
+      expect(git(f.nested.cwd, "rev-parse", "--path-format=absolute", "--git-common-dir")).toBe(path.join(base, ".git"));
+      expect(git(f.nested.cwd, "symbolic-ref", "HEAD")).toBe(ownBranch);
+      expect(git(f.nested.cwd, "rev-parse", "HEAD")).toBe(f.nestedA);
+      expect(git(f.nested.cwd, "rev-parse", "--abbrev-ref", "@{upstream}")).toBe("origin/main");
+      expect(await fs.readFile(f.nestedSettingsPath)).toEqual(f.settings);
+      expect(await prepareProjectRepositoryWorkspaces(f.preparation)).toMatchObject([{ cwd: f.nested.cwd }]);
+    });
+
+    it("recreates a deleted shared base when restoring an expired nested worktree", async () => {
+      const f = await nestedFixture(false, true);
+      expect(await f.expire({ expireBase: false })).toMatchObject({ expired: true });
+      await fs.rm(f.sharedBase, { recursive: true, force: true });
+      expect(await f.reopen()).toMatchObject({ ok: true, reopened: true });
+      expect(git(f.nested.cwd, "rev-parse", "--path-format=absolute", "--git-common-dir")).toBe(path.join(await real(f.sharedBase), ".git"));
+      expect(git(f.nested.cwd, "rev-parse", "HEAD")).toBe(f.nestedA);
+    });
+
+    it("blocks unpushed nested work and saves it in a restore point", async () => {
+      vi.stubEnv("PAPERCLIP_SECRETS_MASTER_KEY", "31".repeat(32));
+      const f = await sharedFixture();
+      const branch = git(f.nested.cwd, "symbolic-ref", "HEAD");
+      await fs.writeFile(path.join(f.nested.cwd, "nested.txt"), "nested B (unpushed)\n");
+      git(f.nested.cwd, "commit", "-qam", "Nested B unpushed");
+      const unpushed = git(f.nested.cwd, "rev-parse", "HEAD");
+      await fs.writeFile(path.join(f.nested.cwd, "draft.md"), "nested untracked work\n");
+      expect(await f.expire({ expireBase: false })).toMatchObject({ expired: false, skipReason: "dirty_or_untracked_files" });
+      await fs.rename(path.join(f.nested.cwd, "draft.md"), path.join(f.siblingCwd, "draft.md"));
+      expect(await f.expire({ expireBase: false })).toMatchObject({ expired: false, skipReason: "unpushed_managed_checkout" });
+      await fs.rename(path.join(f.siblingCwd, "draft.md"), path.join(f.nested.cwd, "draft.md"));
+      expect(await f.expire({ expireBase: false, restorePoint: restorePoint() })).toMatchObject({ expired: true, restorePoint: true, skipReason: null });
+      expect(await f.reopen()).toMatchObject({ ok: true, reopened: true });
+      expect(git(f.nested.cwd, "symbolic-ref", "HEAD")).toBe(branch);
+      expect(git(f.nested.cwd, "rev-parse", "HEAD")).toBe(unpushed);
+      expect(await fs.readFile(path.join(f.nested.cwd, "draft.md"), "utf8")).toBe("nested untracked work\n");
+      expect(git(f.sibling.cwd, "rev-parse", "HEAD")).toBe(f.nestedA);
+      vi.unstubAllEnvs();
+    });
+
+    it("saves history kept only in the nested worktree's reflog and restores it there", async () => {
+      vi.stubEnv("PAPERCLIP_SECRETS_MASTER_KEY", "31".repeat(32));
+      const f = await sharedFixture();
+      await fs.writeFile(path.join(f.nested.cwd, "nested.txt"), "rewritten away\n");
+      git(f.nested.cwd, "commit", "-qam", "Only in the reflog");
+      const orphan = git(f.nested.cwd, "rev-parse", "HEAD");
+      git(f.nested.cwd, "reset", "-q", "--hard", "HEAD~1");
+      expect(await f.expire({ expireBase: false })).toMatchObject({ expired: false, skipReason: "unique_original_head" });
+      expect(await f.expire({ expireBase: false, restorePoint: restorePoint() })).toMatchObject({ expired: true, restorePoint: true });
+      git(await real(f.sharedBase), "reflog", "expire", "--expire=now", "--all");
+      git(await real(f.sharedBase), "gc", "-q", "--prune=now");
+      expect(await f.reopen()).toMatchObject({ ok: true, reopened: true });
+      expect(git(f.nested.cwd, "rev-parse", "HEAD")).toBe(f.nestedA);
+      expect(git(f.nested.cwd, "reflog", "show", "--format=%H", "HEAD").split("\n")).toContain(orphan);
+      expect(git(f.nested.cwd, "cat-file", "-t", orphan)).toBe("commit");
+      await expect(assertReproducibleManagedCheckout(f.nested.cwd, { repoUrl: pathToFileURL(f.nestedRemote).href,
+        resolveGitAuth: async () => null, baseCandidates: [f.sharedBase] })).rejects.toThrow("unique_reflog_commits");
+      vi.unstubAllEnvs();
+    });
+
+    it("blocks on stashes, unowned checked-out branches, and unpushed owned branches", async () => {
+      vi.stubEnv("PAPERCLIP_SECRETS_MASTER_KEY", "31".repeat(32));
+      const f = await sharedFixture();
+      await fs.writeFile(path.join(f.nested.cwd, "nested.txt"), "stashed work\n");
+      git(f.nested.cwd, "stash", "-q");
+      expect(await f.expire({ expireBase: false, restorePoint: restorePoint() })).toMatchObject({ expired: false, skipReason: "unsupported_local_git_state" });
+      git(f.nested.cwd, "stash", "pop", "-q");
+      git(f.nested.cwd, "checkout", "-q", "--", "nested.txt");
+      const owned = git(f.nested.cwd, "symbolic-ref", "--short", "HEAD");
+      git(f.nested.cwd, "checkout", "-q", "-b", "side");
+      expect(await f.expire({ expireBase: false, restorePoint: restorePoint() })).toMatchObject({ expired: false, skipReason: "unowned_nested_worktree_branch" });
+      git(f.nested.cwd, "checkout", "-q", owned);
+      git(f.nested.cwd, "checkout", "-q", "-b", `${owned}-extra`);
+      git(f.nested.cwd, "commit", "-q", "--allow-empty", "-m", "Unpushed extra owned branch");
+      git(f.nested.cwd, "checkout", "-q", owned);
+      await fs.writeFile(path.join(f.nested.cwd, "draft.md"), "untracked\n");
+      expect(await f.expire({ expireBase: false, restorePoint: restorePoint() })).toMatchObject({ expired: false, skipReason: "unpushed_managed_checkout_branches" });
+      expect(await exists(f.cwd)).toBe(true);
+      vi.unstubAllEnvs();
+    });
+
+    it("blocks an unpushed owned branch or owned reflog entry outside HEAD history", async () => {
+      const f = await sharedFixture();
+      const owned = git(f.nested.cwd, "symbolic-ref", "--short", "HEAD");
+      const orphan = execFileSync("git", ["commit-tree", git(f.nested.cwd, "rev-parse", "HEAD^{tree}"), "-p", "HEAD", "-m", "Owned but unpushed"],
+        { cwd: f.nested.cwd, env: gitEnv, encoding: "utf8" }).trim();
+      git(f.nested.cwd, "update-ref", "--create-reflog", `refs/heads/${owned}-extra`, orphan);
+      expect(await f.expire({ expireBase: false })).toMatchObject({ expired: false, skipReason: "unpushed_managed_checkout" });
+      git(f.nested.cwd, "update-ref", `refs/heads/${owned}-extra`, f.nestedA);
+      expect(await f.expire({ expireBase: false })).toMatchObject({ expired: false, skipReason: "unpushed_managed_checkout" });
+      git(f.nested.cwd, "update-ref", "-d", `refs/heads/${owned}-extra`);
+      expect(await f.expire({ expireBase: false })).toMatchObject({ expired: true, skipReason: null });
+    });
+
+    it("rejects too many owned branches before reading their reflogs", async () => {
+      const f = await nestedFixture(false, true);
+      const owned = git(f.nested.cwd, "symbolic-ref", "--short", "HEAD");
+      const refs = Array.from({ length: 65 }, (_, index) => `create refs/heads/${owned}-many-${index} ${f.nestedA}`).join("\n");
+      execFileSync("git", ["update-ref", "--stdin"], { cwd: f.nested.cwd, env: gitEnv, input: `${refs}\n` });
+      expect(await f.expire({ expireBase: false })).toMatchObject({ expired: false, skipReason: "managed_checkout_local_tip_budget" });
+    });
+
+    it.each([
+      ["a named pipe", async (file: string) => { execFileSync("mkfifo", [file]); }],
+      ["an oversized file", async (file: string) => { await fs.writeFile(file, "x".repeat(8 * 1024)); }],
+      ["a symlink", async (file: string) => { await fs.symlink("/dev/zero", file); }],
+    ])("rejects a nested worktree whose administration pointer is %s without reading it unsafely", async (_name, plant) => {
+      const f = await nestedFixture(false, true);
+      const admin = git(f.nested.cwd, "rev-parse", "--absolute-git-dir");
+      const pointer = path.join(admin, "gitdir");
+      await fs.rm(pointer);
+      await plant(pointer);
+      expect(await f.expire({ expireBase: false })).toMatchObject({ expired: false, skipReason: "unproven_managed_checkout" });
+      await expect(prepareProjectRepositoryWorkspaces(f.preparation)).rejects.toThrow("Invalid project repository checkout path");
+    });
+
+    it("ignores another task's unpushed branch and keeps it after expiring this worktree", async () => {
+      const f = await sharedFixture();
+      git(f.sibling.cwd, "commit", "-q", "--allow-empty", "-m", "Sibling unpushed work");
+      const siblingWork = git(f.sibling.cwd, "rev-parse", "HEAD");
+      const siblingBranch = git(f.sibling.cwd, "symbolic-ref", "HEAD");
+      git(f.nested.cwd, "branch", "agent-shared-branch", siblingWork);
+      expect(await f.expire({ expireBase: false })).toMatchObject({ expired: true, skipReason: null });
+      const base = await real(f.sharedBase);
+      expect(git(base, "rev-parse", siblingBranch)).toBe(siblingWork);
+      expect(git(base, "rev-parse", "refs/heads/agent-shared-branch")).toBe(siblingWork);
+      expect(git(f.sibling.cwd, "rev-parse", "HEAD")).toBe(siblingWork);
+    });
+
+    it("rejects a nested worktree whose base is not the project's shared clone", async () => {
+      const f = await sharedFixture();
+      const foreign = path.join(path.dirname(f.source), "foreign-base");
+      git(path.dirname(f.source), "clone", "-q", pathToFileURL(f.nestedRemote).href, foreign);
+      git(f.nested.cwd, "checkout", "-q", "--detach");
+      const ownBranch = git(f.sibling.cwd, "symbolic-ref", "HEAD");
+      await fs.rm(f.nested.cwd, { recursive: true, force: true });
+      git(await real(f.sharedBase), "worktree", "prune");
+      git(foreign, "worktree", "add", "-q", "--detach", f.nested.cwd);
+      await expect(prepareProjectRepositoryWorkspaces(f.preparation)).rejects.toThrow("Invalid project repository checkout path");
+      await expect(assertReproducibleManagedCheckout(f.nested.cwd, { repoUrl: pathToFileURL(f.nestedRemote).href,
+        resolveGitAuth: async () => null, baseCandidates: [f.sharedBase] })).rejects.toThrow("unproven_managed_checkout");
+      expect(await f.expire({ expireBase: false })).toMatchObject({ expired: false, skipReason: "unproven_managed_checkout" });
+      expect(git(f.sibling.cwd, "symbolic-ref", "HEAD")).toBe(ownBranch);
+    });
+
+    it("recovers process-abandoned nested worktree locks held in the shared base", async () => {
+      const f = await nestedFixture(true, true);
+      const locations = await crashWithExpirationLocks(f);
+      const base = await real(f.sharedBase);
+      const nestedLocks = locations.filter(location => location.checkout !== null);
+      expect(nestedLocks.map(location => location.relativePath)).toEqual(expect.arrayContaining([
+        expect.stringMatching(/^\.git\/worktrees\/[^/]+\/index\.lock$/), expect.stringMatching(/^\.git\/refs\/heads\/paperclip\/[a-f0-9]{12}\/main\.lock$/)]));
+      for (const location of nestedLocks) {
+        expect(await real(location.root)).toBe(base);
+        expect(await exists(path.join(location.root, location.relativePath))).toBe(true);
+      }
+      expect(await f.expire()).toMatchObject({ expired: true });
+      for (const location of nestedLocks) expect(await exists(path.join(location.root, location.relativePath))).toBe(false);
+      expect(await f.reopen()).toMatchObject({ ok: true, reopened: true });
+      expect(git(f.nested.cwd, "rev-parse", "HEAD")).toBe(f.nestedA);
+      expect(git(f.nested.cwd, "rev-parse", "--path-format=absolute", "--git-common-dir")).toBe(path.join(base, ".git"));
+    });
+
+    it("removes only the deleted task's nested worktrees and keeps its unpushed branch", async () => {
+      const f = await sharedFixture();
+      const { cleanupExecutionWorkspaceArtifacts } = await import("../services/workspace-runtime.js");
+      const base = await real(f.sharedBase);
+      git(f.nested.cwd, "commit", "-q", "--allow-empty", "-m", "Unpushed before deletion");
+      const unpushed = git(f.nested.cwd, "rev-parse", "HEAD");
+      const ownBranch = git(f.nested.cwd, "symbolic-ref", "HEAD");
+      const siblingBranch = git(f.sibling.cwd, "symbolic-ref", "HEAD");
+      const nestedPath = await real(f.nested.cwd);
+      const row = await f.row();
+      const cleanup = await cleanupExecutionWorkspaceArtifacts({ workspace: { ...row, providerType: "git_worktree", metadata: {} },
+        runCleanupCommands: false });
+      expect(cleanup).toMatchObject({ cleaned: true, warnings: [] });
+      expect(await exists(f.cwd)).toBe(false);
+      expect(await worktrees(base)).not.toContain(nestedPath);
+      expect(await worktrees(base)).toContain(await real(f.sibling.cwd));
+      expect(git(base, "rev-parse", ownBranch)).toBe(unpushed);
+      const siblingPath = await real(f.sibling.cwd);
+      const siblingWorkspace = { ...row, id: randomUUID(), cwd: f.siblingCwd, providerRef: f.siblingCwd, providerType: "local_fs",
+        metadata: { createdByRuntime: true } };
+      expect(await cleanupExecutionWorkspaceArtifacts({ workspace: siblingWorkspace, runCleanupCommands: false }))
+        .toMatchObject({ cleaned: true, warnings: [] });
+      expect(await worktrees(base)).not.toContain(siblingPath);
+      expect(() => git(base, "rev-parse", "--verify", "-q", siblingBranch)).toThrow();
+      expect(git(base, "rev-parse", ownBranch)).toBe(unpushed);
+    });
   });
 
 });

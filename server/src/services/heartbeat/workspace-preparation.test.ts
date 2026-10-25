@@ -607,6 +607,7 @@ describe.skipIf(!support.supported)("heartbeat workspace preparation boundary", 
     await db.insert(projectWorkspaces).values({ companyId: issue.companyId, projectId: readable.id, name: "Provider-only storage", cwd: unavailableCwd });
     await db.update(issues).set({ description: [readable, privateProject].map(project => `[project](${buildProjectMentionHref(project.id)})`).join(" ") }).where(eq(issues.id, issue.id));
     const stopped = new Error("Fixture reached plugin realization");
+    const acquire=vi.spyOn(envOrchestrator,"acquireForRun");
     const realize = vi.spyOn(envOrchestrator, "realizeForRun").mockRejectedValue(stopped);
     try {
       await expect(prepareHeartbeatWorkspace(db, input)).rejects.toBe(stopped);
@@ -614,8 +615,11 @@ describe.skipIf(!support.supported)("heartbeat workspace preparation boundary", 
         runnerTaskProjectIds: enabled ? [issue.projectId, readable.id] : undefined,
         executionWorkspace: expect.objectContaining({ additionalWorkspaces: [] }),
       }));
+      expect(acquire).toHaveBeenCalledWith(expect.objectContaining({runnerTaskProjectIds:
+        enabled ? [issue.projectId,readable.id] : [issue.projectId]}));
       await expect(access(unavailableCwd)).rejects.toMatchObject({ code: "ENOENT" });
     } finally {
+      acquire.mockRestore();
       vi.stubEnv("PAPERCLIP_MULTI_PROJECT_WORKSPACE_SYNC", "true");
       vi.stubEnv("PAPERCLIP_MULTI_PROJECT_WORKSPACE_SYNC_REMOTE", "true");
     }
@@ -640,10 +644,7 @@ describe.skipIf(!support.supported)("heartbeat workspace preparation boundary", 
     const namespace = join(source, ".paperclip-repositories");
     const guard = vi.spyOn(input.services.executionWorkspacesSvc, "assertTaskRepositoryPublicationAllowed")
       .mockImplementation(async () => {
-        const candidates = await readdir(namespace);
-        expect(candidates).toHaveLength(1);
-        expect(candidates[0]).toContain(".clone-");
-        expect(await readFile(join(namespace, candidates[0]!, "README.md"), "utf8")).toBe("source content\n");
+        expect(await readdir(namespace)).toEqual([]);
         throw new Error("Task binding changed during clone");
       });
     await expect(prepareHeartbeatWorkspace(db, input)).rejects.toThrow("Task binding changed during clone");

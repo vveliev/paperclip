@@ -2375,7 +2375,7 @@ export function heartbeatService(
         !boundSourceWorkspace && !taskWorkspaceIntentRow?.intent && !issueContext?.projectWorkspaceId
           ? taskProjectContext : null
       );
-      const parsedProjectExecutionWorkspacePolicy = workspacePolicyContext && !boundSourceWorkspace
+      const parsedProjectExecutionWorkspacePolicy = workspacePolicyContext?.hasWorkspace && !boundSourceWorkspace
         ? await effectiveProjectWorkspacePolicy(db, agent.companyId, workspacePolicyContext.executionWorkspacePolicy, workspacePolicyContext.hasGitSource)
         : parseProjectExecutionWorkspacePolicy(workspacePolicyContext?.executionWorkspacePolicy);
       const projectExecutionWorkspacePolicy =
@@ -2618,7 +2618,7 @@ export function heartbeatService(
         run, agent,
         task: { issueId, context, responsibleUserId, acceptedPlanContinuationWake, acceptedPlanWakeRoutingDecision, taskProjectContext, routineEnvContext },
         config: { sourceWorkspaceConfig, aiBinding },
-        policy: { trustPreset, useIsolatedTaskDirectory, explicitTaskDirectory },
+        policy: { trustPreset, useIsolatedTaskDirectory, explicitTaskDirectory, requestedExecutionWorkspaceMode },
         environment: { selectedEnvironmentId, selectedEnvironmentForConfig, resolvedInstanceSettings, persistedNativeExecutionInput },
         services: { secretsSvc, companySkills, appendRunEvent, finalizeAiConnectionBusyDeferral },
         onFailureSecretsResolved: (readSecrets) => { readFailureReportSecrets = () => [...readSecrets(), ...identityRedactor.values]; },

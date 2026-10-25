@@ -325,9 +325,14 @@ describe("native runner file handoff", () => {
       await db.update(issueWorkProducts).set({ status: "failed" }).where(eq(issueWorkProducts.id, product.id));
       await expect(nativeCompletionFeedback(db, runId, doneReport([`work_product:${product.id}`])))
         .rejects.toThrow("requested file has no accessible delivery evidence");
-      await db.update(heartbeatRuns).set({ contextSnapshot: { issueId, executionContinuation: { objective: "Do not create a file. Explain the result inline." } } }).where(eq(heartbeatRuns.id, runId));
-      await expect(nativeCompletionFeedback(db, runId, doneReport([])))
-        .resolves.toContain("Completion report accepted");
+      for (const objective of [
+        "Do not create a file. Explain the result inline.",
+        "Run hostname, id, and pwd. Report the output in a completion comment. Do not modify repository files or create attachments.",
+      ]) {
+        await db.update(heartbeatRuns).set({ contextSnapshot: { issueId, executionContinuation: { objective } } }).where(eq(heartbeatRuns.id, runId));
+        await expect(nativeCompletionFeedback(db, runId, doneReport([])))
+          .resolves.toContain("Completion report accepted");
+      }
     } finally {
       await db.delete(issueWorkProducts).where(eq(issueWorkProducts.id, product.id));
       await db.update(heartbeatRuns).set({ contextSnapshot: { issueId } }).where(eq(heartbeatRuns.id, runId));
