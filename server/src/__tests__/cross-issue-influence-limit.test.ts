@@ -222,8 +222,12 @@ describe("cross-issue influence limit rollout", () => {
       kind: "update",
       now: CROSS_ISSUE_INFLUENCE_ENFORCE_AT,
     })).resolves.toMatchObject({ allowed: true, count: 1 });
-    expect(fake.inserted).toHaveLength(1);
-    expect(fake.inserted[0]).toMatchObject({ action: "issue.cross_issue_influence_observed" });
+    expect(fake.inserted).toEqual([
+      expect.objectContaining({
+        action: "issue.cross_issue_influence_observed",
+        details: expect.objectContaining({ sourceIssueId: null }),
+      }),
+    ]);
   });
 
   it("still fails closed past the cap for an unscoped run with no source issue and no lock match", async () => {
