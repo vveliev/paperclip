@@ -102,7 +102,15 @@ for (const classic of [false, true]) {
     // Blocked is an explicit nonterminal disposition. A paused agent's Todo
     // task can legitimately be escalated to Blocked by recovery before the UI
     // observes it; that recovery behavior has separate database coverage.
+    let previousStatus = "done";
     for (const status of ["blocked", "cancelled", "blocked", "done"]) {
+      // This fork rejects a direct done/cancelled -> blocked move (GIF-49), so
+      // reopen to todo first. The agent is paused with wake-on-demand off, so
+      // the hop starts no work; the runs assertion below still covers that.
+      if (status === "blocked" && (previousStatus === "done" || previousStatus === "cancelled")) {
+        await json(await request.patch(`/api/issues/${task.id}`, { data: { status: "todo" } }));
+      }
+      previousStatus = status;
       await json(await request.patch(`/api/issues/${task.id}`, { data: {
         status,
         ...(status === "blocked" ? {

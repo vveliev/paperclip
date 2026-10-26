@@ -5623,7 +5623,11 @@ export function agentRoutes(
       // `heartbeat`. adapterConfig already merges this way above; runtimeConfig
       // did not, which is how an unrelated save could wipe a just-enabled
       // heartbeat with no trace of the loss in config-revisions.
-      const existingRuntimeConfig = asRecord(existing.runtimeConfig) ?? {};
+      // aiConnection is excluded from the merge. The binding logic above already
+      // carries the saved connection forward when it still applies and leaves
+      // it out on purpose when the setup changes authentication; merging the
+      // persisted value back in would resurrect a superseded connection.
+      const { aiConnection: _supersededAiConnection, ...existingRuntimeConfig } = asRecord(existing.runtimeConfig) ?? {};
       patchData.runtimeConfig = { ...existingRuntimeConfig, ...requestedRuntimeConfig };
     }
     if (touchesAdapterConfiguration || Object.prototype.hasOwnProperty.call(patchData, "defaultEnvironmentId")) {

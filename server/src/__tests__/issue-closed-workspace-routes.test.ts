@@ -58,6 +58,12 @@ const mockRunnerGoalService = vi.hoisted(() => ({
 const mockLogActivity = vi.hoisted(() => vi.fn(async () => undefined));
 
 function registerServiceMocks() {
+  // Upstream's comment route looks up the execution blocker for blocked
+  // issues. This file's route db is a stub, so mock it the way the other
+  // route suites do: no workspace-repair blocker.
+  vi.doMock("../services/execution-blocker.js", () => ({
+    getExecutionBlocker: vi.fn(async () => null),
+  }));
   vi.doMock("../services/fast-responses.js", () => ({
     enqueueFastResponse: vi.fn(async () => undefined),
   }));

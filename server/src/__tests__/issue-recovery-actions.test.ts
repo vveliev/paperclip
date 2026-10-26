@@ -141,6 +141,9 @@ describe("issueRecoveryActionService", () => {
   it("defaults a new active action's timeoutAt instead of leaving it permanent (BLA-1074)", async () => {
     let insertedValues: Record<string, unknown> | null = null;
     const fakeDb = {
+      // Upstream writes recovery actions through writeExecutionControl, which
+      // opens a transaction; pass the fake through as its own transaction.
+      async transaction<T>(fn: (tx: unknown) => Promise<T>): Promise<T> { return fn(fakeDb); },
       select: vi.fn(() => ({
         from() { return this; },
         where() { return this; },
@@ -173,6 +176,9 @@ describe("issueRecoveryActionService", () => {
   it("leaves an explicit null timeoutAt alone (opt-out is respected)", async () => {
     let insertedValues: Record<string, unknown> | null = null;
     const fakeDb = {
+      // Upstream writes recovery actions through writeExecutionControl, which
+      // opens a transaction; pass the fake through as its own transaction.
+      async transaction<T>(fn: (tx: unknown) => Promise<T>): Promise<T> { return fn(fakeDb); },
       select: vi.fn(() => ({
         from() { return this; },
         where() { return this; },
