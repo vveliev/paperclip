@@ -106,6 +106,58 @@ export function buildNativeHeartbeatPreparationSpans(input: {
   ];
 }
 
+/** Which accepted input `task.time_to_first_token` is measured from. */
+export type NativeTimeToFirstTokenAnchor =
+  | "question_response"
+  | "comment"
+  | "wake_request"
+  | "run_created";
+
+/**
+ * Resolve the start of `task.time_to_first_token`: the earliest accepted input
+ * that caused this run. A question answer or a wake comment is already a root
+ * historical span. Otherwise the run row's creation time is the fallback. A
+ * durable wake request accepted earlier (deferred, coalesced or retried wakes)
+ * moves the start back to that request, so queueing before the run row exists
+ * is part of the measured latency.
+ *
+ * Run-log only. The wake request time is read after the first deliverable
+ * text, never before `turn.start`.
+ */
+export function resolveNativeTimeToFirstTokenStart(input: {
+  traceStartedAtMs: number;
+  preparationSpans: readonly NativeRunHistoricalSpan[];
+  wakeRequestedAtMs: number | null;
+}): { startedAtMs: number; anchor: NativeTimeToFirstTokenAnchor } {
+  const ingress = input.preparationSpans.find(
+    (span) =>
+      span.name === "question_response.to_run_created" ||
+      span.name === "comment.to_run_created",
+  );
+  // The trace starts at the earliest preparation span. A comment coalesced
+  // into an already-queued run starts after run creation, so it names the
+  // start only when it is that earliest span.
+  const ingressIsStart = ingress !== undefined && ingress.startedAtMs <= input.traceStartedAtMs;
+  let anchor: NativeTimeToFirstTokenAnchor =
+    !ingressIsStart
+      ? "run_created"
+      : ingress.name === "question_response.to_run_created"
+        ? "question_response"
+        : "comment";
+  let startedAtMs = input.traceStartedAtMs;
+  const wakeAt = input.wakeRequestedAtMs;
+  if (
+    wakeAt !== null &&
+    Number.isFinite(wakeAt) &&
+    wakeAt >= 0 &&
+    wakeAt < startedAtMs
+  ) {
+    startedAtMs = wakeAt;
+    anchor = "wake_request";
+  }
+  return { startedAtMs, anchor };
+}
+
 export function nativeRunPreparationStarts(
   spans: NativeRunHistoricalSpan[],
   nowMs: number,
@@ -138,6 +190,7 @@ interface NativeRunSpanScopeState extends NativeRunSpanScope {
   context: unknown;
   attributes: Record<string, string | number | boolean>;
   ended: boolean;
+  persistRunLog: boolean;
 }
 
 const NOOP_SPAN: SpanHandle = {
@@ -148,7 +201,9 @@ const NOOP_SPAN: SpanHandle = {
 
 const SAFE_NATIVE_RUN_SPAN_ATTRIBUTE_KEYS = new Set([
   "adapter",
+  "anchor",
   "bytesTransferred",
+  "inputBytes", "toolSchemaBytes", "toolCount", "contextReused", "tokenDataAvailable",
   "connectionOwner",
   "driver",
   "duration_ms",
@@ -323,6 +378,8 @@ export function createNativeRunTrace(input: {
       parentName?: string;
       startedAtMs?: number;
       attributes?: Record<string, string | number | boolean>;
+      /** False only when an existing durable diagnostic batch already contains the measurements. */
+      persistRunLog?: boolean;
     } = {},
   ): NativeRunSpanScope => {
     const startedAtMs = finiteMs(options.startedAtMs ?? Date.now());
@@ -364,6 +421,7 @@ export function createNativeRunTrace(input: {
       context,
       attributes,
       ended: false,
+      persistRunLog: options.persistRunLog !== false,
     };
     scopes.add(state);
     openScopes.add(state);
@@ -413,7 +471,7 @@ export function createNativeRunTrace(input: {
     });
     if (outcome === "failed") { try { state.span.setStatus({ code: 2 }); } catch {} }
     try { state.span.end(endedAtMs); } catch {}
-    await emitCompletedSpanEvent({
+    if (state.persistRunLog) await emitCompletedSpanEvent({
       name: state.name,
       parentName: state.parentName,
       startedAtMs: state.startedAtMs,
@@ -458,11 +516,12 @@ export function createNativeRunTrace(input: {
     );
   };
 
-  const record = async (span: NativeRunHistoricalSpan): Promise<void> => {
+  const record = async (span: NativeRunHistoricalSpan, options: { persistRunLog?: boolean } = {}): Promise<void> => {
     const scope = start(span.name, {
       parentName: span.parentName,
       startedAtMs: span.startedAtMs,
       attributes: span.attributes,
+      persistRunLog: options.persistRunLog,
     });
     await end(scope, {
       endedAtMs: span.endedAtMs,
@@ -490,7 +549,28 @@ export function createNativeRunTrace(input: {
     }
   };
 
+  /**
+   * Diagnostic work that must not block the caller (for example a read that
+   * anchors a span). It runs detached; `finish` settles it before the root
+   * span closes. The work must bound its own waits.
+   */
+  const pendingDiagnostics = new Set<Promise<void>>();
+  const defer = (work: () => Promise<void>): void => {
+    if (ended) return;
+    const pending: Promise<void> = Promise.resolve()
+      .then(work)
+      .catch(() => {
+        // Diagnostics cannot change runner control flow.
+      })
+      .finally(() => {
+        pendingDiagnostics.delete(pending);
+      });
+    pendingDiagnostics.add(pending);
+  };
+
   const finish = async (outcome: NativeRunSpanOutcome): Promise<void> => {
+    if (ended) return;
+    await Promise.all([...pendingDiagnostics]);
     if (ended) return;
     ended = true;
     const endedAtMs = Date.now();
@@ -522,11 +602,28 @@ export function createNativeRunTrace(input: {
     run,
     record,
     measure,
+    defer,
     finish,
   };
 }
 
 export type NativeRunTrace = ReturnType<typeof createNativeRunTrace>;
+
+/** Group already-normalized provider measurements without exporting provider attributes. */
+export async function recordNativeProviderPerformanceSpans(trace: NativeRunTrace, spans: NativeRunHistoricalSpan[]): Promise<void> {
+  if (!spans.length) return;
+  try {
+    const scope = trace.start("provider.runtime", { parentName: "native.session.execute",
+      startedAtMs: Math.min(...spans.map(span => span.startedAtMs)), persistRunLog: false });
+    try {
+      for (const span of spans) await trace.record({ name: span.name, parentName: "provider.runtime",
+        startedAtMs: span.startedAtMs, endedAtMs: span.endedAtMs, outcome: span.outcome }, { persistRunLog: false });
+    } finally {
+      await trace.end(scope, { endedAtMs: Math.max(...spans.map(span => span.endedAtMs)),
+        outcome: spans.some(span => span.outcome === "failed") ? "failed" : "ok" });
+    }
+  } catch { /* Diagnostics cannot replace the work's result. */ }
+}
 
 /** Emit preparation failure even when execution aborts before a native session exists. */
 export async function recordFailedSkillPreparation(input: {

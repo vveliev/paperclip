@@ -554,6 +554,28 @@ export async function sealRestorePoint(payload: Buffer, identity: RestorePointId
   return { ciphertext, sha256: createHash("sha256").update(ciphertext).digest("hex"), key: material };
 }
 
+async function restorePointKey(input: { key: StoredSecretVersionMaterial; identity: RestorePointIdentity }) {
+  const unwrapped = JSON.parse(await localEncryptedProvider.resolveVersion({ material: input.key, externalRef: null } as Parameters<typeof localEncryptedProvider.resolveVersion>[0]));
+  const { identity } = input;
+  if (unwrapped.schema !== KEY_SCHEMA || unwrapped.companyId !== identity.companyId || unwrapped.workspaceId !== identity.workspaceId
+    || unwrapped.restorePointId !== identity.restorePointId || unwrapped.generation !== identity.generation) {
+    throw new RestorePointRestoreFailure("key_identity_mismatch");
+  }
+  return unwrapped as RestorePointIdentity & { dataKey: string; plaintextBytes: number; plaintextSha256: string };
+}
+
+function verifyRestorePointPayload(payload: Buffer, key: { plaintextBytes: number; plaintextSha256: string }) {
+  if (payload.length !== key.plaintextBytes || createHash("sha256").update(payload).digest("hex") !== key.plaintextSha256) {
+    throw new RestorePointRestoreFailure("plaintext_hash_mismatch");
+  }
+}
+
+export async function verifyRestorePointPayloadCandidate(input: {
+  payload: Buffer; key: StoredSecretVersionMaterial; identity: RestorePointIdentity;
+}) {
+  verifyRestorePointPayload(input.payload, await restorePointKey(input));
+}
+
 export async function openRestorePoint(input: {
   ciphertext: Buffer;
   sha256: string;
@@ -567,12 +589,8 @@ export async function openRestorePoint(input: {
   if (input.ciphertext.length < minimum || !input.ciphertext.subarray(0, SEALED_MAGIC.length).equals(SEALED_MAGIC)) {
     throw new RestorePointRestoreFailure("invalid_ciphertext");
   }
-  const unwrapped = JSON.parse(await localEncryptedProvider.resolveVersion({ material: input.key, externalRef: null } as Parameters<typeof localEncryptedProvider.resolveVersion>[0]));
+  const unwrapped = await restorePointKey(input);
   const { identity } = input;
-  if (unwrapped.schema !== KEY_SCHEMA || unwrapped.companyId !== identity.companyId || unwrapped.workspaceId !== identity.workspaceId
-    || unwrapped.restorePointId !== identity.restorePointId || unwrapped.generation !== identity.generation) {
-    throw new RestorePointRestoreFailure("key_identity_mismatch");
-  }
   const iv = input.ciphertext.subarray(SEALED_MAGIC.length, SEALED_MAGIC.length + 12);
   const tag = input.ciphertext.subarray(input.ciphertext.length - 16);
   const body = input.ciphertext.subarray(SEALED_MAGIC.length + 12, input.ciphertext.length - 16);
@@ -585,9 +603,7 @@ export async function openRestorePoint(input: {
   } catch {
     throw new RestorePointRestoreFailure("ciphertext_authentication_failed");
   }
-  if (payload.length !== unwrapped.plaintextBytes || createHash("sha256").update(payload).digest("hex") !== unwrapped.plaintextSha256) {
-    throw new RestorePointRestoreFailure("plaintext_hash_mismatch");
-  }
+  verifyRestorePointPayload(payload, unwrapped);
   return payload;
 }
 
@@ -595,9 +611,21 @@ export async function restorePointHistoryDigest(input: string, signal?: AbortSig
   const cwd = await fs.realpath(input);
   const reflog = await gitText(cwd, ["reflog", "show", "--format=%H", "HEAD"], { signal }).catch(() => "");
   const original = await gitText(cwd, ["rev-parse", "--verify", "-q", "ORIG_HEAD^{commit}"], { signal }).catch(() => "");
-  const remotes = await gitText(cwd, ["for-each-ref", "--format=%(objectname) %(refname)", "refs/remotes"], { signal }).catch(() => "");
-  const remoteReflogs = (await gitText(cwd, ["reflog", "show", "--all", "--format=%H %gD"], { signal }).catch(() => ""))
-    .split("\n").filter((line) => / refs\/remotes\//.test(line));
+  const linked = (await fs.lstat(path.join(cwd, ".git")).catch(() => null))?.isFile() ?? false;
+  const nested = linked ? await import("./nested-repository-worktrees.js") : null;
+  const scope = nested ? `refs/heads/${await nested.nestedWorktreeBranchPrefix(cwd)}` : "refs/remotes";
+  const remotes = await gitText(cwd, ["for-each-ref", ...nested ? [`--count=${nested.OWNED_NESTED_REF_LIMIT + 1}`] : [],
+    "--format=%(objectname) %(refname)", scope], { signal }).catch(() => "");
+  const remoteReflogs: string[] = [];
+  if (nested) {
+    if (remotes.split("\n").filter(Boolean).length > nested.OWNED_NESTED_REF_LIMIT) throw new Error("managed_checkout_local_tip_budget");
+    for (const ref of remotes.split("\n").map((line) => line.split(" ")[1]).filter(Boolean)) {
+      remoteReflogs.push(...(await gitText(cwd, ["reflog", "show", "--format=%H", ref!], { signal }).catch(() => "")).split("\n").filter((line) => SHA.test(line)).map((sha) => `${sha} ${ref}`));
+    }
+  } else {
+    remoteReflogs.push(...(await gitText(cwd, ["reflog", "show", "--all", "--format=%H %gD"], { signal }).catch(() => ""))
+      .split("\n").filter((line) => / refs\/remotes\//.test(line)));
+  }
   return createHash("sha256").update(JSON.stringify([reflog.split("\n").filter((line) => SHA.test(line)), SHA.test(original) ? original : null,
     remotes.split("\n").filter(Boolean), remoteReflogs])).digest("hex");
 }

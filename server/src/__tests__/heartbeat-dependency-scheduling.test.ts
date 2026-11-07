@@ -37,8 +37,10 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { resolveExternalTestDatabaseUrl } from "./helpers/external-test-database.js";
 import { heartbeatService } from "../services/heartbeat.ts";
 import { runningProcesses } from "../adapters/index.ts";
+import { taskInterruptionPresentation } from "../services/task-interruption-presentation.js";
 
 const mockAdapterExecute = vi.hoisted(() =>
   vi.fn(async () => ({
@@ -63,7 +65,8 @@ vi.mock("../adapters/index.ts", async () => {
   };
 });
 
-const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
+const external = resolveExternalTestDatabaseUrl("PAPERCLIP_DEPENDENCY_TEST_DATABASE_URL");
+const embeddedPostgresSupport = external ? { supported: true, reason: undefined } : await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
 
 if (!embeddedPostgresSupport.supported) {
@@ -103,8 +106,8 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
 
   beforeAll(async () => {
-    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-heartbeat-dependency-scheduling-");
-    db = createDb(tempDb.connectionString);
+    if (!external) tempDb = await startEmbeddedPostgresTestDatabase("paperclip-heartbeat-dependency-scheduling-");
+    db = createDb(external ?? tempDb!.connectionString);
     await db.insert(authUsers).values({ id: "responsible-user", name: "Fixture owner", email: "owner@example.test", createdAt: new Date(), updatedAt: new Date() });
     heartbeat = heartbeatService(db);
     await ensureIssueRelationsTable(db);
@@ -125,11 +128,7 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
       }
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
-    const runIds = await db
-      .select({ id: heartbeatRuns.id })
-      .from(heartbeatRuns)
-      .then((runs) => runs.map((run) => run.id));
-    await Promise.all(runIds.map((runId) => heartbeat.waitForRunExecutionDrain(runId)));
+    await heartbeat.drainActiveRunExecutions();
     mockAdapterExecute.mockReset();
     mockAdapterExecute.mockImplementation(async () => ({
       exitCode: 0,
@@ -185,6 +184,8 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
   });
 
   afterAll(async () => {
+    await db?.delete(authUsers).where(eq(authUsers.id, "responsible-user"));
+    await db?.$client.end();
     await tempDb?.cleanup();
   });
 
@@ -685,14 +686,9 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
     });
     expect(interactionWake).not.toBeNull();
 
-    await waitForCondition(async () => {
-      const run = await db
-        .select({ status: heartbeatRuns.status })
-        .from(heartbeatRuns)
-        .where(eq(heartbeatRuns.id, interactionWake!.id))
-        .then((rows) => rows[0] ?? null);
-      return run?.status === "succeeded";
-    });
+    // This checks dependency interaction semantics, not provider startup speed.
+    // Join the admitted execution before inspecting its persisted outcome.
+    await heartbeat.drainActiveRunExecutions();
 
     const interactionRun = await db
       .select({
@@ -1233,16 +1229,18 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
       })
       .where(eq(issues.id, blockedIssueId));
 
+    mockAdapterExecute.mockImplementationOnce(async () => {
+      await db.update(issues).set({ status: "done" }).where(eq(issues.id, readyIssueId));
+      return { exitCode: 0, signal: null, timedOut: false, errorMessage: null,
+        summary: "Ready queued run completed.", provider: "test", model: "test-model" };
+    });
     await heartbeat.resumeQueuedRuns();
 
-    await waitForCondition(async () => {
-      const run = await db
-        .select({ status: heartbeatRuns.status })
-        .from(heartbeatRuns)
-        .where(eq(heartbeatRuns.id, readyRunId))
-        .then((rows) => rows[0] ?? null);
-      return run?.status === "succeeded";
-    });
+    expect(await waitForCondition(async () => {
+      const [ready] = await db.select({ status: heartbeatRuns.status }).from(heartbeatRuns).where(eq(heartbeatRuns.id, readyRunId));
+      return ready?.status === "succeeded";
+    }, 30_000)).toBe(true);
+    await heartbeat.drainActiveRunExecutions();
 
     const [blockedRun, blockedWakeup, blockedIssue, readyRun] = await Promise.all([
       db
@@ -1283,6 +1281,13 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
     expect(blockedRun?.errorCode).toBe("issue_dependencies_blocked");
     expect(blockedRun?.finishedAt).toBeTruthy();
     expect(blockedRun?.resultJson).toMatchObject({ stopReason: "issue_dependencies_blocked" });
+    expect(blockedRun?.resultJson).toMatchObject({ cancellation: { source: "control_plane", expected: true } });
+    const [waitingIssue] = await db.select().from(issues).where(eq(issues.id, blockedIssueId));
+    expect(await taskInterruptionPresentation(db, waitingIssue!)).toMatchObject({ state: "resolved", canRetry: false });
+    await db.update(heartbeatRuns).set({ resultJson: { ...blockedRun!.resultJson, timeoutFired: true } })
+      .where(eq(heartbeatRuns.id, blockedRunId));
+    expect(await taskInterruptionPresentation(db, waitingIssue!)).toMatchObject({ state: "failed", canRetry: true });
+    await db.update(heartbeatRuns).set({ resultJson: blockedRun!.resultJson }).where(eq(heartbeatRuns.id, blockedRunId));
     expect(blockedWakeup?.status).toBe("skipped");
     expect(blockedWakeup?.error).toContain("dependencies are still blocked");
     expect(blockedIssue).toMatchObject({
@@ -1291,8 +1296,8 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
       executionLockedAt: null,
     });
     expect(readyRun?.status).toBe("succeeded");
-    expect(mockAdapterExecute.mock.calls.length).toBeGreaterThanOrEqual(1);
-  });
+    expect(mockAdapterExecute).toHaveBeenCalledTimes(1);
+  }, 40_000);
 
   it("suppresses normal wakeups while allowing comment interaction wakes under a pause hold", async () => {
     const companyId = randomUUID();
