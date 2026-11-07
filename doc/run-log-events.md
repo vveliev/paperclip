@@ -68,10 +68,19 @@ instance run log and add no first-party Telemetry or OpenTelemetry export.
 dispatch at the first newly committed deliverable text: assistant or reasoning
 `item.delta`/`item.completed`, a redaction tail released at completion, or an
 accepted run-result summary. Its
-`durationMs` starts at the native run trace's historical start (accepted ingress,
-otherwise queued run creation, or dispatch when history is absent) and ends at Core
-commit callback. `startOffsetMs` is zero, and `eventKind` is `agentMessage` or
-`reasoning`. It includes preparation and startup, but excludes browser
+`durationMs` starts at the earliest accepted input. The accepted comment or
+answered question is the start only when its span is the earliest preparation span.
+A comment coalesced into an already-queued run starts after run creation, so that
+run uses queued run creation. The durable wake request's `requested_at` replaces
+the start when it is earlier (deferred, coalesced and retried wakes). Without
+preparation history, the start is dispatch and the anchor is `run_created`. It ends at Core commit callback. `anchor` names the start:
+`comment`, `question_response`, `wake_request` or `run_created`. `startOffsetMs` is
+zero, or negative when a wake request precedes the run trace. `eventKind` is
+`agentMessage` or `reasoning`. The wake request time is read after the first text,
+in detached diagnostic work bounded to 2 s (a
+transaction-local `statement_timeout`, so PostgreSQL cancels a stalled read), so the measurement adds no wait before
+`turn.start` and never delays event delivery. The span can appear after later
+run-log rows; the trace settles it before `task.provider_session.measured`. It includes preparation and startup, but excludes browser
 delivery/rendering. This measures text availability, not an exact model token.
 Empty text, item starts, tools, usage, result proposals, and duplicate replay do
 not qualify. No deliverable text means no timing sample. A recovered dispatch can
@@ -342,6 +351,13 @@ execution coordinator opens. Unavailable probes are retried within a shared
 an unreadable identity from a confirmed missing process and contains no command
 output or credentials. Saved-state read failures use `state_read_failed`; malformed
 saved JSON uses `state_invalid`. It does not itself authorize replacement or cleanup.
+For `process_not_running`, the event also records `runnerLifecycle` and
+`runnerSettled` from the exited runner's saved state. `runnerLifecycle` is a known
+runner lifecycle, `other` for an unknown value, or `unavailable` when the state has
+none. `runnerSettled` is true only when the outbox is empty and no terminal delivery,
+provider cleanup or warm transition is pending. These fields explain how the runner
+stopped. The event is not recorded when a scheduled retry resumes a runner that
+exited after a settled suspension; see `doc/execution-semantics.md`.
 
 For a prepared remote workspace interrupted before its first executor claim,
 that ledger records `remote_execution_never_claimed` with a

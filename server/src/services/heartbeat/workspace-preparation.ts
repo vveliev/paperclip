@@ -1,3 +1,4 @@
+import { remoteRecoveryLeaseMismatch } from "../native-runtime/remote-recovery-lease-mismatch.js";
 import { resolveProviderApiPlacement } from "../native-runtime/provider-api-placement.js";
 import { assertEphemeralWorkspaceExecution, readRemoteWorkspaceAuthority, RemoteWorkspaceWriterActiveError, reserveRemoteWorkspace, shouldUseRemoteWorkspaces } from "../remote-workspaces.js";
 import { WORKSPACE_BUSY_HOLDER_STALE_AFTER_MS, WorkspaceBusyDeferral } from "./retries.js";
@@ -47,7 +48,7 @@ import { readNativeWorkspaceSyncReference, readNativeWorkspaceSyncLocalCwd } fro
 import { parseObject } from "../../adapters/utils.js";
 import { materializeNativeChatTaskRoot } from "../native-runtime/native-chat-workspace.js";
 import { materializeIsolatedTaskDirectory } from "../isolated-task-directory.js";
-import { withWorkspaceSourceLocks } from "../workspace-source-lock.js";
+import { withIndependentWorkspaceSourceLocks } from "../workspace-source-lock.js";
 import {
   cleanupExecutionWorkspaceArtifacts,
   ensurePersistedExecutionWorkspaceAvailable,
@@ -171,9 +172,11 @@ export async function prepareHeartbeatWorkspace(db: Db, input: HeartbeatWorkspac
   const sourceIssueId = input.reuse.reusableExistingExecutionWorkspace?.sourceIssueId
     ?? input.reuse.existingExecutionWorkspace?.sourceIssueId ?? input.task.issueId;
   if (input.reuse.isDotRun || resolveProviderApiPlacement(input)) return prepareHeartbeatWorkspaceLocked(db, input);
-  if (!sourceIssueId) return withWorkspaceSourceLocks(db, { companyId: input.agent.companyId },
+  // A run can be dispatched from inside another operation's source scope, for
+  // example by a recovery timer. Its preparation owns its own locks.
+  if (!sourceIssueId) return withIndependentWorkspaceSourceLocks(db, { companyId: input.agent.companyId },
     () => prepareHeartbeatWorkspaceLocked(db, input));
-  return withWorkspaceSourceLocks(db, { companyId: input.agent.companyId,
+  return withIndependentWorkspaceSourceLocks(db, { companyId: input.agent.companyId,
     issueIds: [...new Set([sourceIssueId, input.task.issueId].filter((id): id is string => Boolean(id)))] }, async () => {
     const reuse = { ...input.reuse };
     for (const key of ["existingExecutionWorkspace", "reusableExistingExecutionWorkspace"] as const) {
@@ -1294,12 +1297,14 @@ async function prepareHeartbeatWorkspaceLocked(db: Db, input: HeartbeatWorkspace
       ? readNativeWorkspaceSyncReference(parseObject(run.runnerProfileJson).nativeWorkspaceSync) : null;
     const remoteRecoveryLocation = remoteAuthority
       ? readRemoteWorkspaceAuthority(persistedExecutionWorkspace?.metadata)?.location ?? null : null;
-    if (remoteRecovery && (remoteRecovery.runId !== run.id || (sandboxRecovery && (remoteAuthority
-        ? !remoteRecoveryLocation || remoteRecoveryLocation.providerLeaseId !== sandboxRecovery.providerLeaseId
-          || remoteRecoveryLocation.remoteCwd !== sandboxRecovery.remoteCwd
-        : !recoveryWorkspace || recoveryWorkspace.providerLeaseId !== sandboxRecovery.providerLeaseId
-          || recoveryWorkspace.remoteCwd !== sandboxRecovery.remoteCwd)))) {
-      throw new Error("native_remote_recovery_lease_mismatch");
+    if (remoteRecovery) {
+      const saved = remoteAuthority ? remoteRecoveryLocation : recoveryWorkspace;
+      const mismatch = remoteRecovery.runId !== run.id ? "run_id" as const
+        : !sandboxRecovery ? null
+        : !saved ? "workspace_reference" as const
+        : saved.providerLeaseId !== sandboxRecovery.providerLeaseId ? "provider_lease_id" as const
+        : saved.remoteCwd !== sandboxRecovery.remoteCwd ? "remote_cwd" as const : null;
+      if (mismatch) throw remoteRecoveryLeaseMismatch("workspace_preparation", mismatch);
     }
     acquiredEnvironment = await timeWorkspace("workspace_environment_acquire", () => envOrchestrator.acquireForRun({
       companyId: agent.companyId,
