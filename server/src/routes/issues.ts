@@ -1493,6 +1493,7 @@ const ISSUE_WAKE_DIAGNOSTIC_KNOWN_REASONS = new Set([
   "issue_human_assignment",
   "native_provider_overloaded",
   "task_retry",
+  "execution_recovery",
 ]);
 
 const ISSUE_WAKE_DIAGNOSTIC_KNOWN_STATUSES = new Set([

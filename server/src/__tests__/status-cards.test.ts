@@ -645,7 +645,7 @@ describeEmbeddedPostgres("status card routes", () => {
     const summarizer = await seedSummarizer(company.id);
     const service = statusCardService(db);
     const realIssues = issueService(db);
-    await realIssues.create(company.id, { title: "Watched blocker", status: "blocked", priority: "medium" });
+    await realIssues.create(company.id, { title: "Watched blocker", status: "blocked", assigneeUserId: "board-user", priority: "medium" });
     const card = await service.create(company.id, {
       interestPrompt: "Revision race", titlePinned: false,
       refreshPolicy: { ...defaultStatusCardRefreshPolicy, mode: "interval", intervalMinutes: 15 },
@@ -714,7 +714,7 @@ describeEmbeddedPostgres("status card routes", () => {
     const summarizer = await seedSummarizer(company.id);
     const service = statusCardService(db);
     const realIssues = issueService(db);
-    await realIssues.create(company.id, { title: "Watched blocker", status: "blocked", priority: "medium" });
+    await realIssues.create(company.id, { title: "Watched blocker", status: "blocked", assigneeUserId: "board-user", priority: "medium" });
     const card = await service.create(company.id, {
       interestPrompt: "Completed winner race", titlePinned: false,
       refreshPolicy: { ...defaultStatusCardRefreshPolicy, mode: "interval", intervalMinutes: 15 },

@@ -11,8 +11,13 @@ describeIssueRecovery("issue recovery production producers and dependencies", ()
   it.each(["startup", "committed"])("restores blocker-only and completed-action debt with no assignment candidates (%s)", async mode => {
     const f = await fixture();
     if (mode === "committed") { await start(); await quiet(); }
-    const blocker = await issueService(state.db).create(f.companyId, { title: "Orphan blocker", status: "blocked", createdByAgentId: f.agentId });
-    const dependent = await issueService(state.db).create(f.companyId, { title: "Blocked dependent", status: "blocked", blockedByIssueIds: [blocker.id] });
+    // This fork's issue service rejects a blocked issue with no owner (GIF-66),
+    // so seed the orphan row directly: upstream's orphan-blocker recovery must
+    // still find an unassigned blocker to adopt.
+    const blocker = (await state.db.insert(issues).values({ companyId: f.companyId, title: "Orphan blocker", status: "blocked",
+      createdByAgentId: f.agentId, unblockDescriptor: { owner: "board", action: "Test fixture: orphan blocker." } }).returning())[0]!;
+    const dependent = await issueService(state.db).create(f.companyId, { title: "Blocked dependent", status: "blocked",
+      assigneeUserId: "board-user", blockedByIssueIds: [blocker.id] });
     const completedSource = await issueService(state.db).create(f.companyId, { title: "Completed source", status: "done" });
     const action = await issueRecoveryActionService(state.db).upsertSourceScoped({ companyId: f.companyId, sourceIssueId: completedSource.id,
       kind: "stranded_assigned_issue", ownerType: "agent", ownerAgentId: f.agentId, cause: "stranded_assigned_issue",

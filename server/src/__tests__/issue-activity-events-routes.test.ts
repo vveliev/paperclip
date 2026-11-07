@@ -519,7 +519,8 @@ describe("issue activity event routes", () => {
               tableName === "project_workspaces"
                 ? [{ id: previousProjectWorkspaceId, name: "Main workspace" }]
                 : tableName === "execution_workspaces"
-                ? [{ id: nextExecutionWorkspaceId, name: "Feature workspace" }]
+                // The fork's reopen guard loads the requested workspace with a company check.
+                ? [{ id: nextExecutionWorkspaceId, companyId: issue.companyId, name: "Feature workspace" }]
                 : [];
             const query: any = {};
             query.orderBy = vi.fn(async () => rows);

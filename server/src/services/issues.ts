@@ -387,13 +387,16 @@ function isTerminalIssueStatus(status: string) {
 // unattributed revert minutes after the issue actually closed. Reopening a
 // terminal issue back to "todo"/"in_progress" (e.g. a human comment or an
 // explicit PATCH) stays unrestricted — that path never targets "blocked"
-// directly, so no caller needs an opt-in here.
-function assertTransition(from: string, to: string) {
+// directly. The one deliberate exception is a server-owned caller that
+// re-reads the terminal issue inside its own transaction and reopens it into
+// blocked on purpose (e.g. a done task whose workspace now needs a project);
+// it passes `allowTerminalToBlocked`. HTTP input never carries that flag.
+function assertTransition(from: string, to: string, opts: { allowTerminalToBlocked?: boolean } = {}) {
   if (from === to) return;
   if (!ALL_ISSUE_STATUSES.includes(to)) {
     throw conflict(`Unknown issue status: ${to}`);
   }
-  if (isTerminalIssueStatus(from) && to === "blocked") {
+  if (isTerminalIssueStatus(from) && to === "blocked" && !opts.allowTerminalToBlocked) {
     throw conflict(`Cannot move issue from terminal status "${from}" directly to "blocked"`);
   }
 }
@@ -11321,6 +11324,11 @@ export function issueService(db: Db) {
         actorRunStopId?: string | null;
         actorUserId?: string | null;
         companyGuard?: string;
+        /**
+         * Server-owned GIF-49 opt-in for a caller that deliberately reopens a
+         * terminal issue straight into blocked; never accepted from HTTP input.
+         */
+        allowTerminalToBlocked?: boolean;
         workspaceSelectionActor?: AuthorizationActor;
         expectedExecutionPolicy?: typeof issues.$inferInsert.executionPolicy;
         expectedStatusVersion?: number;
@@ -11413,6 +11421,7 @@ export function issueService(db: Db) {
         actorRunStopId,
         actorUserId,
         companyGuard,
+        allowTerminalToBlocked,
         workspaceSelectionActor,
         expectedExecutionPolicy,
         expectedStatusVersion,
@@ -11488,7 +11497,7 @@ export function issueService(db: Db) {
       }
 
       if (issueData.status) {
-        assertTransition(existing.status, issueData.status);
+        assertTransition(existing.status, issueData.status, { allowTerminalToBlocked });
       }
 
       const nextAssigneeAgentId =

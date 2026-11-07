@@ -3934,7 +3934,10 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               await notifyRoutineExecutionStatus(tx, issue.id, issue.companyId);
               if (issue.status === "done") {
                 const blocked = await issuesSvc.updateForCompany(issue.id, issue.companyId,
-                  { status: "blocked", executionState: null }, tx, issueActivityPublications, issuePostCommitActions);
+                  // GIF-49 opt-in: this reopen of a done task is deliberate
+                  // and reads the issue inside this transaction.
+                  { status: "blocked", executionState: null, allowTerminalToBlocked: true },
+                  tx, issueActivityPublications, issuePostCommitActions);
                 if (!blocked) throw conflict("The task changed before its workspace settings could be checked");
               } else await tx
                 .update(issues)

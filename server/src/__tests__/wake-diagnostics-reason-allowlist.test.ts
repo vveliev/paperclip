@@ -38,6 +38,10 @@ const KNOWN_DYNAMIC_REASON_SOURCES = new Set([
   // "issue_children_completed", "issue_blockers_resolved". Traced by hand when upstream's
   // native status-decision committer landed.
   "input.reason",
+  // server/src/modules/wake-queue/adapters/postgres.ts copies `prior.reason` from an
+  // agentWakeupRequests row it just read into a coalesced receipt for the same wake. The
+  // value was already written by another covered site, so it adds no new reason.
+  "prior.reason",
 ]);
 
 function walkTsFiles(dir: string, out: string[] = []): string[] {
