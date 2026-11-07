@@ -1,6 +1,13 @@
-import { and, desc, eq, inArray } from "drizzle-orm";
+import { notifyAttentionRetentionWork } from "./retention-work-notifications.js";
+import { notifyIssueRecovery } from "./issue-recovery-notifications.js";
+import { notifyNativeRecoveryNotices } from "./native-recovery-notice-notifications.js";
+import { notifyUnsafeWorkspaceExportRecovery } from "./unsafe-workspace-export-notifications.js";
+import { writeExecutionControl } from "./execution-control-notifications.js";
+import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
+import { and, desc, eq, inArray, isNull, isNotNull, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { issueRecoveryActions } from "@paperclipai/db";
+import { heartbeatRuns, issueRecoveryActions, workspaceOperations } from "@paperclipai/db";
+import { isUuidLike } from "@paperclipai/shared";
 import type {
   IssueRecoveryAction,
   IssueRecoveryActionKind,
@@ -8,6 +15,8 @@ import type {
   IssueRecoveryActionOutcome,
   IssueRecoveryActionStatus,
 } from "@paperclipai/shared";
+
+import { isNativeWorkspaceFinalizationOperationActive } from "./workspace-operations.js";
 
 const ACTIVE_RECOVERY_ACTION_STATUSES = ["active", "escalated"] as const satisfies readonly IssueRecoveryActionStatus[];
 const MAX_UPSERT_RETRIES = 3;
@@ -91,6 +100,9 @@ export type UpsertIssueRecoveryActionInput = {
   // one. The new failure then gets a distinct recovery identity and a fresh
   // operator notice, and the prior identity stays as a resolved record.
   supersedeOnIdentityChange?: boolean;
+  // When true, an existing active action is returned unchanged. A concurrent
+  // writer that wins the insert keeps its owner, cause, and evidence.
+  createOnly?: boolean;
   // Rollout compatibility for active pre-policy actions. Refresh their
   // evidence/attempt metadata without silently changing the recorded owner or
   // the wake/monitor contract that made that owner authoritative.
@@ -141,22 +153,30 @@ function toReadModel(row: IssueRecoveryActionRow): IssueRecoveryAction {
 }
 
 function isUniqueRecoveryActionConflict(error: unknown) {
-  const maybe = error as { code?: string; constraint?: string; message?: string } | null;
-  return Boolean(
-    maybe &&
-      maybe.code === "23505" &&
-      (
+  const seen = new Set<unknown>();
+  let candidate = error;
+  // Drizzle wraps the driver error in cause. Only this specific uniqueness
+  // conflict can reuse the existing bounded source-scoped upsert retry.
+  for (let depth = 0; depth < 8 && candidate && typeof candidate === "object"; depth++) {
+    if (seen.has(candidate)) break;
+    seen.add(candidate);
+    const maybe = candidate as { code?: string; constraint?: string; constraint_name?: string; message?: string; cause?: unknown };
+    if (maybe.code === "23505" && (
         maybe.constraint === "issue_recovery_actions_active_source_uq" ||
         maybe.constraint === "issue_recovery_actions_active_fingerprint_uq" ||
+        maybe.constraint_name === "issue_recovery_actions_active_source_uq" ||
+        maybe.constraint_name === "issue_recovery_actions_active_fingerprint_uq" ||
         typeof maybe.message === "string" && (
           maybe.message.includes("issue_recovery_actions_active_source_uq") ||
           maybe.message.includes("issue_recovery_actions_active_fingerprint_uq")
         )
-      ),
-  );
+      )) return true;
+    candidate = maybe.cause;
+  }
+  return false;
 }
 
-export function issueRecoveryActionService(db: Db) {
+export function issueRecoveryActionService(db: DbOrTransaction) {
   const upsertQueues = new Map<string, Promise<void>>();
 
   async function runExclusiveUpsert<T>(
@@ -207,6 +227,68 @@ export function issueRecoveryActionService(db: Db) {
     return expired ?? null;
   }
 
+  // Coordinator retries reuse the original native run. They are not legacy
+  // scheduled retries, and workspace export can run while the heartbeat still
+  // records its earlier failure. Project their actual activity for every reader.
+  async function projectNativeRunActivity(
+    companyId: string,
+    actions: IssueRecoveryAction[],
+    dbOrTx: DbOrTransaction,
+  ) {
+    const nativeActions = actions.filter((action) => action.wakePolicy?.kind === "resume_native_run");
+    for (const action of nativeActions) action.nativeRunActivity = null;
+    const runIds = [...new Set(nativeActions.flatMap((action) => {
+      const runId = action.wakePolicy?.runId;
+      return typeof runId === "string" && isUuidLike(runId) ? [runId] : [];
+    }))];
+    if (runIds.length === 0) return;
+    const activity = await dbOrTx.select({
+      runId: heartbeatRuns.id,
+      issueId: heartbeatRuns.nativeIssueId,
+      status: heartbeatRuns.status,
+      finishedAt: heartbeatRuns.finishedAt,
+      workspaceOperationId: workspaceOperations.id,
+    }).from(heartbeatRuns).leftJoin(workspaceOperations, and(
+      eq(workspaceOperations.companyId, heartbeatRuns.companyId),
+      eq(workspaceOperations.heartbeatRunId, heartbeatRuns.id),
+      eq(workspaceOperations.issueId, heartbeatRuns.nativeIssueId),
+      eq(workspaceOperations.phase, "workspace_finalize"),
+      eq(workspaceOperations.status, "running"),
+      isNull(workspaceOperations.finishedAt),
+      sql`${workspaceOperations.metadata}->>'owningService' = 'native_workspace_finalizer'`,
+    )).where(and(
+      eq(heartbeatRuns.companyId, companyId),
+      eq(heartbeatRuns.runtimeMode, "native"),
+      inArray(heartbeatRuns.id, runIds),
+      or(
+        and(inArray(heartbeatRuns.status, ["queued", "running"]), isNull(heartbeatRuns.finishedAt)),
+        isNotNull(workspaceOperations.id),
+      ),
+    )).orderBy(desc(workspaceOperations.startedAt));
+    const activityByRun = new Map<string, (typeof activity)[number]>();
+    for (const row of activity) {
+      const liveOperation = row.workspaceOperationId && row.issueId
+        && isNativeWorkspaceFinalizationOperationActive({
+          operationId: row.workspaceOperationId, companyId, runId: row.runId, issueId: row.issueId,
+        });
+      const liveHeartbeat = ["queued", "running"].includes(row.status) && row.finishedAt === null;
+      if (!liveHeartbeat && !liveOperation) continue;
+      const projected = { ...row, workspaceOperationId: liveOperation ? row.workspaceOperationId : null };
+      if (!activityByRun.has(row.runId) || (!activityByRun.get(row.runId)?.workspaceOperationId && liveOperation)) {
+        activityByRun.set(row.runId, projected);
+      }
+    }
+    for (const action of nativeActions) {
+      const row = activityByRun.get(String(action.wakePolicy?.runId).toLowerCase());
+      if (!row || row.issueId !== action.sourceIssueId) continue;
+      action.nativeRunActivity = {
+        runId: row.runId,
+        status: row.workspaceOperationId || row.status === "running" ? "running" : "queued",
+        workspaceOperationId: row.workspaceOperationId,
+      };
+    }
+  }
+
   async function getActiveForIssue(
     companyId: string,
     sourceIssueId: string,
@@ -231,7 +313,9 @@ export function issueRecoveryActionService(db: Db) {
       await expireRow(dbOrTx, row, now);
       return null;
     }
-    return toReadModel(row);
+    const action = toReadModel(row);
+    await projectNativeRunActivity(companyId, [action], dbOrTx);
+    return action;
   }
 
   async function listActiveForIssues(companyId: string, sourceIssueIds: string[]) {
@@ -257,6 +341,7 @@ export function issueRecoveryActionService(db: Db) {
       if (isExpiredActiveRow(row, now)) continue;
       if (!result.has(row.sourceIssueId)) result.set(row.sourceIssueId, toReadModel(row));
     }
+    await projectNativeRunActivity(companyId, [...result.values()], db);
     return result;
   }
 
@@ -319,6 +404,12 @@ export function issueRecoveryActionService(db: Db) {
   ): Promise<IssueRecoveryAction> {
     try {
       const created = await db.transaction(async (tx) => {
+        await notifyAttentionRetentionWork(tx, { companyId: input.companyId });
+        await notifyIssueRecovery(tx, { companyId: input.companyId });
+        await notifyNativeRecoveryNotices(tx, { companyId: input.companyId, issueId: input.sourceIssueId });
+        await notifyDeliveryWork(tx, DELIVERY_QUEUES.executionDisposition);
+        await notifyDeliveryWork(tx, DELIVERY_QUEUES.executionContinuation);
+        await notifyUnsafeWorkspaceExportRecovery(tx, { companyId: input.companyId, issueId: input.sourceIssueId });
         const [superseded] = await tx
           .update(issueRecoveryActions)
           .set({
@@ -358,6 +449,7 @@ export function issueRecoveryActionService(db: Db) {
   ): Promise<IssueRecoveryAction> {
     const existing = await getActiveForIssue(input.companyId, input.sourceIssueId);
     const now = new Date();
+    if (existing && input.createOnly) return existing;
     const ownerType = input.ownerType ?? (input.ownerAgentId ? "agent" : "board");
     if (existing) {
       // A distinct failure identity must not overwrite the active action of a
@@ -376,6 +468,18 @@ export function issueRecoveryActionService(db: Db) {
       // beyond the advertised cap. A distinct identity can still supersede the
       // exhausted action through the branch above.
       if (isRecoveryBudgetExhausted(existing.evidence ?? {})) {
+        // Older sweeps replaced this operator-only hold with instructions to
+        // start another run. Restore the exact copyback recovery instructions
+        // without reopening its budget or erasing a recorded stop confirmation.
+        if (existing.cause === "native_workspace_finalization_owner_unverified"
+          && input.cause === existing.cause && input.fingerprint === existing.fingerprint
+          && !existing.evidence?.workspaceOwnerStop && existing.nextAction !== input.nextAction) {
+          const [updated] = await writeExecutionControl(db, [DELIVERY_QUEUES.executionDisposition, DELIVERY_QUEUES.executionContinuation], tx => tx.update(issueRecoveryActions).set({ nextAction: input.nextAction, updatedAt: now })
+            .where(and(eq(issueRecoveryActions.id, existing.id),
+              inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES]),
+              sql`${issueRecoveryActions.evidence}->'workspaceOwnerStop' is null`)).returning(), { companyId: input.companyId });
+          if (updated) return toReadModel(updated);
+        }
         return existing;
       }
       const nextAttemptCount =
@@ -393,54 +497,63 @@ export function issueRecoveryActionService(db: Db) {
           existing.attemptCount,
           Math.min(nextAttemptCount, effectiveMaxAttempts),
         );
-        const [exhausted] = await db
-          .update(issueRecoveryActions)
-          .set({
-            status: "escalated",
-            ownerType: "board",
-            ownerAgentId: null,
-            ownerUserId: null,
-            previousOwnerAgentId:
-              existing.ownerAgentId ?? existing.previousOwnerAgentId,
-            returnOwnerAgentId:
-              input.returnOwnerAgentId ??
-              existing.returnOwnerAgentId ??
-              existing.ownerAgentId,
-            evidence: {
-              ...(existing.evidence ?? {}),
-              ...(input.evidence ?? {}),
-              recoveryBudget: {
-                state: "exhausted",
-                attemptsUsed,
-                maxAttempts: effectiveMaxAttempts,
-                exhaustedAt: now.toISOString(),
-                cause: existing.cause,
-                fingerprint: existing.fingerprint,
+        const [exhausted] = await writeExecutionControl(db, [DELIVERY_QUEUES.executionDisposition, DELIVERY_QUEUES.executionContinuation], async tx => {
+          await notifyIssueRecovery(tx, { companyId: input.companyId });
+          await notifyNativeRecoveryNotices(tx, { companyId: input.companyId, issueId: input.sourceIssueId });
+          if ((!input.preserveExistingOwner && existing.cause !== input.cause)
+            || (input.evidence?.runId !== undefined && input.evidence.runId !== existing.evidence?.runId)) {
+            await notifyUnsafeWorkspaceExportRecovery(tx, { companyId: input.companyId, issueId: input.sourceIssueId });
+          }
+          return tx
+            .update(issueRecoveryActions)
+            .set({
+              status: "escalated",
+              ownerType: existing.ownerType === "system" || input.ownerType === "system" ? "system" : "board",
+              ownerAgentId: null,
+              ownerUserId: null,
+              previousOwnerAgentId:
+                existing.ownerAgentId ?? existing.previousOwnerAgentId,
+              returnOwnerAgentId:
+                input.returnOwnerAgentId ??
+                existing.returnOwnerAgentId ??
+                existing.ownerAgentId,
+              evidence: {
+                ...(existing.evidence ?? {}),
+                ...(input.evidence ?? {}),
+                recoveryBudget: {
+                  state: "exhausted",
+                  attemptsUsed,
+                  maxAttempts: effectiveMaxAttempts,
+                  exhaustedAt: now.toISOString(),
+                  cause: existing.cause,
+                  fingerprint: existing.fingerprint,
+                },
               },
-            },
-            nextAction:
-              `Automatic recovery exhausted after ${attemptsUsed}/${effectiveMaxAttempts} attempts. ` +
-              "Review the infrastructure failure and explicitly choose a replacement run or provider configuration.",
-            wakePolicy: null,
-            monitorPolicy: null,
-            attemptCount: attemptsUsed,
-            maxAttempts: effectiveMaxAttempts,
-            timeoutAt: null,
-            lastAttemptAt: input.lastAttemptAt ?? now,
-            outcome: "escalated",
-            resolutionNote: null,
-            resolvedAt: null,
-            updatedAt: now,
-          })
-          .where(
-            and(
-              eq(issueRecoveryActions.id, existing.id),
-              inArray(issueRecoveryActions.status, [
-                ...ACTIVE_RECOVERY_ACTION_STATUSES,
-              ]),
-            ),
-          )
-          .returning();
+              nextAction: existing.cause === "native_workspace_finalization_owner_unverified"
+                ? input.nextAction
+                : `Automatic recovery exhausted after ${attemptsUsed}/${effectiveMaxAttempts} attempts. ` +
+                "Review the infrastructure failure and explicitly choose a replacement run or provider configuration.",
+              wakePolicy: null,
+              monitorPolicy: null,
+              attemptCount: attemptsUsed,
+              maxAttempts: effectiveMaxAttempts,
+              timeoutAt: null,
+              lastAttemptAt: input.lastAttemptAt ?? now,
+              outcome: "escalated",
+              resolutionNote: null,
+              resolvedAt: null,
+              updatedAt: now,
+            })
+            .where(
+              and(
+                eq(issueRecoveryActions.id, existing.id),
+                inArray(issueRecoveryActions.status, [
+                  ...ACTIVE_RECOVERY_ACTION_STATUSES,
+                ]),
+              ),
+            )
+            .returning();
+        }, { companyId: input.companyId });
         if (!exhausted) {
           return retryUpsertSourceScoped(input, retryCount);
         }
@@ -456,66 +569,74 @@ export function issueRecoveryActionService(db: Db) {
       // routing still preserves.
       const causeChanged = existing.cause !== input.cause;
       const preserveClassification = input.preserveExistingOwner && !causeChanged;
-      const [updated] = await db
-        .update(issueRecoveryActions)
-        .set({
-          recoveryIssueId: input.preserveExistingOwner
-            ? existing.recoveryIssueId
-            : input.recoveryIssueId ?? null,
-          kind: preserveClassification ? existing.kind : input.kind,
-          status: input.preserveExistingOwner ? existing.status : "active",
-          ownerType: input.preserveExistingOwner ? existing.ownerType : ownerType,
-          ownerAgentId: input.preserveExistingOwner
-            ? existing.ownerAgentId
-            : input.ownerAgentId ?? null,
-          ownerUserId: input.preserveExistingOwner
-            ? existing.ownerUserId
-            : input.ownerUserId ?? null,
-          previousOwnerAgentId: input.preserveExistingOwner
-            ? existing.previousOwnerAgentId
-            : input.previousOwnerAgentId ?? existing.previousOwnerAgentId,
-          returnOwnerAgentId: input.preserveExistingOwner
-            ? existing.returnOwnerAgentId
-            : input.returnOwnerAgentId ?? existing.returnOwnerAgentId,
-          cause: preserveClassification ? existing.cause : input.cause,
-          fingerprint: preserveClassification ? existing.fingerprint : input.fingerprint,
-          evidence: input.preserveExistingOwner
-            ? {
-              ...(existing.evidence ?? {}),
-              ...(input.evidence ?? {}),
-            }
-            : input.evidence ?? existing.evidence,
-          nextAction: preserveClassification ? existing.nextAction : input.nextAction,
-          wakePolicy: preserveClassification
-            ? existing.wakePolicy
-            : input.wakePolicy ?? null,
-          monitorPolicy: preserveClassification
-            ? existing.monitorPolicy
-            : input.monitorPolicy ?? null,
-          attemptCount: nextAttemptCount,
-          maxAttempts: input.preserveExistingOwner
-            ? existing.maxAttempts
-            : input.maxAttempts === undefined
+      const [updated] = await writeExecutionControl(db, [DELIVERY_QUEUES.executionDisposition, DELIVERY_QUEUES.executionContinuation], async tx => {
+        await notifyIssueRecovery(tx, { companyId: input.companyId });
+        await notifyNativeRecoveryNotices(tx, { companyId: input.companyId, issueId: input.sourceIssueId });
+        if (causeChanged
+          || (input.evidence?.runId !== undefined && input.evidence.runId !== existing.evidence?.runId)) {
+          await notifyUnsafeWorkspaceExportRecovery(tx, { companyId: input.companyId, issueId: input.sourceIssueId });
+        }
+        return tx
+          .update(issueRecoveryActions)
+          .set({
+            recoveryIssueId: input.preserveExistingOwner
+              ? existing.recoveryIssueId
+              : input.recoveryIssueId ?? null,
+            kind: preserveClassification ? existing.kind : input.kind,
+            status: input.preserveExistingOwner ? existing.status : "active",
+            ownerType: input.preserveExistingOwner ? existing.ownerType : ownerType,
+            ownerAgentId: input.preserveExistingOwner
+              ? existing.ownerAgentId
+              : input.ownerAgentId ?? null,
+            ownerUserId: input.preserveExistingOwner
+              ? existing.ownerUserId
+              : input.ownerUserId ?? null,
+            previousOwnerAgentId: input.preserveExistingOwner
+              ? existing.previousOwnerAgentId
+              : input.previousOwnerAgentId ?? existing.previousOwnerAgentId,
+            returnOwnerAgentId: input.preserveExistingOwner
+              ? existing.returnOwnerAgentId
+              : input.returnOwnerAgentId ?? existing.returnOwnerAgentId,
+            cause: preserveClassification ? existing.cause : input.cause,
+            fingerprint: preserveClassification ? existing.fingerprint : input.fingerprint,
+            evidence: input.preserveExistingOwner
+              ? {
+                ...(existing.evidence ?? {}),
+                ...(input.evidence ?? {}),
+              }
+              : input.evidence ?? existing.evidence,
+            nextAction: preserveClassification ? existing.nextAction : input.nextAction,
+            wakePolicy: preserveClassification
+              ? existing.wakePolicy
+              : input.wakePolicy ?? null,
+            monitorPolicy: preserveClassification
+              ? existing.monitorPolicy
+              : input.monitorPolicy ?? null,
+            attemptCount: nextAttemptCount,
+            maxAttempts: input.preserveExistingOwner
               ? existing.maxAttempts
-              : input.maxAttempts,
-          timeoutAt: input.preserveExistingOwner
-            ? asDatabaseDate(existing.timeoutAt)
-            : defaultTimeoutAt(input.timeoutAt, now),
-          lastAttemptAt: input.preserveExistingOwner
-            ? asDatabaseDate(existing.lastAttemptAt)
-            : input.lastAttemptAt ?? now,
-          outcome: input.preserveExistingOwner ? existing.outcome : null,
-          resolutionNote: input.preserveExistingOwner ? existing.resolutionNote : null,
-          resolvedAt: null,
-          updatedAt: now,
-        })
-        .where(
-          and(
-            eq(issueRecoveryActions.id, existing.id),
-            inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES]),
-          ),
-        )
-        .returning();
+              : input.maxAttempts === undefined
+                ? existing.maxAttempts
+                : input.maxAttempts,
+            timeoutAt: input.preserveExistingOwner
+              ? asDatabaseDate(existing.timeoutAt)
+              : defaultTimeoutAt(input.timeoutAt, now),
+            lastAttemptAt: input.preserveExistingOwner
+              ? asDatabaseDate(existing.lastAttemptAt)
+              : input.lastAttemptAt ?? now,
+            outcome: input.preserveExistingOwner ? existing.outcome : null,
+            resolutionNote: input.preserveExistingOwner ? existing.resolutionNote : null,
+            resolvedAt: null,
+            updatedAt: now,
+          })
+          .where(
+            and(
+              eq(issueRecoveryActions.id, existing.id),
+              inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES]),
+            ),
+          )
+          .returning();
+      }, { companyId: input.companyId });
       if (!updated) {
         return retryUpsertSourceScoped(input, retryCount);
       }
@@ -523,10 +644,15 @@ export function issueRecoveryActionService(db: Db) {
     }
 
     try {
-      const [created] = await db
-        .insert(issueRecoveryActions)
-        .values(buildInsertValues(input, ownerType, now))
-        .returning();
+      const [created] = await writeExecutionControl(db, [DELIVERY_QUEUES.executionDisposition, DELIVERY_QUEUES.executionContinuation], async tx => {
+        await notifyIssueRecovery(tx, { companyId: input.companyId });
+        await notifyNativeRecoveryNotices(tx, { companyId: input.companyId, issueId: input.sourceIssueId });
+        await notifyUnsafeWorkspaceExportRecovery(tx, { companyId: input.companyId, issueId: input.sourceIssueId });
+        return tx
+          .insert(issueRecoveryActions)
+          .values(buildInsertValues(input, ownerType, now))
+          .returning();
+      }, { companyId: input.companyId });
       return toReadModel(created!);
     } catch (error) {
       if (!isUniqueRecoveryActionConflict(error)) throw error;
@@ -563,17 +689,25 @@ export function issueRecoveryActionService(db: Db) {
       predicates.push(eq(issueRecoveryActions.fingerprint, input.fingerprint));
     }
 
-    const [updated] = await dbOrTx
-      .update(issueRecoveryActions)
-      .set({
-        status: input.status,
-        outcome: input.outcome,
-        resolutionNote: input.resolutionNote ?? null,
-        resolvedAt: now,
-        updatedAt: now,
-      })
-      .where(and(...predicates))
-      .returning();
+    const [updated] = await writeExecutionControl(dbOrTx, [DELIVERY_QUEUES.executionDisposition, DELIVERY_QUEUES.executionContinuation], async tx => {
+      const pending = await tx.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions)
+        .where(and(...predicates)).limit(1);
+      if (!pending.length) return [];
+      await notifyIssueRecovery(tx, { companyId: input.companyId });
+      await notifyNativeRecoveryNotices(tx, { companyId: input.companyId, issueId: input.sourceIssueId });
+      await notifyUnsafeWorkspaceExportRecovery(tx, { companyId: input.companyId, issueId: input.sourceIssueId });
+      return tx
+        .update(issueRecoveryActions)
+        .set({
+          status: input.status,
+          outcome: input.outcome,
+          resolutionNote: input.resolutionNote ?? null,
+          resolvedAt: now,
+          updatedAt: now,
+        })
+        .where(and(...predicates))
+        .returning();
+    }, { companyId: input.companyId });
 
     return updated ? toReadModel(updated) : null;
   }
