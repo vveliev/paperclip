@@ -1,6 +1,14 @@
 #!/bin/sh
 set -e
 
+# Timestamped progress lines make the pre-start phase (container start to
+# the first app log line) measurable from the container log alone.
+log() {
+    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) docker-entrypoint.sh: $*"
+}
+
+log "starting"
+
 # Capture runtime UID/GID from environment variables, defaulting to 1000
 PUID=${USER_UID:-1000}
 PGID=${USER_GID:-1000}
@@ -15,19 +23,59 @@ if [ "$(id -u)" -ne 0 ]; then
     if [ "$(id -u)" -ne "$PUID" ] || [ "$(id -g)" -ne "$PGID" ]; then
         echo "docker-entrypoint.sh: running unprivileged as $(id -u):$(id -g); cannot remap to requested ${PUID}:${PGID}" >&2
     fi
+    log "starting app as $(id -u):$(id -g)"
     exec "$@"
 fi
 
-# Adjust the node user's UID/GID if they differ from the runtime request
-if [ "$(id -u node)" -ne "$PUID" ]; then
+# Adjust the node user's UID/GID if they differ from the runtime request.
+#
+# `usermod -u` and `usermod -g` also re-own every file under the user's home
+# directory. When that home is the app home (the data volume), the walk can
+# take minutes on a large home, and the app cannot start until it ends. In
+# that case the remap runs while the home points at a placeholder path that
+# does not exist, so usermod changes only the account, and the ownership probe
+# below repairs the app home when the IDs really changed (the home directory
+# itself then has the old owner, which the shallow probe detects on the same
+# boot). A passwd home outside the app home is not covered by that probe, so
+# it keeps the plain usermod behavior, which re-owns it.
+#
+# The placeholder embeds the original home, so a boot that stops between the
+# two usermod -d calls is repaired on the next start of the same container.
+remap_home_prefix="/nonexistent/paperclip-uid-remap"
+node_home="$(getent passwd node 2>/dev/null | cut -d: -f6 || true)"
+case "$node_home" in
+    "$remap_home_prefix"/*)
+        node_home="${node_home#"$remap_home_prefix"}"
+        echo "Restoring node home to $node_home after an interrupted remap"
+        usermod -d "$node_home" node
+        ;;
+esac
+
+remap_uid=0
+remap_gid=0
+[ "$(id -u node)" -ne "$PUID" ] && remap_uid=1
+[ "$(id -g node)" -ne "$PGID" ] && remap_gid=1
+app_home="${PAPERCLIP_HOME:-/paperclip}"
+move_home=0
+if { [ "$remap_uid" -eq 1 ] || [ "$remap_gid" -eq 1 ]; } \
+    && [ -n "$node_home" ] && [ "${node_home%/}" = "${app_home%/}" ]; then
+    move_home=1
+    usermod -d "$remap_home_prefix$node_home" node
+fi
+
+if [ "$remap_uid" -eq 1 ]; then
     echo "Updating node UID to $PUID"
     usermod -o -u "$PUID" node
 fi
 
-if [ "$(id -g node)" -ne "$PGID" ]; then
+if [ "$remap_gid" -eq 1 ]; then
     echo "Updating node GID to $PGID"
     groupmod -o -g "$PGID" node
     usermod -g "$PGID" node
+fi
+
+if [ "$move_home" -eq 1 ]; then
+    usermod -d "$node_home" node
 fi
 
 # Ensure the app home is owned by the runtime user BEFORE dropping
@@ -37,79 +85,68 @@ fi
 # remap-only condition dropped privileges onto an unwritable home and the
 # server crashed on its first mkdir.
 #
-# The probe used to be a first-mismatch find over the WHOLE tree. That is
-# correct but not scoped to the failure mode it exists for: a fresh mount,
-# a backup restore, or an init container all land wrong ownership at (or
-# near) the volume root, not several million inodes deep inside a single
-# leaf directory. On a long-lived PVC that accumulates per-project working
-# trees (each with its own node_modules), the full walk costs 20-60+
-# minutes of nothing-found metadata reads on every single restart -- see
-# home-lab#(paperclip disk incident, 2026-08-30) for a walk that ran past
-# an hour on a ~2.3M-inode volume. That's the same shape of problem
-# home-lab#287 already fixed on the kubelet side: fsGroupChangePolicy:
-# OnRootMismatch stopped kubelet's own recursive chown by trusting the
-# mount root's ownership as a proxy for the whole volume. This mirrors
-# that same trade-off at the application layer: check the root and its
-# immediate children (cheap, bounded by the number of top-level entries,
-# not by tree depth) rather than walking every leaf. A mismatch confined
-# to a deeply nested path with an otherwise-correct root/children would
-# no longer be caught here -- accepted, because every mismatch we've
-# actually hit (fresh mount, restore, remap) has shown up at this depth,
-# and a real deep-tree miss surfaces as a diagnosable EACCES at runtime
-# rather than a silent multi-hour boot.
+# A full-tree probe costs one stat per file. On a home with many agent
+# worktrees and node_modules trees that is minutes of boot time, so the
+# probe is tiered:
+#  1. A shallow probe (the home and its first few levels) runs on every
+#     boot. It catches a fresh root-owned mount and a UID/GID remap, because
+#     both change the owner of the home directory itself.
+#  2. A full-tree probe runs only when the marker file below is missing or
+#     records a different node UID/GID. It catches a mismatch deeper in the
+#     tree (init containers, backup restores, files written before a remap,
+#     the first boot after an upgrade from an older image).
+# Any mismatch repairs the whole tree. After a clean probe or a repair, the
+# marker records the verified node UID/GID, so later boots skip the full
+# walk. Delete the marker to force a full probe on the next boot.
 home_dir="${PAPERCLIP_HOME:-/paperclip}"
-if [ -d "$home_dir" ] && [ -n "$(find "$home_dir" -maxdepth 1 \( ! -user node -o ! -group node \) -print -quit 2>/dev/null)" ]; then
-    chown -R node:node "$home_dir"
+ownership_marker="$home_dir/.paperclip-ownership-verified"
+ownership_shallow_depth=3
+
+# Sets needs_repair=1 when any entry is not node:node, and probe_failed=1
+# when find exits non-zero (for example, an I/O error), so an incomplete
+# walk is never recorded as verified. The arguments bound the walk (empty
+# for the full tree); -quit stops at the first mismatch.
+probe_ownership() {
+    if ! first_mismatch="$(find "$home_dir" "$@" \( ! -user node -o ! -group node \) -print -quit 2>/dev/null)"; then
+        probe_failed=1
+        log "ownership probe of $home_dir failed; it will run again on the next boot"
+    fi
+    if [ -n "$first_mismatch" ]; then
+        needs_repair=1
+    fi
+}
+
+if [ -d "$home_dir" ]; then
+    expected_marker="v1 $(id -u node):$(id -g node)"
+    current_marker="$(cat "$ownership_marker" 2>/dev/null || true)"
+    needs_repair=0
+    probe_failed=0
+    probe_ownership -maxdepth "$ownership_shallow_depth"
+    if [ "$needs_repair" -eq 0 ] && [ "$current_marker" != "$expected_marker" ]; then
+        log "full ownership probe of $home_dir (no current marker)"
+        probe_started=$(date +%s)
+        probe_ownership
+        log "full ownership probe finished in $(( $(date +%s) - probe_started ))s"
+    fi
+
+    if [ "$needs_repair" -eq 1 ]; then
+        log "repairing ownership of $home_dir to node:node"
+        repair_started=$(date +%s)
+        chown -R node:node "$home_dir"
+        log "ownership repair finished in $(( $(date +%s) - repair_started ))s"
+    fi
+
+    # Record the marker only when the tree is known good: a successful
+    # recursive chown (set -e stops the script if it fails), or probes that
+    # all completed without a mismatch.
+    if [ "$current_marker" != "$expected_marker" ] && { [ "$needs_repair" -eq 1 ] || [ "$probe_failed" -eq 0 ]; }; then
+        # Write as node so the marker itself never trips the shallow probe
+        # (root-squashed network mounts included). Best effort: a read-only
+        # home only costs a full probe on the next boot.
+        # shellcheck disable=SC2016 # $1/$2 expand in the inner shell
+        gosu node sh -c 'printf "%s\n" "$1" > "$2"' sh "$expected_marker" "$ownership_marker" 2>/dev/null || true
+    fi
 fi
 
-# The check above is shallow by design, so a real mismatch confined to a
-# deep path (buried inside some project's git worktree, say) would never
-# get caught by it. Backfill that gap off the critical path instead of
-# widening the startup check: once per PAPERCLIP_OWNERSHIP_AUDIT_INTERVAL_DAYS
-# (default weekly), walk the whole tree in the background at the lowest
-# scheduling priority and repair anything wrong. A marker file on the
-# volume itself (not in-process state) tracks when it last ran, so this
-# stays a cheap single stat() on every restart that isn't due -- the
-# common case -- rather than re-running on a timer that resets whenever
-# the pod does. Runs as root (before gosu drops privileges below) since
-# repairing ownership needs it; exec later doesn't kill this -- it only
-# replaces the calling shell, so the backgrounded subshell is reparented
-# to tini and keeps running. The marker itself is written via `gosu node`
-# rather than root + a follow-up chown: a root-owned marker sitting at the
-# volume root would be exactly the kind of top-level mismatch the shallow
-# startup probe above looks for, silently defeating its fast path (and, on
-# a fully clean tree, tripping a chown on every single boot) from the very
-# next restart on.
-audit_marker="$home_dir/.ownership-audit-last-run"
-audit_interval_days="${PAPERCLIP_OWNERSHIP_AUDIT_INTERVAL_DAYS:-7}"
-(
-    if [ -d "$home_dir" ]; then
-        now=$(date +%s)
-        last=0
-        [ -f "$audit_marker" ] && last=$(cat "$audit_marker" 2>/dev/null || echo 0)
-        case "$last" in ''|*[!0-9]*) last=0 ;; esac
-        age_days=$(( (now - last) / 86400 ))
-        if [ "$age_days" -ge "$audit_interval_days" ]; then
-            # `|| true` is load-bearing. This script runs under `set -e`, and a bare
-            # `var=$(cmd)` assignment propagates the command's exit status. `find`
-            # exits 1 when it cannot read any single path -- a lost+found, a
-            # directory left behind by another container -- even with stderr
-            # discarded. Without this, the first unreadable path anywhere under
-            # $home_dir kills this subshell before it logs, repairs, or writes the
-            # marker, silently disabling the audit forever. A partial scan that
-            # repairs what it can see is the correct outcome here; the whole point
-            # of this block is to be the backstop that still runs.
-            mismatches=$(nice -n 19 find "$home_dir" \( ! -user node -o ! -group node \) -print 2>/dev/null || true)
-            if [ -n "$mismatches" ]; then
-                echo "ownership-audit: mismatched paths found under $home_dir, repairing:" >&2
-                echo "$mismatches" >&2
-                nice -n 19 chown -R node:node "$home_dir"
-            else
-                echo "ownership-audit: full-tree scan of $home_dir clean, no mismatches" >&2
-            fi
-            gosu node sh -c 'date +%s > "$1"' _ "$audit_marker"
-        fi
-    fi
-) &
-
+log "starting app as node"
 exec gosu node "$@"
