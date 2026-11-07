@@ -1490,6 +1490,9 @@ const ISSUE_WAKE_DIAGNOSTIC_KNOWN_REASONS = new Set([
   "native_safe_replacement",
   "chat_control_completed_source",
   "chat_control_recovery_proof_unresolved",
+  "issue_human_assignment",
+  "native_provider_overloaded",
+  "task_retry",
 ]);
 
 const ISSUE_WAKE_DIAGNOSTIC_KNOWN_STATUSES = new Set([

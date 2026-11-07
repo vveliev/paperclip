@@ -723,6 +723,9 @@ describe.skipIf(!support.supported)("public MCP OAuth and tool boundary", () => 
     const f = await expandedFixture();
     try {
       expect(await f.call("paperclip_update_task", { taskId: f.issue.id, requestId: randomUUID(), changes: { title: "Edited", description: "Durable detail" } })).toHaveProperty("task.title", "Edited");
+      // This fork rejects blocking an unassigned issue (GIF-66): nothing ever
+      // wakes to re-examine it. Give the task its acting user as owner first.
+      await db.update(issues).set({ assigneeUserId: f.actor.userId! }).where(eq(issues.id, f.issue.id));
       expect(await f.call("paperclip_block_task", { taskId: f.issue.id, requestId: randomUUID(), unblockDescriptor: { owner: "board", action: "Supply the source file" } })).toHaveProperty("task.status", "blocked");
       expect(await f.call("paperclip_finish_task", { taskId: f.issue.id, requestId: randomUUID() })).toHaveProperty("task.status", "done");
       await db.update(issues).set({ status: "in_review" }).where(eq(issues.id, f.issue.id));
