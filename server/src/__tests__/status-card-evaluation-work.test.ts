@@ -51,6 +51,8 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
     companyId = randomUUID(); agentId = randomUUID(); draining = false; errors.length = 0; wakeup.mockReset();
     compiledQuery = companySearchQuerySchema.parse({ scope: "issues", status: ["blocked"] });
     await db.insert(companies).values({ id: companyId, name: "Status", issuePrefix: `S${companyId.slice(0, 6)}` });
+    // GIF-66 fixtures assign blocked issues to this member (the fork requires a named owner).
+    await db.insert(companyMemberships).values({ companyId, principalType: "user", principalId: "board-user", membershipRole: "member", status: "active" });
     await db.insert(agents).values({ id: agentId, companyId, name: "Summarizer", role: "general", status: "idle", adapterType: "process", adapterConfig: {} });
     await instanceSettingsService(db).updateExperimental({ enableStatusCards: true });
     await Promise.all(Array.from({ length: 4 }, () => db.execute(sql`select pg_sleep(0.01)`)));
@@ -217,7 +219,7 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
     const passes = runs.mock.calls.length;
     hints.mockClear();
     try {
-      await issueService(db).create(companyId, { title: "Source committed after summary search", status: relevant ? "blocked" : "backlog", priority: "medium" });
+      await issueService(db).create(companyId, { title: "Source committed after summary search", status: relevant ? "blocked" : "backlog", assigneeUserId: "board-user", priority: "medium" });
       await vi.waitFor(async () => {
         await vi.advanceTimersByTimeAsync(500);
         await Promise.allSettled([...evaluations]);
@@ -290,6 +292,8 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
     const ownCompany = companyId, ownAgent = agentId;
     companyId = randomUUID(); agentId = randomUUID();
     await db.insert(companies).values({ id: companyId, name: "Other", issuePrefix: `O${companyId.slice(0, 6)}` });
+    // GIF-66 fixtures assign blocked issues to this member (the fork requires a named owner).
+    await db.insert(companyMemberships).values({ companyId, principalType: "user", principalId: "board-user", membershipRole: "member", status: "active" });
     await db.insert(agents).values({ id: agentId, companyId, name: "Other summarizer", role: "general", status: "idle", adapterType: "process", adapterConfig: {} });
     const other = await card();
     companyId = ownCompany; agentId = ownAgent;
@@ -321,6 +325,8 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
     const originalCompany = companyId, originalAgent = agentId;
     companyId = randomUUID(); agentId = randomUUID();
     await db.insert(companies).values({ id: companyId, name: "Other", issuePrefix: `O${companyId.slice(0, 6)}` });
+    // GIF-66 fixtures assign blocked issues to this member (the fork requires a named owner).
+    await db.insert(companyMemberships).values({ companyId, principalType: "user", principalId: "board-user", membershipRole: "member", status: "active" });
     await db.insert(agents).values({ id: agentId, companyId, name: "Other summarizer", role: "general", status: "idle", adapterType: "process", adapterConfig: {} });
     const other = await card("interval");
     const otherIssue = await issueService(db).create(companyId, { title: "Other interval blocker", status: "blocked", assigneeUserId: "board-user", priority: "medium" });
@@ -648,6 +654,8 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
     await issueService(db).create(companyId, { title: "First blocker", status: "blocked", assigneeUserId: "board-user", priority: "medium" });
     companyId = randomUUID(); agentId = randomUUID();
     await db.insert(companies).values({ id: companyId, name: "Other", issuePrefix: `X${companyId.slice(0, 6)}` });
+    // GIF-66 fixtures assign blocked issues to this member (the fork requires a named owner).
+    await db.insert(companyMemberships).values({ companyId, principalType: "user", principalId: "board-user", membershipRole: "member", status: "active" });
     await db.insert(agents).values({ id: agentId, companyId, name: "Other summarizer", role: "general", status: "idle", adapterType: "process", adapterConfig: {} });
     const second = await card();
     await issueService(db).create(companyId, { title: "Second blocker", status: "blocked", assigneeUserId: "board-user", priority: "medium" });

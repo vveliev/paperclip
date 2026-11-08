@@ -110,11 +110,15 @@ describeEmbeddedPostgres("status card routes", () => {
   });
 
   async function seedCompany() {
-    return db
+    const company = await db
       .insert(companies)
       .values({ name: "Status Cards Co", issuePrefix: `SC${randomUUID().slice(0, 6).toUpperCase()}` })
       .returning()
       .then((rows) => rows[0]!);
+    // GIF-66 fixtures assign blocked issues to this member (the fork requires a named owner).
+    await db.insert(companyMemberships).values({ companyId: company.id, principalType: "user", principalId: "board-user",
+      membershipRole: "member", status: "active" });
+    return company;
   }
 
   async function enableStatusCards() {

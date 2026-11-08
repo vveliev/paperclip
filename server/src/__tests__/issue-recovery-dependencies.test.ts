@@ -1,6 +1,6 @@
 import { and, eq, sql } from "drizzle-orm";
 import { expect, it, vi } from "vitest";
-import { heartbeatRuns, issueRecoveryActions, issues } from "@paperclipai/db";
+import { companyMemberships, heartbeatRuns, issueRecoveryActions, issues } from "@paperclipai/db";
 import { issueService } from "../services/issues.js";
 import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
 import { describeIssueRecovery, issueRecoveryFixture } from "./issue-recovery.test-fixture.js";
@@ -16,6 +16,7 @@ describeIssueRecovery("issue recovery production producers and dependencies", ()
     // still find an unassigned blocker to adopt.
     const blocker = (await state.db.insert(issues).values({ companyId: f.companyId, title: "Orphan blocker", status: "blocked",
       createdByAgentId: f.agentId, unblockDescriptor: { owner: "board", action: "Test fixture: orphan blocker." } }).returning())[0]!;
+    await state.db.insert(companyMemberships).values({ companyId: f.companyId, principalType: "user", principalId: "board-user", membershipRole: "member", status: "active" });
     const dependent = await issueService(state.db).create(f.companyId, { title: "Blocked dependent", status: "blocked",
       assigneeUserId: "board-user", blockedByIssueIds: [blocker.id] });
     const completedSource = await issueService(state.db).create(f.companyId, { title: "Completed source", status: "done" });
