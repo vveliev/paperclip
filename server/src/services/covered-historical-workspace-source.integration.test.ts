@@ -111,6 +111,8 @@ describe.skipIf(!support.supported)("covered historical prepared-source preserva
       parentId: f.aliases[0].issue.id, title: "Descendant prepared recovery", executionWorkspaceId: f.workspaceId }).returning())[0]
       : f.aliases[0].issue;
     const [agent] = await db.insert(agents).values({ companyId: f.companyId, name: "Terminal native worker", adapterType: "paperclip_runner" }).returning();
+    // Fork rule: a blocked issue needs an owner, and the failure below blocks it.
+    await db.update(issues).set({ assigneeAgentId: agent.id }).where(eq(issues.id, issue.id));
     const reference = { schema: "paperclip.native-workspace-sync/v3", state: "prepared", workspaceId: f.workspaceId,
       leaseId: randomUUID(), providerLeaseId: randomUUID(), remoteCwd: "/workspaces/retained",
       descriptorSha256: "12".repeat(32), baselineSha256: "34".repeat(32), resourceDisposition: "destroy" };
