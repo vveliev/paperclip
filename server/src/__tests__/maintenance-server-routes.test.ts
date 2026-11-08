@@ -188,8 +188,7 @@ describeDatabase("assembled maintenance server production wiring", () => {
       expect(admitted!.experimental).toMatchObject({ enableWorktreeRunExecution: true,
         worktreeRunExecutionActivatedAt: expect.any(String), worktreeRunExecutionActivationInstanceId: "maintenance-test" });
       const [reconstructed] = await fixture.$client`select status, failure_reason, cleanup_status from environment_leases where id=${leaseId}`;
-      // This fork releases a dead local orphan lease directly (see the startup isolation test).
-      expect(reconstructed).toMatchObject({ status: "expired", failure_reason: "orphaned_local_lease_recovered", cleanup_status: "success" });
+      expect(reconstructed).toMatchObject({ status: "expired", failure_reason: "pending_cleanup_retry", cleanup_status: "success" });
       await server.advance(30_000); await settleClock(server);
       const [cleaned] = await fixture.$client`select status, cleanup_status from environment_leases where id=${leaseId}`;
       expect(cleaned).toMatchObject({ status: "expired", cleanup_status: "success" });
@@ -231,11 +230,9 @@ describeDatabase("assembled maintenance server production wiring", () => {
       for (let step = 0; step < 10; step++) {
         await server.advance(1_000); await delay(50);
         [discovered] = await fixture.$client`select status, failure_reason, provider, provider_lease_id from environment_leases where id=${leaseId}`;
-        if (discovered?.status === "expired") break;
+        if (discovered?.status === "pending_cleanup") break;
       }
-      // This fork releases a dead local orphan lease straight to expired once its
-      // recorded process is gone, instead of routing it through pending_cleanup.
-      expect(discovered).toMatchObject({ status: "expired", failure_reason: "orphaned_local_lease_recovered", provider: "local", provider_lease_id: null });
+      expect(discovered).toMatchObject({ status: "pending_cleanup", failure_reason: "orphaned_active_lease_recovered", provider: "local", provider_lease_id: null });
       const elapsedClockMs = (await server.snapshot()).now - start;
       expect(elapsedClockMs).toBeLessThan(30_000);
       await server.advance(30_000); await settleClock(server);
