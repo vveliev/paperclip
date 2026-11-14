@@ -581,6 +581,8 @@ describe("board retry of accepted workspace export", () => {
       const f = await seed(unsafe);
       await db.update(issues).set({ status: "cancelled" }).where(eq(issues.id, f.issueId));
       await start(); await flush(); await quiet();
+      // This fork rejects a direct cancelled -> blocked move (GIF-49); reopen first.
+      await issueService(db).update(f.issueId, { status: "todo" });
       await issueService(db).update(f.issueId, { status: "blocked" });
       await flush(); expect(await phase(f.runId)).toBe("result_accepted"); await quiet();
     });

@@ -220,7 +220,8 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
       await expect(db.transaction(tx => tx.select({ id: issues.id }).from(issues)
         .where(eq(issues.id, run.linkedIssueId!)).for("update", { noWait: true })))
         .rejects.toMatchObject({ cause: expect.objectContaining({ code: "55P03" }) });
-      changing = issueService(db).update(run.linkedIssueId!, { status: "blocked" });
+      // A deliberate done -> blocked change; this fork requires the GIF-49 opt-in for it.
+      changing = issueService(db).update(run.linkedIssueId!, { status: "blocked", allowTerminalToBlocked: true });
       await vi.waitFor(async () => {
         const rows = await db.execute(sql`select count(*)::int as count from pg_stat_activity
           where datname = current_database() and wait_event_type = 'Lock'
