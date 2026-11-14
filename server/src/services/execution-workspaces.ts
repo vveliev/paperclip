@@ -39,7 +39,11 @@ import { authorizationService, executionWorkspaceReadSqlCondition, projectReadSq
 import type { SQL } from "drizzle-orm";
 import { nativeSessionProviderEvidence } from "./native-runtime/native-session-resume.js";
 import { hasWorkspaceRestoreFailure } from "@paperclipai/shared";
-import { notifyTerminalWorkspaceWork, TERMINAL_WORKSPACE_RETRY_MS } from "./terminal-workspace-work.js";
+import { notifyTerminalWorkspaceWork, terminalWorkspaceTargetsFromHints, type TerminalWorkspaceTargets } from "./terminal-workspace-work.js";
+import {
+  clearTerminalWorkspaceRetry, readTerminalWorkspaceRetry, recordTerminalWorkspaceFailure, terminalWorkspaceFailure,
+  TERMINAL_WORKSPACE_RETRY_KEY, type TerminalWorkspaceFailure,
+} from "./terminal-workspace-retry.js";
 import {
   deleteWorkspaceCompactionTrash,
   findRegenerableWorkspaceDirs,
@@ -265,6 +269,20 @@ export function clearMetadataReopenPendingConsumption(
   return next;
 }
 
+function terminalWorkspaceTargetFilter(targets: TerminalWorkspaceTargets) {
+  const ids = (values: string[]) => sql.join(values.map(id => sql`${id}::uuid`), sql`, `);
+  const byWorkspace = targets.workspaceIds.length ? sql`${executionWorkspaces.id} in (${ids(targets.workspaceIds)})` : undefined;
+  const byIssue = targets.issueIds.length ? sql`(${executionWorkspaces.sourceIssueId} in (
+      with recursive ancestry(id, parent_id) as (
+        select id, parent_id from ${issues} where id in (${ids(targets.issueIds)})
+        union
+        select parent.id, parent.parent_id from ${issues} parent inner join ancestry on parent.id = ancestry.parent_id
+      ) select id from ancestry)
+    or ${executionWorkspaces.id} in (select execution_workspace_id from ${issues}
+      where id in (${ids(targets.issueIds)}) and execution_workspace_id is not null))` : undefined;
+  return or(byWorkspace, byIssue) ?? sql`false`;
+}
+
 const workspaceSourceKeys = ["providerType", "cwd", "providerRef", "projectId", "projectWorkspaceId", "sourceIssueId", "mode", "strategyType", "branchName", "repoUrl", "baseRef"] as const;
 
 function preserveWorkspaceMetadataForPatch(
@@ -290,16 +308,16 @@ function preserveWorkspaceMetadataForPatch(
     }
     if (patch.metadata !== undefined) {
       nextPatch.metadata = { ...nextPatch.metadata };
-      for (const key of ["workspaceProvider", "workspaceProviderOwner", "workspaceProviderSource", "workspaceProviderDestinationRef", "workspaceProviderBaseSha", "workspaceProviderRemoved", "workspaceProviderBranchMode", "workspaceProviderRemoval", "workspaceProviderRetired", "workspaceProviderRestoration", "lifecycleGeneration", "reopenPendingConsumption", "reopenPendingConsumptionSince"] as const) {
+      for (const key of ["workspaceProvider", "workspaceProviderOwner", "workspaceProviderSource", "workspaceProviderPreparationPlacement", "workspaceProviderDestinationRef", "workspaceProviderBaseSha", "workspaceProviderRemoved", "workspaceProviderBranchMode", "workspaceProviderRemoval", "workspaceProviderRetired", "workspaceProviderRestoration", "lifecycleGeneration", "reopenPendingConsumption", "reopenPendingConsumptionSince"] as const) {
         if (current.metadata?.[key] !== undefined) nextPatch.metadata[key] = current.metadata[key];
         else delete nextPatch.metadata[key];
       }
     }
   }
-  const freshIntentKeys = ["workspaceProviderFresh", "runnerTaskFreshWorkspace", "runnerTaskWorkspaceOwner"] as const;
-  if (patch.metadata !== undefined && (patch.metadata !== null || freshIntentKeys.some(key => current.metadata?.[key] !== undefined))) {
+  const coreOwnedKeys = ["workspaceProviderFresh", "runnerTaskFreshWorkspace", "runnerTaskWorkspaceOwner", TERMINAL_WORKSPACE_RETRY_KEY] as const;
+  if (patch.metadata !== undefined && (patch.metadata !== null || coreOwnedKeys.some(key => current.metadata?.[key] !== undefined))) {
     nextPatch.metadata = { ...(nextPatch.metadata ?? patch.metadata) };
-    for (const key of freshIntentKeys) {
+    for (const key of coreOwnedKeys) {
       if (current.metadata?.[key] !== undefined) nextPatch.metadata[key] = current.metadata[key];
       else delete nextPatch.metadata[key];
     }
@@ -1237,6 +1255,11 @@ function toExecutionWorkspace(
   runtimeServices: WorkspaceRuntimeService[] = [],
   deliveryState: ExecutionWorkspaceDeliveryState = "unknown",
 ): ExecutionWorkspace {
+  let metadata = row.metadata ?? null;
+  if (metadata?.workspaceProviderPreparationPlacement !== undefined) {
+    metadata = { ...metadata };
+    delete metadata.workspaceProviderPreparationPlacement;
+  }
   return {
     id: row.id,
     companyId: row.companyId,
@@ -1261,7 +1284,7 @@ function toExecutionWorkspace(
     cleanupEligibleAt: row.cleanupEligibleAt ?? null,
     cleanupReason: row.cleanupReason ?? null,
     config: readExecutionWorkspaceConfig((row.metadata as Record<string, unknown> | null) ?? null),
-    metadata: (row.metadata as Record<string, unknown> | null) ?? null,
+    metadata,
     runtimeServices,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
@@ -1497,6 +1520,45 @@ async function hasPendingTaskWorkspaceRecovery(tx: DbTransaction, input: {
   });
 }
 
+/**
+ * Clears a task's binding to a relative's execution workspace that an older
+ * release created, so its next run realizes its own workspace from the project
+ * base. The relative and the shared workspace are never changed. Does nothing
+ * while another run of the task (other than `runId`) is running or its earlier
+ * run still owns workspace finalization or recovery. Runs inside the caller's
+ * transaction; returns whether the binding was released.
+ */
+export async function releaseAncestorWorkspaceBinding(tx: DbTransaction, input: { companyId: string; issueId: string; runId?: string }) {
+  const [task] = await tx.select().from(issues).where(and(eq(issues.id, input.issueId), eq(issues.companyId, input.companyId))).for("update");
+  if (!task?.executionWorkspaceId || task.workspacePendingSelection) return false;
+  if (!await bindsRelativesExecutionWorkspace(tx, { companyId: input.companyId, executionWorkspaceId: task.executionWorkspaceId, task })) {
+    return false;
+  }
+  const [holder] = await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.companyId, input.companyId), input.runId ? ne(heartbeatRuns.id, input.runId) : undefined,
+    or(eq(heartbeatRuns.nativeIssueId, input.issueId),
+      sql`coalesce(${heartbeatRuns.contextSnapshot}->>'issueId', ${heartbeatRuns.contextSnapshot}->>'taskId') = ${input.issueId}`),
+    eq(heartbeatRuns.status, "running"),
+  )).limit(1);
+  if (holder) return false;
+  if (await hasPendingTaskWorkspaceRecovery(tx, { companyId: input.companyId, issueId: input.issueId, excludeRunId: input.runId })) return false;
+  const selection = task.workspaceSelection;
+  await notifyStatusCardIssueChange(tx, task.companyId);
+  await tx.update(issues).set({
+    executionWorkspaceId: null,
+    executionWorkspacePreference: null,
+    // Without a project workspace the old settings described the relative's
+    // task files; the project's defaults apply instead, as for a top-level task.
+    executionWorkspaceSettings: task.projectWorkspaceId
+      ? buildIndependentTaskWorkspaceSettings(task.executionWorkspaceSettings)
+      : null,
+    ...(selection?.selection.kind === "existing" ? { workspaceSelection: null } : {}),
+    workspaceBindingRevision: task.workspaceBindingRevision + 1,
+    updatedAt: new Date(),
+  }).where(eq(issues.id, task.id));
+  return true;
+}
+
 // Compaction trash older than this belongs to no compaction in progress: the
 // move and the guard finish in one short transaction.
 const WORKSPACE_COMPACTION_TRASH_STALE_MS = 60 * 60 * 1000;
@@ -1516,7 +1578,10 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
     if (!row) throw notFound("Workspace is unavailable");
     let state;
     try { state = await inspectPluginWorkspace(db, opts.pluginWorkerManager, row, recoveryPullRequest); }
-    catch { return { statusInspectionSucceeded: false, warnings: ["Workspace storage inspection is unavailable; data was retained."], git: null }; }
+    catch (error) {
+      const failure = terminalWorkspaceFailure(error);
+      return { statusInspectionSucceeded: false, warnings: [`Workspace storage inspection is unavailable; data was retained. ${failure.message}`], git: null, failure };
+    }
     return { statusInspectionSucceeded: true, warnings: [], git: {
       repoRoot: `/workspaces/${workspace.id}`, workspacePath: `/workspaces/${workspace.id}`,
       branchName: state.branchName, baseRef: workspace.baseRef,
@@ -1739,36 +1804,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       .from(issues).innerJoin(executionWorkspaces, eq(executionWorkspaces.id, issues.executionWorkspaceId))
       .where(and(eq(issues.id, input.issueId), eq(issues.companyId, input.companyId))).limit(1);
     if (!candidate || candidate.sourceIssueId === input.issueId) return false;
-    return db.transaction(async tx => {
-      const [task] = await tx.select().from(issues).where(and(eq(issues.id, input.issueId), eq(issues.companyId, input.companyId))).for("update");
-      if (!task?.executionWorkspaceId || task.workspacePendingSelection) return false;
-      if (!await bindsRelativesExecutionWorkspace(tx, { companyId: input.companyId, executionWorkspaceId: task.executionWorkspaceId, task })) {
-        return false;
-      }
-      const [holder] = await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
-        eq(heartbeatRuns.companyId, input.companyId), ne(heartbeatRuns.id, input.runId),
-        or(eq(heartbeatRuns.nativeIssueId, input.issueId),
-          sql`coalesce(${heartbeatRuns.contextSnapshot}->>'issueId', ${heartbeatRuns.contextSnapshot}->>'taskId') = ${input.issueId}`),
-        eq(heartbeatRuns.status, "running"),
-      )).limit(1);
-      if (holder) return false;
-      if (await hasPendingTaskWorkspaceRecovery(tx, { ...input, excludeRunId: input.runId })) return false;
-      const selection = task.workspaceSelection;
-      await notifyStatusCardIssueChange(tx, task.companyId);
-      await tx.update(issues).set({
-        executionWorkspaceId: null,
-        executionWorkspacePreference: null,
-        // Without a project workspace the old settings described the relative's
-        // task files; the project's defaults apply instead, as for a top-level task.
-        executionWorkspaceSettings: task.projectWorkspaceId
-          ? buildIndependentTaskWorkspaceSettings(task.executionWorkspaceSettings)
-          : null,
-        ...(selection?.selection.kind === "existing" ? { workspaceSelection: null } : {}),
-        workspaceBindingRevision: task.workspaceBindingRevision + 1,
-        updatedAt: new Date(),
-      }).where(eq(issues.id, task.id));
-      return true;
-    });
+    return db.transaction(tx => releaseAncestorWorkspaceBinding(tx, input));
   }
 
   async function bindTaskWorkspace(companyId: string, issueId: string, workspaceId: string, patch: TaskWorkspaceBindingPatch = {}) {
@@ -2747,10 +2783,12 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       reuseEligible?: boolean;
       selectableForTask?: boolean;
       readCondition?: SQL<boolean>;
+      ids?: string[];
     },
   ) {
     const conditions = [eq(executionWorkspaces.companyId, companyId)];
     if (filters?.readCondition) conditions.push(filters.readCondition);
+    if (filters?.ids) conditions.push(inArray(executionWorkspaces.id, filters.ids));
     if (filters?.projectId) conditions.push(eq(executionWorkspaces.projectId, filters.projectId));
     if (filters?.projectWorkspaceId) {
       conditions.push(eq(executionWorkspaces.projectWorkspaceId, filters.projectWorkspaceId));
@@ -3037,6 +3075,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       reuseEligible?: boolean;
       selectableForTask?: boolean;
       readCondition?: SQL<boolean>;
+      ids?: string[];
     }, pagination?: { limit: number; cursor?: string }) => {
       const conditions = buildListConditions(companyId, filters);
       if (pagination?.cursor) conditions.push(gt(executionWorkspaces.id, pagination.cursor));
@@ -3493,7 +3532,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
     // `compact: false` skips workspace compaction and compaction-trash deletion
     // for this sweep only. Pending compactions keep their deadlines, so a later
     // sweep runs them.
-    sweepTerminalWorkspaces: async (limit = 50, signal?: AbortSignal, options: { compact?: boolean; allowRemoteDeliveryChecks?: boolean } = {}) => {
+    sweepTerminalWorkspaces: async (limit = 50, signal?: AbortSignal, options: { compact?: boolean; allowRemoteDeliveryChecks?: boolean; targets?: TerminalWorkspaceTargets } = {}) => {
       // Skip this sweep while another sweep runs. A concurrent sweep would share
       // the cursor and the boundary and could corrupt the rotation state. A
       // skipped tick is safe: the next tick runs the sweep with intact state.
@@ -3542,13 +3581,14 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       // predicate uses the same (updatedAt, id) order as the query, so each
       // sweep advances past the rows it already inspected instead of re-reading
       // the oldest ineligible candidates.
-      const cursor = terminalSweepCursor;
+      const targets = options.targets;
+      const cursor = targets ? null : terminalSweepCursor;
       // Freeze an upper bound on updatedAt at the start of each rotation. Without
       // a bound, a steady stream of newer candidates keeps every page full, so
       // the cursor never reaches the end and never resets, and older candidates
       // that became eligible are never revisited. The frozen bound makes the
       // rotation cover a finite set, so the cursor always reaches a short page.
-      if (!cursor) {
+      if (!targets && !cursor) {
         terminalSweepBoundary = now();
         terminalWorkspaceDeadlines.clear();
         isolatedRehomeDeadlines.clear();
@@ -3581,7 +3621,8 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       const cursorFilter = cursor
         ? sql`(${executionWorkspaces.updatedAt}, ${executionWorkspaces.id}) > (${cursor.updatedAt}::timestamptz, ${cursor.id}::uuid)`
         : undefined;
-      const scanFilter = and(baseCandidateFilter, boundaryFilter, cursorFilter);
+      const scanFilter = targets ? and(baseCandidateFilter, terminalWorkspaceTargetFilter(targets))
+        : and(baseCandidateFilter, boundaryFilter, cursorFilter);
       const candidates = await db
         .select({ workspace: executionWorkspaces, cursorAt: sql<string>`${executionWorkspaces.updatedAt}::text` })
         .from(executionWorkspaces)
@@ -3591,10 +3632,11 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       // Advance the cursor to this page's last row. A short page means the scan
       // reached the end of the bounded candidate set, so reset the cursor and
       // the bound to start a new rotation on the next sweep.
-      if (candidates.length < limit) {
+      if (targets && candidates.length >= limit) terminalSweepRescanRequested = true;
+      if (!targets && candidates.length < limit) {
         terminalSweepCursor = null;
         terminalSweepBoundary = null;
-      } else {
+      } else if (!targets) {
         const lastCandidate = candidates[candidates.length - 1]!;
         terminalSweepCursor = { updatedAt: lastCandidate.cursorAt, id: lastCandidate.workspace.id };
       }
@@ -3614,7 +3656,21 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         compacted: 0,
         compactionFailed: 0,
       };
-      const readinessByWorkingTree = new Map<string, ReturnType<typeof inspectGitCloseReadiness>>();
+      const readinessByWorkingTree = new Map<string, ReturnType<typeof inspectWorkspace>>();
+      const backOffTerminalWorkspace = async (snapshot: ExecutionWorkspaceRow, failure: TerminalWorkspaceFailure) => {
+        const [target] = await db.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, snapshot.id));
+        if (!target) return;
+        const generation = readExecutionWorkspaceLifecycleGeneration(target.metadata);
+        const removalFence = (target.metadata?.workspaceProviderRemoval as { generation?: unknown } | null | undefined)?.generation === generation;
+        if (generation !== readExecutionWorkspaceLifecycleGeneration(snapshot.metadata) && !removalFence) return;
+        const retry = await recordTerminalWorkspaceFailure(db, target, generation, failure, now());
+        terminalWorkspaceDeadlines.set(target.id, Date.parse(retry.retryAt));
+        logger.warn({ event: "execution_workspace.terminal_cleanup_retry", executionWorkspaceId: target.id, sourceIssueId: target.sourceIssueId,
+          failures: retry.failures, retryAt: retry.retryAt, failure: retry.failure }, "terminal workspace cleanup failed; a later sweep retries");
+      };
+      const settleTerminalWorkspaceRetry = async (target: ExecutionWorkspaceRow) => {
+        if (target.metadata?.[TERMINAL_WORKSPACE_RETRY_KEY] !== undefined) await clearTerminalWorkspaceRetry(db, target.id);
+      };
       let taskDirectoryBudget = opts.taskDirectoryRetention?.perSweep ?? 8;
       const expireTaskDirectory = async (workspace: ExecutionWorkspaceRow, notBefore: Date) => {
         const settings = opts.taskDirectoryRetention!;
@@ -3845,6 +3901,12 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           result.skippedCooldown += 1;
           continue;
         }
+        const terminalRetry = readTerminalWorkspaceRetry(workspace.metadata, readExecutionWorkspaceLifecycleGeneration(workspace.metadata));
+        if (terminalRetry && Date.parse(terminalRetry.retryAt) > now().getTime()) {
+          terminalWorkspaceDeadlines.set(workspace.id, Date.parse(terminalRetry.retryAt));
+          result.skippedBackoff += 1;
+          continue;
+        }
         if (await workspaceHasActiveRun(workspace)) {
           if (reopenPending) result.skippedReopened += 1;
           else result.skippedActiveRun += 1;
@@ -3856,10 +3918,10 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
             const cleanup = await cleanupTerminalWorkspace(workspace, null, generation);
             if (cleanup.skippedReopened) result.skippedReopened += 1;
             else if (!cleanup.cleaned) result.cleanupFailed += 1;
-            else { result.archived += 1; terminalWorkspaceDeadlines.delete(workspace.id); }
+            else { result.archived += 1; terminalWorkspaceDeadlines.delete(workspace.id); await settleTerminalWorkspaceRetry(workspace); }
           } catch (error) {
             result.cleanupFailed += 1;
-            terminalWorkspaceDeadlines.set(workspace.id, now().getTime() + TERMINAL_WORKSPACE_RETRY_MS);
+            await backOffTerminalWorkspace(workspace, terminalWorkspaceFailure(error));
             await markTerminalCleanupFailedFenced({ workspaceId: workspace.id, capturedGeneration: generation,
               cleanupReason: `${ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON} | ${error instanceof Error ? error.message : String(error)}` });
           }
@@ -3966,11 +4028,19 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           inspection = inspectWorkspace(toExecutionWorkspace(workspace), recoveryPullRequest);
           readinessByWorkingTree.set(readinessKey, inspection);
         }
-        const { git, statusInspectionSucceeded } = await inspection;
+        const inspected = await inspection;
+        const { git, statusInspectionSucceeded } = inspected;
         if (!statusInspectionSucceeded) {
           if (remoteWorkspace) terminalWorkspaceDeadlines.delete(workspace.id);
+          if ("failure" in inspected) await backOffTerminalWorkspace(workspace, inspected.failure);
           result.skippedUndelivered += 1;
           continue;
+        }
+        if (workspace.metadata?.[TERMINAL_WORKSPACE_RETRY_KEY] !== undefined) {
+          await settleTerminalWorkspaceRetry(workspace);
+          const metadata = { ...workspace.metadata };
+          delete metadata[TERMINAL_WORKSPACE_RETRY_KEY];
+          workspace = { ...workspace, metadata };
         }
         if (deliveryCandidate && (git?.headSha !== deliveryCandidate.headSha || git.branchName !== workspace.branchName
           || (await workspaceDeliveryCandidate(workspace))?.operationId !== deliveryCandidate.operationId)) {
@@ -4089,10 +4159,10 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
             const cleanup = await cleanupTerminalWorkspace(workspace, assessment.workspaceHeadSha, generation, recoveryPullRequest, verifyDeliveryBeforeRemove);
             if (cleanup.skippedReopened) result.skippedReopened += 1;
             else if (!cleanup.cleaned) result.cleanupFailed += 1;
-            else { result.archived += 1; terminalWorkspaceDeadlines.delete(workspace.id); }
+            else { result.archived += 1; terminalWorkspaceDeadlines.delete(workspace.id); await settleTerminalWorkspaceRetry(workspace); }
           } catch (error) {
             result.cleanupFailed += 1;
-            terminalWorkspaceDeadlines.set(workspace.id, now().getTime() + TERMINAL_WORKSPACE_RETRY_MS);
+            await backOffTerminalWorkspace(workspace, terminalWorkspaceFailure(error));
             await markTerminalCleanupFailedFenced({ workspaceId: workspace.id, capturedGeneration: generation,
               cleanupReason: `${ISSUE_TERMINAL_WORKSPACE_CLEANUP_REASON} | ${error instanceof Error ? error.message : String(error)}` });
             logger.warn({ err: error, executionWorkspaceId: workspace.id }, "workspace storage cleanup remains pending");
@@ -4225,10 +4295,10 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           const cleanup = await cleanupTerminalWorkspace(archived, assessment.workspaceHeadSha, capturedGeneration, recoveryPullRequest, verifyDeliveryBeforeRemove);
           if (cleanup.skippedReopened) result.skippedReopened += 1;
           else if (!cleanup.cleaned) result.cleanupFailed += 1;
-          else result.archived += 1;
+          else { result.archived += 1; await settleTerminalWorkspaceRetry(archived); }
         } catch (error) {
           result.cleanupFailed += 1;
-          if (archived.providerType === "plugin" || remoteWorkspace) terminalWorkspaceDeadlines.set(archived.id, now().getTime() + TERMINAL_WORKSPACE_RETRY_MS);
+          if (archived.providerType === "plugin" || remoteWorkspace) await backOffTerminalWorkspace(archived, terminalWorkspaceFailure(error));
           const failure = error instanceof Error ? error.message : String(error);
           // Mark cleanup_failed only while the row is still closed at the
           // generation this sweep captured. A reopen that raced after the failure
@@ -4253,8 +4323,10 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       }
       return result;
       } catch (error) {
-        terminalSweepCursor = previousCursor;
-        terminalSweepBoundary = previousBoundary;
+        if (!options.targets) {
+          terminalSweepCursor = previousCursor;
+          terminalSweepBoundary = previousBoundary;
+        }
         terminalSweepRescanRequested = true;
         throw error;
       } finally {
@@ -4264,8 +4336,10 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
 
     hasTerminalWorkspaceSweepContinuation: () => terminalSweepCursor !== null || terminalSweepRescanRequested,
 
-    terminalWorkspaceWorkSettled: (hints?: ReadonlySet<string>) => {
-      if (terminalSweepInProgress || terminalSweepCursor !== null) terminalSweepRescanRequested = true;
+    terminalWorkspaceWorkSettled: (hints?: ReadonlySet<string>, options: { targeted?: boolean } = {}) => {
+      if ((terminalSweepInProgress || terminalSweepCursor !== null) && !(options.targeted && terminalWorkspaceTargetsFromHints(hints))) {
+        terminalSweepRescanRequested = true;
+      }
       pullRequestStateCache.clear();
       if (opts.taskDirectoryRetention) {
         if (!hints) taskDirectoryRowSkips.clear();

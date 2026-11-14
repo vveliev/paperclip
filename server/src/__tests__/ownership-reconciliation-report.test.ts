@@ -10,18 +10,33 @@ import {
   agents,
   budgetPolicies,
   companies,
+  completionContracts,
   createDb,
   environmentLeases,
+  environments,
+  executionWorkspaces,
+  heartbeatRunEvents,
   heartbeatRuns,
+  issueComments,
   issues,
   nativeRunFinalizations,
+  nativeRunResults,
   sandboxCreationOperations,
+  statusDecisions,
+  workAssessments,
+  workspaceOperations,
 } from "@paperclipai/db";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { resolveExternalTestDatabaseUrl } from "./helpers/external-test-database.js";
 import { currentControllerBootId, currentProcessSpaceHash } from "../services/controller-process-identity.js";
 import { createDeliveryWorkCoordinator } from "../services/delivery-work-coordinator.js";
-import { registerOwnershipReconciliationWork } from "../services/native-runtime/native-finalization-reconciler.js";
+import { applyOwnershipReportBackstops, registerOwnershipReconciliationWork } from "../services/native-runtime/native-finalization-reconciler.js";
+import { DELIVERY_QUEUES } from "../services/delivery-work-notifications.js";
+import { notifyNativeFinalizationWork } from "../services/native-finalization-notifications.js";
+import { instanceSettingsService } from "../services/instance-settings.js";
+import { listUndispatchedQueuedRuns, readUndispatchedQueuedRuns, undispatchedQueuedRunPageQuery } from "../services/queued-run-dispatch-liveness.js";
+import { releaseLapsedCoordinatorOwner } from "../services/workspace-recovery-stop-proof.js";
+import { subscribeDatabaseWork } from "@paperclipai/db/work-signals";
 import {
   createOwnershipReportState,
   OWNERSHIP_INVARIANT_VIOLATION_ACTION,
@@ -30,6 +45,11 @@ import {
   type OwnershipReport,
 } from "../services/recovery/ownership-invariant-report.js";
 import { OWNABLE_KINDS } from "../services/recovery/ownership-registry.js";
+import { trackRemoteWorkspaceSaveInvocationForTests } from "../services/remote-workspaces.js";
+import { readRemoteWorkspaceAuthority } from "@paperclipai/shared";
+import { preparedRemoteWorkspaceSource } from "../services/remote-workspace-lifecycle.js";
+import { readRemoteWorkspaceWriterHold } from "../services/remote-workspace-writer-hold.js";
+import { workspaceOperationService } from "../services/workspace-operations.js";
 
 const external = resolveExternalTestDatabaseUrl("PAPERCLIP_HISTORY_TEST_DATABASE_URL");
 
@@ -65,7 +85,7 @@ describe("report-only ownership reconciliation", () => {
 
   beforeEach(async () => {
     await rm(orphanSpool, { recursive: true, force: true });
-    await db.execute(sql`truncate budget_policies, activity_log, agent_wakeup_requests, sandbox_creation_operations, environment_leases,
+    await db.execute(sql`truncate budget_policies, activity_log, workspace_operations, agent_wakeup_requests, sandbox_creation_operations, environment_leases,
       native_run_finalizations, heartbeat_runs, issues, agents, companies cascade`);
     companyId = randomUUID(); agentId = randomUUID();
     await db.insert(companies).values({ id: companyId, name: "Ownership fixture", issuePrefix: "OWN" });
@@ -141,8 +161,7 @@ describe("report-only ownership reconciliation", () => {
     expect(new Set(names).size).toBe(names.length);
     expect(names.length).toBeGreaterThanOrEqual(40);
     expect(OWNABLE_KINDS.filter(kind => kind.settle !== null).map(kind => kind.id))
-      .toEqual(["native_accepted_result_lease", "native_finalizer_lease", "native_cleanup_lease", "environment_run_lease_active",
-        "environment_teardown_claim", "wake_request_claimed", "legacy_controller_lease"]);
+      .toEqual(["native_executor_claim", "native_restart_recovery_claim", "native_awaiting_evidence", "native_accepted_result_lease", "native_finalizer_lease", "native_cleanup_lease", "sandbox_creation_intent", "environment_run_lease_active", "environment_teardown_claim", "environment_retained_orphan_sandbox", "environment_login_probe_lease", "workspace_runtime_control_operation", "native_workspace_finalize_attempt", "workspace_command_operation", "remote_snapshot_save", "execution_workspace_runtime_lease", "remote_workspace_unsaved_files", "remote_snapshot_ledger", "legacy_shutdown_settlement_fence", "copyback_owner_hold", "observed_workspace_preservation_fence", "wake_request_claimed", "legacy_controller_lease", "legacy_interrupted_preparation_hold", "native_completed_turn_cleanup_hold", "issue_execution_lock", "issue_checkout_lock", "agent_lifecycle_lease"]);
     expect(OWNABLE_KINDS.filter(kind => !kind.listInProgress).every(kind => kind.coverageGap)).toBe(true);
   });
 
@@ -157,15 +176,16 @@ describe("report-only ownership reconciliation", () => {
       verdicts: { alive: 1, gone: 0, unprovable: 0 }, reasons: { current_process: 1 } });
     expect(kindReport(first, "environment_run_lease_active")).toMatchObject({ inProgress: 1,
       verdicts: { gone: 1 }, reasons: { owner_run_terminal: 1 } });
+    // The cleanup queue owns an unclaimed item while its retry deadline is current.
     expect(kindReport(first, "environment_pending_cleanup")).toMatchObject({ inProgress: 1,
-      verdicts: { unprovable: 1 }, reasons: { no_owner_stamp: 1 } });
+      verdicts: { alive: 1 }, reasons: { queue_scheduled: 1 } });
     // A different PID space is never proof.
     expect(currentProcessSpaceHash()).not.toBe("another-pid-space");
     expect(kindReport(first, "sandbox_creation_intent")).toMatchObject({ inProgress: 1,
       verdicts: { unprovable: 1 }, reasons: { different_process_space: 1 } });
     expect(kindReport(first, "run_accounting_debt")).toMatchObject({ inProgress: 2 });
 
-    expect(rules(first, "environment_pending_cleanup")).toEqual(["I1_owned"]);
+    expect(rules(first, "environment_pending_cleanup")).toEqual([]);
     // I2 needs the owner proven gone on two consecutive passes.
     expect(rules(first, "environment_run_lease_active")).toEqual([]);
     // Phase 3: pending accounting is exposure, not a gate. Only a refusal that
@@ -203,7 +223,7 @@ describe("report-only ownership reconciliation", () => {
     });
   });
 
-  it("proves a foreign-boot coordinator gone when its PID-space stamp matches and its PID is dead", async () => {
+  it("proves a recorded same-space Native controller gone while keeping a legacy NULL controller unprovable", async () => {
     const issueId = randomUUID(); const runId = randomUUID(); const legacyRunId = randomUUID(); const legacyIssueId = randomUUID();
     await db.insert(issues).values([{ id: issueId, companyId, title: "Dead owner" }, { id: legacyIssueId, companyId, title: "Legacy" }]);
     await db.insert(heartbeatRuns).values([
@@ -216,13 +236,11 @@ describe("report-only ownership reconciliation", () => {
       controllerProcessStartedAt: new Date("2026-11-07T09:00:00.000Z"), controllerGeneration: 1 };
     await db.insert(nativeRunFinalizations).values([
       { ...claim, runId, issueId, controllerHostHash: currentProcessSpaceHash() },
-      // Written before the PID space was stamped: the one-release local proof
-      // on a single-host server (#19883), never on an ephemeral one.
       { ...claim, runId: legacyRunId, issueId: legacyIssueId, controllerHostHash: null },
     ]);
     const report = await runOwnershipReconciliationPass(db, { state: createOwnershipReportState(), record: false });
     expect(kindReport(report, "native_executor_claim")).toMatchObject({ inProgress: 2,
-      verdicts: { gone: 2, unprovable: 0 }, reasons: { pid_dead: 2 } });
+      verdicts: { gone: 1, unprovable: 1 }, reasons: { pid_dead: 1, process_space_unrecorded: 1 } });
     vi.stubEnv("PAPERCLIP_EPHEMERAL_SERVER", "true");
     try {
       const ephemeral = await runOwnershipReconciliationPass(db, { state: createOwnershipReportState(), record: false });
@@ -286,6 +304,346 @@ describe("report-only ownership reconciliation", () => {
     const second = await runOwnershipReconciliationPass(db, { state });
     expect(second.violations.filter(violation => violation.kind === "wake_request_claimed").map(violation => violation.recordId).sort())
       .toEqual([wakes.pending.id, wakes.unprojected.id].sort());
+  });
+
+  // Non-wake recovery (Phase 3): a task lock is owned by the run it names. A
+  // restart between the run's terminal write and the lock release left the
+  // task locked to a dead run until the next periodic sweep. The reconciler
+  // now settles it on the proof (the run's terminal row), never by age.
+  it("settles a task lock whose run ended without releasing it, and keeps live or resuming ones", async () => {
+    const ids = { dead: randomUUID(), live: randomUUID(), resuming: randomUUID() };
+    const runs = { dead: randomUUID(), live: randomUUID(), resuming: randomUUID() };
+    await db.insert(heartbeatRuns).values([
+      { id: runs.dead, companyId, agentId, status: "failed", invocationSource: "manual", finishedAt: minutesAgo(1) },
+      { id: runs.live, companyId, agentId, status: "running", invocationSource: "manual" },
+      { id: runs.resuming, companyId, agentId, status: "failed", invocationSource: "manual", finishedAt: minutesAgo(1),
+        runtimeMode: "native", nativeIssueId: ids.resuming },
+    ]);
+    await db.insert(issues).values(Object.entries(ids).map(([name, id]) => ({ id, companyId, title: name, status: "in_progress",
+      assigneeAgentId: agentId, executionRunId: runs[name as keyof typeof runs], checkoutRunId: runs[name as keyof typeof runs],
+      executionLockedAt: minutesAgo(1) })));
+    // A same-run resume still needs the failed run's lock.
+    await db.insert(nativeRunFinalizations).values({ runId: runs.resuming, companyId, issueId: ids.resuming, phase: "retryable_failure" });
+    const locks = async () => Object.fromEntries((await db.select({ id: issues.id, executionRunId: issues.executionRunId,
+      checkoutRunId: issues.checkoutRunId }).from(issues)).map(row =>
+      [Object.keys(ids).find(name => ids[name as keyof typeof ids] === row.id), row.executionRunId === null && row.checkoutRunId === null]));
+    const allHeld = { dead: false, live: false, resuming: false };
+
+    // A read-only pass never settles.
+    await runOwnershipReconciliationPass(db, { state: createOwnershipReportState(), record: false });
+    expect(await locks()).toEqual(allHeld);
+
+    await runOwnershipReconciliationPass(db, { state: createOwnershipReportState() });
+    expect(await locks()).toEqual({ dead: true, live: false, resuming: false });
+    expect(await db.select({ action: activityLog.action }).from(activityLog).where(eq(activityLog.entityId, ids.dead)))
+      .toContainEqual({ action: "issue.stale_lock_cleared" });
+  });
+
+  it("settles a finalize attempt whose process died mid-copyback, and keeps live or independent ones", async () => {
+    // Crash points workspace.finalize.after_start_before_copyback and
+    // .after_copyback_before_done: the run finished through a later attempt,
+    // but the interrupted attempt stayed `running`.
+    const run = (id: string, status: string) => ({ id, companyId, agentId, status, invocationSource: "manual",
+      ...(status === "running" ? {} : { finishedAt: minutesAgo(2) }) });
+    const runs = { done: randomUUID(), live: randomUUID(), legacyDone: randomUUID(), legacyLive: randomUUID() };
+    await db.insert(heartbeatRuns).values([run(runs.done, "succeeded"), run(runs.live, "running"),
+      run(runs.legacyDone, "succeeded"), run(runs.legacyLive, "running")]);
+    const dead = { bootId: "previous-boot", pid: 4_194_303, hostHash: currentProcessSpaceHash(),
+      processStartedAt: "2026-11-07T09:00:00.000Z" };
+    const ops = { dead: randomUUID(), live: randomUUID(), foreign: randomUUID(), uncertain: randomUUID(),
+      legacyDone: randomUUID(), legacyLive: randomUUID() };
+    const op = (id: string, runId: string, metadata: Record<string, unknown>) => ({ id, companyId, heartbeatRunId: runId,
+      phase: "workspace_finalize", status: "running", metadata });
+    await db.insert(workspaceOperations).values([
+      op(ops.dead, runs.done, { finalizeOwner: dead }),
+      // Stamped by this process and still running here (current boot): alive.
+      op(ops.live, runs.live, { finalizeOwner: { bootId: currentControllerBootId(), pid: process.pid,
+        hostHash: currentProcessSpaceHash(), processStartedAt: null } }),
+      // Another PID space is never proof.
+      op(ops.foreign, runs.done, { finalizeOwner: { ...dead, hostHash: "another-pid-space" } }),
+      op(ops.uncertain, runs.done, { finalizeOwner: dead, uncertain: true }),
+      // Written before the stamp: owned by its run.
+      op(ops.legacyDone, runs.legacyDone, {}),
+      op(ops.legacyLive, runs.legacyLive, {}),
+    ]);
+    const statuses = async () => Object.fromEntries((await db.select({ id: workspaceOperations.id, status: workspaceOperations.status })
+      .from(workspaceOperations)).map(row => [Object.keys(ops).find(name => ops[name as keyof typeof ops] === row.id), row.status]));
+
+    await runOwnershipReconciliationPass(db, { state: createOwnershipReportState(), record: false });
+    expect(Object.values(await statuses()).every(status => status === "running")).toBe(true);
+
+    const state = createOwnershipReportState();
+    const first = await runOwnershipReconciliationPass(db, { state });
+    expect(kindReport(first, "native_workspace_finalize_attempt")).toMatchObject({ inProgress: 6, settled: 2 });
+    expect(await statuses()).toEqual({ dead: "failed", live: "running", foreign: "running", uncertain: "running",
+      legacyDone: "failed", legacyLive: "running" });
+    const [settled] = await db.select().from(workspaceOperations).where(eq(workspaceOperations.id, ops.dead));
+    expect(settled.metadata).toMatchObject({ abandonedFinalization: { reason: "abandoned_workspace_finalization", proof: "pid_dead" } });
+    expect(settled.finishedAt).not.toBeNull();
+    // The run's outcome never changes.
+    const [doneRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runs.done));
+    expect(doneRun.status).toBe("succeeded");
+  });
+
+  it("settles a remote snapshot save that stopped without finishing after its run ended, and keeps open or live ones", async () => {
+    const run = (id: string, status: string) => ({ id, companyId, agentId, status, invocationSource: "manual",
+      ...(status === "running" ? {} : { finishedAt: minutesAgo(2) }) });
+    const runs = { failed: randomUUID(), live: randomUUID() };
+    await db.insert(heartbeatRuns).values([run(runs.failed, "failed"), run(runs.live, "running")]);
+    const quiesced = { schema: "paperclip.remote-workspace-save-work.v1", activeIds: [], unknown: false, quiescedAt: minutesAgo(30).toISOString() };
+    const liveInvocation = randomUUID();
+    const ops = { abandoned: randomUUID(), pendingAbandoned: randomUUID(), liveRun: randomUUID(), activeInvocation: randomUUID(),
+      unknownWork: randomUUID(), notQuiesced: randomUUID(), invalidWork: randomUUID() };
+    const op = (id: string, runId: string, saveWork: Record<string, unknown>, status = "running") => ({ id, companyId, heartbeatRunId: runId,
+      phase: "remote_workspace_snapshot", status,
+      metadata: { epoch: 8, boundary: "final", generation: 9, saveWork, exportCleanup: { state: "pending" } } });
+    await db.insert(workspaceOperations).values([
+      op(ops.abandoned, runs.failed, quiesced),
+      op(ops.pendingAbandoned, runs.failed, quiesced, "pending"),
+      op(ops.liveRun, runs.live, quiesced),
+      op(ops.activeInvocation, runs.failed, { ...quiesced, activeIds: [liveInvocation], quiescedAt: null,
+        owners: { [liveInvocation]: { bootId: currentControllerBootId(), pid: process.pid, hostHash: currentProcessSpaceHash(), processStartedAt: null } } }),
+      op(ops.unknownWork, runs.failed, { ...quiesced, unknown: true }),
+      op(ops.notQuiesced, runs.failed, { ...quiesced, quiescedAt: null }),
+      op(ops.invalidWork, runs.failed, { ...quiesced, quiescedAt: "" }),
+    ]);
+    const statuses = async () => Object.fromEntries((await db.select({ id: workspaceOperations.id, status: workspaceOperations.status })
+      .from(workspaceOperations).where(eq(workspaceOperations.phase, "remote_workspace_snapshot")))
+      .map(row => [Object.keys(ops).find(name => ops[name as keyof typeof ops] === row.id), row.status]));
+
+    const untrack = trackRemoteWorkspaceSaveInvocationForTests(liveInvocation);
+    const first = await runOwnershipReconciliationPass(db, { state: createOwnershipReportState() }).finally(untrack);
+    expect(kindReport(first, "remote_snapshot_save")).toMatchObject({ inProgress: 7, settled: 2 });
+    expect(await statuses()).toEqual({ abandoned: "failed", pendingAbandoned: "failed", liveRun: "running", activeInvocation: "running",
+      unknownWork: "running", notQuiesced: "running", invalidWork: "running" });
+    const [settled] = await db.select().from(workspaceOperations).where(eq(workspaceOperations.id, ops.abandoned));
+    expect(settled.metadata).toMatchObject({ saveWork: quiesced, exportCleanup: { state: "pending" },
+      abandonedSave: { reason: "abandoned_remote_snapshot_save", runId: runs.failed, previousStatus: "running" },
+      lastFailure: { code: "remote_workspace_save_abandoned" } });
+    expect(settled.finishedAt).not.toBeNull();
+    const [failedRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runs.failed));
+    expect(failedRun.status).toBe("failed");
+  });
+
+  it("settles a remote snapshot save whose process died mid-save, and keeps live, foreign or unprovable ones", async () => {
+    const run = (id: string, status: string) => ({ id, companyId, agentId, status, invocationSource: "manual",
+      ...(status === "running" ? {} : { finishedAt: minutesAgo(2), errorCode: "process_lost" }) });
+    const runs = { lost: randomUUID(), live: randomUUID() };
+    await db.insert(heartbeatRuns).values([run(runs.lost, "failed"), run(runs.live, "running")]);
+    const dead = { bootId: "previous-boot", pid: 4_194_303, hostHash: currentProcessSpaceHash(),
+      processStartedAt: "2026-11-07T09:00:00.000Z" };
+    const self = { bootId: currentControllerBootId(), pid: process.pid, hostHash: currentProcessSpaceHash(), processStartedAt: null };
+    const ops = { deadOwner: randomUUID(), selfOwner: randomUUID(), foreignOwner: randomUUID(), legacyLost: randomUUID(),
+      legacyLive: randomUUID(), mixed: randomUUID() };
+    const op = (id: string, runId: string, owners: Record<string, unknown> | undefined, activeIds = [randomUUID()]) => ({
+      id, companyId, heartbeatRunId: runId, phase: "remote_workspace_snapshot", status: "running",
+      metadata: { epoch: 1, boundary: "initial", generation: 1, exportCleanup: { state: "pending" },
+        saveWork: { schema: "paperclip.remote-workspace-save-work.v1", activeIds, unknown: false, quiescedAt: null,
+          ...(owners ? { owners: Object.fromEntries(activeIds.map((invocation, index) => [invocation, Object.values(owners)[index]])
+            .filter(([, stamp]) => stamp !== undefined)) } : {}) } } });
+    const twoIds = [randomUUID(), randomUUID()], selfInvocation = randomUUID();
+    await db.insert(workspaceOperations).values([
+      op(ops.deadOwner, runs.live, { a: dead }),
+      op(ops.selfOwner, runs.lost, { a: self }, [selfInvocation]),
+      op(ops.foreignOwner, runs.lost, { a: { ...dead, hostHash: "another-pid-space" } }),
+      op(ops.legacyLost, runs.lost, undefined),
+      op(ops.legacyLive, runs.live, undefined),
+      op(ops.mixed, runs.lost, { a: dead }, twoIds),
+    ]);
+    const statuses = async () => Object.fromEntries((await db.select({ id: workspaceOperations.id, status: workspaceOperations.status })
+      .from(workspaceOperations).where(eq(workspaceOperations.phase, "remote_workspace_snapshot")))
+      .map(row => [Object.keys(ops).find(name => ops[name as keyof typeof ops] === row.id), row.status]));
+
+    const untrack = trackRemoteWorkspaceSaveInvocationForTests(selfInvocation);
+    const first = await runOwnershipReconciliationPass(db, { state: createOwnershipReportState() }).finally(untrack);
+    expect(kindReport(first, "remote_snapshot_save")).toMatchObject({ inProgress: 6, settled: 2 });
+    expect(await statuses()).toEqual({ deadOwner: "failed", selfOwner: "running", foreignOwner: "running",
+      legacyLost: "failed", legacyLive: "running", mixed: "running" });
+    const [settled] = await db.select().from(workspaceOperations).where(eq(workspaceOperations.id, ops.deadOwner));
+    expect(settled.metadata).toMatchObject({ saveWork: { activeIds: [], owners: {}, unknown: false, quiescedAt: expect.any(String) },
+      abandonedSave: { reason: "abandoned_remote_snapshot_save", proof: "pid_dead", abandonedInvocationIds: [expect.any(String)] },
+      lastFailure: { code: "remote_workspace_save_abandoned" } });
+    const [liveRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runs.live));
+    expect(liveRun.status).toBe("running");
+  });
+
+  it("ends a dirty remote epoch whose writer died during preparation, and keeps every other writer's files", async () => {
+    const runs = { preparing: randomUUID(), resolved: randomUUID(), executing: randomUUID(), live: randomUUID(), saving: randomUUID(),
+      invoked: randomUUID(), spawned: randomUUID() };
+    const run = (id: string, status: string, extra: Record<string, unknown> = {}) => ({ id, companyId, agentId, status,
+      invocationSource: "manual", executionStage: "preparing", ...(status === "running" ? {} : { finishedAt: minutesAgo(2), errorCode: "process_lost" }), ...extra });
+    await db.insert(heartbeatRuns).values([
+      run(runs.preparing, "failed"),
+      run(runs.resolved, "failed", { runtimeMode: "native", runtimeModeResolvedAt: minutesAgo(3) }),
+      run(runs.executing, "failed", { executionStage: "executing" }),
+      run(runs.live, "running"),
+      run(runs.saving, "failed"),
+      run(runs.invoked, "failed"),
+      run(runs.spawned, "failed", { processPid: 4_194_303 }),
+    ]);
+    await db.insert(heartbeatRunEvents).values({ companyId, runId: runs.invoked, agentId, seq: 1, eventType: "adapter.invoke" });
+    const workspaceFor = Object.fromEntries(Object.keys(runs).map(name => [name, randomUUID()])) as Record<keyof typeof runs, string>;
+    await db.insert(executionWorkspaces).values(Object.entries(runs).map(([name, writerRunId]) => ({
+      id: workspaceFor[name as keyof typeof runs], companyId, mode: "isolated_workspace", strategyType: "test", name,
+      metadata: { remoteWorkspace: { schema: "paperclip.remote-workspace.v1", epoch: 1, snapshotId: null,
+        source: { kind: "git", repoUrl: "https://example.invalid/repo.git", ref: null }, dirty: true, writerRunId,
+        location: { environmentId: randomUUID(), leaseId: randomUUID(), providerLeaseId: "sandbox-1", remoteCwd: "/workspace/root" } } },
+    })));
+    await db.insert(workspaceOperations).values({ companyId, executionWorkspaceId: workspaceFor.saving, heartbeatRunId: runs.saving,
+      phase: "remote_workspace_snapshot", status: "running", metadata: { epoch: 1, boundary: "initial" } });
+    const authorities = async () => Object.fromEntries((await db.select().from(executionWorkspaces))
+      .filter(row => Object.values(workspaceFor).includes(row.id))
+      .map(row => [row.name, readRemoteWorkspaceAuthority(row.metadata)]));
+
+    const first = await runOwnershipReconciliationPass(db, { state: createOwnershipReportState() });
+    expect(kindReport(first, "remote_workspace_unsaved_files")).toMatchObject({ settled: 1 });
+    const after = await authorities();
+    expect(after.preparing).toMatchObject({ epoch: 2, dirty: false, writerRunId: null, location: null, snapshotId: null });
+    for (const kept of ["resolved", "executing", "live", "saving", "invoked", "spawned"] as const)
+      expect(after[kept], kept).toMatchObject({ epoch: 1, dirty: true, writerRunId: runs[kept] });
+    const unsavedFiles = OWNABLE_KINDS.find(kind => kind.id === "remote_workspace_unsaved_files")!;
+    expect((await recheckSettlingKinds(db, { kinds: [unsavedFiles] })).watched).toBe(2);
+    const [abandoned] = await db.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, workspaceFor.preparing));
+    expect(abandoned.metadata?.remoteWorkspaceAbandonedEpochs).toEqual([expect.objectContaining({ epoch: 1, runId: runs.preparing })]);
+  });
+
+  it("releases the lease and frees the workspace for the retry once a preparation-only epoch ends", async () => {
+    const runId = randomUUID(), issueId = randomUUID(), workspaceId = randomUUID(), leaseId = randomUUID();
+    await db.insert(issues).values({ id: issueId, companyId, title: "Remote task", status: "in_progress" });
+    const [environment] = await db.insert(environments).values({ name: `Sandbox ${randomUUID()}`, driver: "sandbox" }).returning();
+    const location = { environmentId: environment.id, leaseId, providerLeaseId: `sandbox-${randomUUID()}`, remoteCwd: "/workspace/task" };
+    await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, issueId, status: "failed", invocationSource: "manual",
+      executionStage: "preparing", finishedAt: minutesAgo(2), errorCode: "process_lost", contextSnapshot: { issueId },
+      runnerProfileJson: { remoteWorkspace: { schema: "paperclip.remote-workspace-run.v1", workspaceId, leaseId,
+        providerLeaseId: location.providerLeaseId, remoteCwd: location.remoteCwd, epoch: 1, state: "prepared", snapshotId: null } } });
+    await db.insert(executionWorkspaces).values({ id: workspaceId, companyId, sourceIssueId: issueId, mode: "isolated_workspace",
+      strategyType: "test", name: "Remote task workspace",
+      metadata: { remoteWorkspace: { schema: "paperclip.remote-workspace.v1", epoch: 1, snapshotId: null,
+        source: { kind: "git", repoUrl: "https://example.invalid/repo.git", ref: null }, dirty: true, writerRunId: runId, location } } });
+    const [lease] = await db.insert(environmentLeases).values({ id: leaseId, companyId, environmentId: environment.id, issueId,
+      heartbeatRunId: runId, executionWorkspaceId: workspaceId, status: "active", leasePolicy: "ephemeral", provider: "daytona",
+      providerLeaseId: location.providerLeaseId, metadata: { remoteCwd: location.remoteCwd } }).returning();
+    const authority = async () => readRemoteWorkspaceAuthority((await db.select().from(executionWorkspaces)
+      .where(eq(executionWorkspaces.id, workspaceId)))[0]!.metadata)!;
+    expect(await preparedRemoteWorkspaceSource(db, lease)).not.toBeNull();
+    expect(await readRemoteWorkspaceWriterHold(db, { companyId, authority: await authority(), runId: randomUUID() }))
+      .toMatchObject({ kind: "held" });
+
+    await runOwnershipReconciliationPass(db, { state: createOwnershipReportState() });
+    await runOwnershipReconciliationPass(db, { state: createOwnershipReportState() });
+    expect(await preparedRemoteWorkspaceSource(db, lease)).toBeNull();
+    expect((await db.select().from(environmentLeases).where(eq(environmentLeases.id, leaseId)))[0]!.status).not.toBe("active");
+    expect(await readRemoteWorkspaceWriterHold(db, { companyId, authority: await authority(), runId: randomUUID() }))
+      .toEqual({ kind: "free" });
+  });
+
+  it("hands on a preparation-only epoch at its saved version only when the unchanged baseline is proven", async () => {
+    // Each writer restored saved version `snapshotId` and was killed in
+    // preparation. Only `clean` has nothing after the restore; every other
+    // writer lacks the proof and keeps today's abandonment.
+    const cases = ["clean", "noBaseline", "otherEpochBaseline", "releasedBaseline", "provisioned", "processStarted"] as const;
+    const snapshotId = randomUUID();
+    const setup = Object.fromEntries(cases.map(name => [name, {
+      runId: randomUUID(), workspaceId: randomUUID(), leaseId: randomUUID(), providerLeaseId: `sandbox-${randomUUID()}`,
+    }])) as Record<(typeof cases)[number], { runId: string; workspaceId: string; leaseId: string; providerLeaseId: string }>;
+    const remoteCwd = (name: string) => `/home/daytona/paperclip-workspace/.paperclip-workspaces/${setup[name as keyof typeof setup].workspaceId}`;
+    await db.insert(heartbeatRuns).values(cases.map(name => {
+      const s = setup[name];
+      return { id: s.runId, companyId, agentId, status: "failed", invocationSource: "manual", executionStage: "preparing",
+        finishedAt: minutesAgo(2), errorCode: "process_lost",
+        ...(name === "processStarted" ? { processPid: 4_194_303 } : {}),
+        runnerProfileJson: { remoteWorkspace: { schema: "paperclip.remote-workspace-run.v1", workspaceId: s.workspaceId,
+          leaseId: s.leaseId, providerLeaseId: s.providerLeaseId, remoteCwd: remoteCwd(name), epoch: 2, state: "prepared", snapshotId } } };
+    }));
+    await db.insert(executionWorkspaces).values(cases.map(name => {
+      const s = setup[name];
+      const baseline = name === "noBaseline" ? {}
+        : { remoteWorkspaceUnchangedBaseline: { schema: "paperclip.remote-workspace-unchanged-baseline.v1",
+          epoch: name === "otherEpochBaseline" ? 1 : 2, runId: s.runId, snapshotId,
+          ...(name === "releasedBaseline" ? { releasedAt: minutesAgo(5).toISOString() } : {}) } };
+      return { id: s.workspaceId, companyId, mode: "isolated_workspace", strategyType: "test", name,
+        metadata: { ...baseline, remoteWorkspace: { schema: "paperclip.remote-workspace.v1", epoch: 2, snapshotId,
+          source: { kind: "git", repoUrl: "https://example.invalid/repo.git", ref: null }, dirty: true, writerRunId: s.runId,
+          location: { environmentId: randomUUID(), leaseId: s.leaseId, providerLeaseId: s.providerLeaseId, remoteCwd: remoteCwd(name) } } } };
+    }));
+    // The restore itself is file-neutral; a provisioning command is not.
+    await db.insert(workspaceOperations).values(cases.map(name => ({ companyId, executionWorkspaceId: setup[name].workspaceId,
+      heartbeatRunId: setup[name].runId, phase: "remote_workspace_restore", status: "succeeded", metadata: { epoch: 2, snapshotId } })));
+    await db.insert(workspaceOperations).values({ companyId, executionWorkspaceId: setup.provisioned.workspaceId,
+      heartbeatRunId: setup.provisioned.runId, phase: "remote_workspace_provision", status: "failed", metadata: { epoch: 2 } });
+    const read = async (name: (typeof cases)[number]) => (await db.select().from(executionWorkspaces)
+      .where(eq(executionWorkspaces.id, setup[name].workspaceId)))[0]!;
+
+    await runOwnershipReconciliationPass(db, { state: createOwnershipReportState() });
+
+    const clean = await read("clean");
+    expect(readRemoteWorkspaceAuthority(clean.metadata)).toMatchObject({ epoch: 2, dirty: false, writerRunId: null, snapshotId,
+      location: { leaseId: setup.clean.leaseId, providerLeaseId: setup.clean.providerLeaseId, remoteCwd: remoteCwd("clean") } });
+    expect(clean.metadata?.remoteWorkspaceAbandonedEpochs).toBeUndefined();
+    expect(clean.metadata?.remoteWorkspaceUnchangedBaseline).toMatchObject({ releasedAt: expect.any(String) });
+    const [cleanRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, setup.clean.runId));
+    expect(cleanRun.runnerProfileJson?.remoteWorkspace).toMatchObject({ state: "saved", epoch: 2 });
+    // The retry is admitted at once, and the killed run's sandbox is no longer a prepared source holding it.
+    expect(await readRemoteWorkspaceWriterHold(db, { companyId, authority: readRemoteWorkspaceAuthority(clean.metadata)!,
+      runId: randomUUID() })).toEqual({ kind: "free" });
+    // A recorded process is runtime work: neither handed on nor abandoned here.
+    expect(readRemoteWorkspaceAuthority((await read("processStarted")).metadata))
+      .toMatchObject({ epoch: 2, dirty: true, writerRunId: setup.processStarted.runId });
+    for (const name of cases.filter(name => name !== "clean" && name !== "processStarted")) {
+      const row = await read(name);
+      expect(readRemoteWorkspaceAuthority(row.metadata), name)
+        .toMatchObject({ epoch: 3, dirty: false, writerRunId: null, location: null });
+      expect(row.metadata?.remoteWorkspaceAbandonedEpochs, name).toEqual([expect.objectContaining({ epoch: 2, runId: setup[name].runId })]);
+    }
+  });
+
+  it("settles a workspace command whose process died mid-command, and keeps live or unprovable ones", async () => {
+    const run = (id: string, status: string) => ({ id, companyId, agentId, status, invocationSource: "manual",
+      ...(status === "running" ? {} : { finishedAt: minutesAgo(2) }) });
+    const runs = { interrupted: randomUUID(), live: randomUUID() };
+    await db.insert(heartbeatRuns).values([run(runs.interrupted, "failed"), run(runs.live, "running")]);
+    const dead = { bootId: "previous-boot", pid: 4_194_303, hostHash: currentProcessSpaceHash(),
+      processStartedAt: "2026-11-09T09:00:00.000Z" };
+    const ops = { dead: randomUUID(), live: randomUUID(), foreign: randomUUID(), legacyDone: randomUUID(),
+      legacyLive: randomUUID(), unowned: randomUUID(), runtimeControl: randomUUID() };
+    const op = (id: string, runId: string | null, phase: string, metadata: Record<string, unknown>) => ({ id, companyId,
+      heartbeatRunId: runId, phase, status: "running", metadata });
+    await db.insert(workspaceOperations).values([
+      op(ops.dead, runs.interrupted, "workspace_provision", { commandOwner: dead }),
+      op(ops.live, runs.live, "worktree_prepare", { commandOwner: { bootId: currentControllerBootId(), pid: process.pid,
+        hostHash: currentProcessSpaceHash(), processStartedAt: null } }),
+      op(ops.foreign, runs.interrupted, "workspace_provision", { commandOwner: { ...dead, hostHash: "another-pid-space" } }),
+      op(ops.legacyDone, runs.interrupted, "workspace_teardown", {}),
+      op(ops.legacyLive, runs.live, "workspace_provision", {}),
+      op(ops.unowned, null, "worktree_cleanup", {}),
+      op(ops.runtimeControl, null, "workspace_runtime_provision", { runtimeControlOwner: { pid: 1 } }),
+    ]);
+    const statuses = async () => Object.fromEntries((await db.select({ id: workspaceOperations.id, status: workspaceOperations.status })
+      .from(workspaceOperations)).map(row => [Object.keys(ops).find(name => ops[name as keyof typeof ops] === row.id), row.status]));
+
+    await runOwnershipReconciliationPass(db, { state: createOwnershipReportState(), record: false });
+    expect(Object.values(await statuses()).every(status => status === "running")).toBe(true);
+
+    const first = await runOwnershipReconciliationPass(db, { state: createOwnershipReportState() });
+    expect(kindReport(first, "workspace_command_operation")).toMatchObject({ inProgress: 6, settled: 2 });
+    expect(await statuses()).toEqual({ dead: "failed", live: "running", foreign: "running", legacyDone: "failed",
+      legacyLive: "running", unowned: "running", runtimeControl: "running" });
+    const [settled] = await db.select().from(workspaceOperations).where(eq(workspaceOperations.id, ops.dead));
+    expect(settled.metadata).toMatchObject({ abandonedCommand: { reason: "abandoned_workspace_command", proof: "pid_dead" } });
+    expect(settled.finishedAt).not.toBeNull();
+  });
+
+  it("stamps a running workspace command with the process that runs it", async () => {
+    const [{ id: runId }] = await db.insert(heartbeatRuns).values({ companyId, agentId, status: "running",
+      invocationSource: "manual" }).returning({ id: heartbeatRuns.id });
+    const recorder = workspaceOperationService(db).createRecorder({ companyId, heartbeatRunId: runId });
+    let stamped: unknown;
+    await recorder.recordOperation({ phase: "workspace_provision", command: "true", run: async () => {
+      const [row] = await db.select().from(workspaceOperations).where(eq(workspaceOperations.heartbeatRunId, runId));
+      stamped = row.metadata;
+      return { status: "succeeded", exitCode: 0 };
+    } });
+    expect(stamped).toMatchObject({ commandOwner: { bootId: currentControllerBootId(), pid: process.pid } });
   });
 
   it("writes nothing when recording is off", async () => {
@@ -357,6 +715,197 @@ describe("report-only ownership reconciliation", () => {
     expect(report.violations.filter(violation => violation.rule === "I4_exactly_once_intent")).toEqual([]);
   });
 
+  // Reconciler rule (chaos s9401/t69): an undelivered user comment newer than
+  // the task's last run gets a wake. A carried, a too-young, or an
+  // already-read comment does not fire it.
+  it("finds a user comment newer than the task's last run that no wake carries", async () => {
+    const issueId = randomUUID();
+    await db.insert(issues).values({ id: issueId, companyId, title: "Reopened", status: "todo", assigneeAgentId: agentId });
+    await db.insert(heartbeatRuns).values({ companyId, agentId, status: "succeeded", invocationSource: "manual",
+      runtimeMode: "native", contextSnapshot: { issueId }, startedAt: minutesAgo(5), createdAt: minutesAgo(5), finishedAt: minutesAgo(4) });
+    const [lost, carried, young] = await db.insert(issueComments).values([
+      { companyId, issueId, authorUserId: "user-1", body: "lost wake", createdAt: minutesAgo(2) },
+      { companyId, issueId, authorUserId: "user-1", body: "carried", createdAt: minutesAgo(2) },
+      { companyId, issueId, authorUserId: "user-1", body: "young", createdAt: new Date(Date.now() - 5_000) },
+    ]).returning();
+    // An agent's own comment written under its user (local CLI) is not user intent.
+    await db.insert(issueComments).values({ companyId, issueId, authorUserId: "user-1", authorAgentId: agentId,
+      body: "self", createdAt: minutesAgo(2) });
+    await db.insert(agentWakeupRequests).values({ companyId, agentId, source: "automation", status: "queued",
+      payload: { issueId, commentId: carried.id } });
+    const report = await runOwnershipReconciliationPass(db, { state: createOwnershipReportState(), record: false,
+      processStartedAt: minutesAgo(10) });
+    expect(report.violations.filter(row => row.reason === "user_comment_without_wake").map(row => row.recordId)).toEqual([lost.id]);
+    // The young comment may still get its normal wake: a deadline, not a report.
+    expect(report.nextDueAt?.getTime()).toBe(young.createdAt.getTime() + 30_000);
+    // A run that started after the comment read it.
+    await db.insert(heartbeatRuns).values({ companyId, agentId, status: "succeeded", invocationSource: "manual",
+      contextSnapshot: { issueId }, startedAt: minutesAgo(1), createdAt: minutesAgo(1), finishedAt: new Date() });
+    const later = await runOwnershipReconciliationPass(db, { state: createOwnershipReportState(), record: false,
+      processStartedAt: minutesAgo(10) });
+    expect(later.violations.filter(row => row.reason === "user_comment_without_wake")).toEqual([]);
+  });
+
+  it("finds at once a young user comment whose wake a restart lost after the board stopped the run", async () => {
+    const issueId = randomUUID();
+    await db.insert(issues).values({ id: issueId, companyId, title: "Stopped then continued", status: "todo", assigneeAgentId: agentId });
+    await db.insert(heartbeatRuns).values({ companyId, agentId, status: "cancelled", invocationSource: "assignment",
+      runtimeMode: "native", contextSnapshot: { issueId }, startedAt: minutesAgo(4), createdAt: minutesAgo(4), finishedAt: minutesAgo(1) });
+    const [comment] = await db.insert(issueComments).values({ companyId, issueId, authorUserId: "user-1",
+      body: "I stopped your previous run on purpose. Please continue.", createdAt: new Date(Date.now() - 12_000) }).returning();
+    const report = await runOwnershipReconciliationPass(db, { state: createOwnershipReportState(), record: false,
+      processStartedAt: new Date(Date.now() - 2_000) });
+    expect(report.violations.filter(row => row.reason === "user_comment_without_wake").map(row => row.recordId))
+      .toEqual([comment!.id]);
+    const sameProcess = await runOwnershipReconciliationPass(db, { state: createOwnershipReportState(), record: false,
+      processStartedAt: minutesAgo(10) });
+    expect(sameProcess.violations.filter(row => row.reason === "user_comment_without_wake")).toEqual([]);
+    expect(sameProcess.nextDueAt?.getTime()).toBe(comment!.createdAt.getTime() + 30_000);
+  });
+
+  it("finds a user comment that a restart left without a wake on a task its agent then closed", async () => {
+    const closedTask = async (actorType: "agent" | "user") => {
+      const issueId = randomUUID();
+      await db.insert(issues).values({ id: issueId, companyId, title: `Closed by ${actorType}`, status: "done", assigneeAgentId: agentId });
+      const [run] = await db.insert(heartbeatRuns).values({ companyId, agentId, status: "succeeded", invocationSource: "manual",
+        runtimeMode: "native", contextSnapshot: { issueId }, startedAt: minutesAgo(6), createdAt: minutesAgo(6), finishedAt: minutesAgo(1) })
+        .returning();
+      const [comment] = await db.insert(issueComments).values({ companyId, issueId, authorUserId: "user-1",
+        body: "also add a follow-up line", createdAt: minutesAgo(4) }).returning();
+      await db.insert(activityLog).values({ companyId, actorType, actorId: actorType === "agent" ? agentId : "user-1",
+        action: "issue.updated", entityType: "issue", entityId: issueId, details: { toStatus: "done" }, createdAt: minutesAgo(1) });
+      return { issueId, runId: run!.id, commentId: comment!.id };
+    };
+    const lost = await closedTask("agent");
+    const steered = await closedTask("agent");
+    const goalSteered = await closedTask("agent");
+    const personClosed = await closedTask("user");
+    await db.insert(heartbeatRunEvents).values([
+      { companyId, runId: steered.runId, agentId, seq: 1, eventType: "item.completed", stream: "system", level: "info",
+        sourceEventId: randomUUID(), payload: { prpEvent: { itemId: `provider-item-9f2:steer:${steered.commentId}`,
+          payload: { kind: "steering_acknowledgement" } } } },
+      { companyId, runId: goalSteered.runId, agentId, seq: 1, eventType: "item.started", stream: "system", level: "info",
+        sourceEventId: randomUUID(), payload: { prpEvent: { itemId: "msg_provider_generated_7c1",
+          payload: { kind: "userMessage", commandId: `goal_comment_${goalSteered.commentId}` } } } },
+    ]);
+    const report = await runOwnershipReconciliationPass(db, { state: createOwnershipReportState(), record: false });
+    expect(report.violations.filter(row => row.reason === "user_comment_without_wake").map(row => row.recordId))
+      .toEqual([lost.commentId]);
+  });
+
+  // The check reads a task's runs through two separate bindings (legacy
+  // context or native column) and reads event payloads only for comments that
+  // the indexed checks keep. Each binding must count alone, and only in the
+  // comment's company.
+  it("binds each task run by its legacy context or its native column in the user-comment wake check", async () => {
+    const otherCompanyId = randomUUID(), otherAgentId = randomUUID();
+    await db.insert(companies).values({ id: otherCompanyId, name: "Other company", issuePrefix: "OTH" });
+    await db.insert(agents).values({ id: otherAgentId, companyId: otherCompanyId, name: "Other", role: "engineer", adapterType: "codex_local" });
+    const task = async (title: string, runs: Array<{ binding: "context" | "native" | "both"; status?: string;
+      startedAt: Date; finishedAt?: Date | null; companyId?: string }>, commentAt: Date) => {
+      const issueId = randomUUID();
+      await db.insert(issues).values({ id: issueId, companyId, title, status: "todo", assigneeAgentId: agentId });
+      const runIds: string[] = [];
+      for (const run of runs) {
+        const runCompanyId = run.companyId ?? companyId;
+        const [row] = await db.insert(heartbeatRuns).values({ companyId: runCompanyId, agentId: runCompanyId === companyId ? agentId : otherAgentId,
+          status: run.status ?? "succeeded", invocationSource: "manual",
+          contextSnapshot: run.binding === "native" ? {} : { issueId },
+          nativeIssueId: run.binding === "context" ? null : issueId,
+          startedAt: run.startedAt, createdAt: run.startedAt, finishedAt: run.finishedAt === undefined ? minutesAgo(3) : run.finishedAt }).returning();
+        runIds.push(row!.id);
+      }
+      const [comment] = await db.insert(issueComments).values({ companyId, issueId, authorUserId: "user-1", body: title,
+        createdAt: commentAt }).returning();
+      return { issueId, runIds, commentId: comment!.id };
+    };
+    const steerEvent = (runId: string, commentId: string, eventType: string, createdAt: Date) => ({ companyId, runId, agentId,
+      seq: 1, eventType, stream: "system", level: "info", sourceEventId: randomUUID(), createdAt,
+      payload: { prpEvent: { itemId: `provider:steer:${commentId}`, payload: { kind: "steering_acknowledgement" } } } });
+    const lostNative = await task("lost, native prior run", [{ binding: "native", startedAt: minutesAgo(10), finishedAt: minutesAgo(9) }], minutesAgo(8));
+    const lostContext = await task("lost, legacy prior run", [{ binding: "context", startedAt: minutesAgo(10), finishedAt: minutesAgo(9) }], minutesAgo(7));
+    await task("no run at all", [], minutesAgo(8));
+    await task("only another company's run", [{ binding: "both", startedAt: minutesAgo(10), finishedAt: minutesAgo(9), companyId: otherCompanyId }], minutesAgo(8));
+    await task("native later run", [{ binding: "context", startedAt: minutesAgo(10), finishedAt: minutesAgo(9) },
+      { binding: "native", startedAt: minutesAgo(5) }], minutesAgo(8));
+    await task("legacy later run", [{ binding: "native", startedAt: minutesAgo(10), finishedAt: minutesAgo(9) },
+      { binding: "context", startedAt: minutesAgo(5) }], minutesAgo(8));
+    await task("native live run", [{ binding: "native", status: "running", startedAt: minutesAgo(10), finishedAt: null }], minutesAgo(8));
+    const nativeSteered = await task("native steered run", [{ binding: "native", startedAt: minutesAgo(10) }], minutesAgo(8));
+    const contextSteered = await task("legacy steered run", [{ binding: "context", startedAt: minutesAgo(10) }], minutesAgo(8));
+    const earlyAck = await task("acknowledged before the comment", [{ binding: "native", startedAt: minutesAgo(10) }], minutesAgo(6));
+    const logOnly = await task("named only in a log event", [{ binding: "context", startedAt: minutesAgo(10) }], minutesAgo(5));
+    const otherRunAck = await task("acknowledged by a run that started after it", [{ binding: "native", startedAt: minutesAgo(10), finishedAt: minutesAgo(9) }], minutesAgo(4));
+    await db.insert(heartbeatRunEvents).values([
+      steerEvent(nativeSteered.runIds[0]!, nativeSteered.commentId, "item.completed", minutesAgo(7)),
+      steerEvent(contextSteered.runIds[0]!, contextSteered.commentId, "item.started", minutesAgo(7)),
+      steerEvent(earlyAck.runIds[0]!, earlyAck.commentId, "item.completed", minutesAgo(7)),
+      steerEvent(logOnly.runIds[0]!, logOnly.commentId, "log", minutesAgo(4)),
+      // The run that names this comment ended before it: not a steer of this comment.
+      steerEvent(otherRunAck.runIds[0]!, otherRunAck.commentId, "item.completed", minutesAgo(3)),
+    ]);
+    const report = await runOwnershipReconciliationPass(db, { state: createOwnershipReportState(), record: false,
+      processStartedAt: minutesAgo(30) });
+    // Oldest first, as the check orders them.
+    expect(report.violations.filter(row => row.reason === "user_comment_without_wake").map(row => row.recordId))
+      .toEqual([lostNative.commentId, lostContext.commentId, earlyAck.commentId, logOnly.commentId, otherRunAck.commentId]);
+  });
+
+  // The stale-continuation check reads a task's runs through the same two
+  // bindings. The closing run and a live run must each count through either
+  // binding alone, and only in the comment's company and for the assignee.
+  it("binds each task run by its legacy context or its native column in the stale-continuation check", async () => {
+    const otherCompanyId = randomUUID(), otherAgentId = randomUUID(), peerAgentId = randomUUID();
+    await db.insert(companies).values({ id: otherCompanyId, name: "Other company", issuePrefix: "OTH" });
+    await db.insert(agents).values([
+      { id: otherAgentId, companyId: otherCompanyId, name: "Other", role: "engineer", adapterType: "codex_local" },
+      { id: peerAgentId, companyId, name: "Peer", role: "engineer", adapterType: "codex_local" }]);
+    type Run = { binding: "context" | "native"; status?: string; startedAt: Date; finishedAt?: Date | null; companyId?: string; agentId?: string };
+    const task = async (title: string, runs: Run[], commentAt: Date, options: { closedBy?: string; wake?: "commentId" | "list" | "open" } = {}) => {
+      const issueId = randomUUID();
+      await db.insert(issues).values({ id: issueId, companyId, title, status: "done", assigneeAgentId: agentId });
+      for (const run of runs) {
+        const runCompanyId = run.companyId ?? companyId;
+        await db.insert(heartbeatRuns).values({ companyId: runCompanyId, agentId: run.agentId ?? (runCompanyId === companyId ? agentId : otherAgentId),
+          status: run.status ?? "succeeded", invocationSource: "manual",
+          contextSnapshot: run.binding === "native" ? {} : { issueId }, nativeIssueId: run.binding === "context" ? null : issueId,
+          startedAt: run.startedAt, createdAt: run.startedAt, finishedAt: run.finishedAt === undefined ? minutesAgo(2) : run.finishedAt });
+      }
+      const [comment] = await db.insert(issueComments).values({ companyId, issueId, authorUserId: "user-1", body: title,
+        createdAt: commentAt }).returning();
+      const commentId = comment!.id;
+      const payload = options.wake === "list" ? { issueId, _paperclipWakeContext: { wakeCommentIds: [commentId] } } : { issueId, commentId };
+      await db.insert(agentWakeupRequests).values({ companyId, agentId, source: "automation", status: "cancelled",
+        error: "continuation_task_ownership_changed", payload });
+      if (options.wake === "open") await db.insert(agentWakeupRequests).values({ companyId, agentId, source: "automation",
+        status: "deferred_issue_execution", payload: { issueId, commentId } });
+      await db.insert(activityLog).values({ companyId, actorType: options.closedBy ?? "agent", actorId: "actor", action: "issue.updated",
+        entityType: "issue", entityId: issueId, details: { toStatus: "done" }, createdAt: minutesAgo(1) });
+      return commentId;
+    };
+    const closing = (binding: Run["binding"], extra: Partial<Run> = {}): Run => ({ binding, startedAt: minutesAgo(10), ...extra });
+    const nativeClosing = await task("closed by a native run", [closing("native")], minutesAgo(8));
+    const contextClosing = await task("closed by a legacy run", [closing("context")], minutesAgo(7));
+    const listWake = await task("carried by a wake list", [closing("native")], minutesAgo(6), { wake: "list" });
+    await task("no closing run", [], minutesAgo(8));
+    await task("closing run in another company", [closing("native", { companyId: otherCompanyId }), closing("context", { companyId: otherCompanyId })], minutesAgo(8));
+    await task("closing run of another agent", [closing("native", { agentId: peerAgentId }), closing("context", { agentId: peerAgentId })], minutesAgo(8));
+    await task("closing run failed", [closing("native", { status: "failed" })], minutesAgo(8));
+    await task("closing run ended before the comment", [closing("context", { finishedAt: minutesAgo(9) })], minutesAgo(8));
+    await task("closing run started after the comment", [closing("native", { startedAt: minutesAgo(7) })], minutesAgo(8));
+    await task("native live run", [closing("context"), closing("native", { status: "running", startedAt: minutesAgo(3), finishedAt: null })], minutesAgo(8));
+    await task("legacy live run", [closing("native"), closing("context", { status: "queued", startedAt: minutesAgo(3), finishedAt: null })], minutesAgo(8));
+    const otherCompanyLive = await task("live run in another company only", [closing("native"),
+      closing("context", { status: "running", companyId: otherCompanyId, finishedAt: null })], minutesAgo(5));
+    await task("closed by a person", [closing("native")], minutesAgo(8), { closedBy: "user" });
+    await task("an open wake carries it", [closing("context")], minutesAgo(8), { wake: "open" });
+    const report = await runOwnershipReconciliationPass(db, { state: createOwnershipReportState(), record: false });
+    const dropped = report.violations.filter(row => row.reason === "user_comment_dropped_by_stale_continuation");
+    // Oldest first, as the check orders them. The other company's live run does not hold the last one.
+    expect(dropped.map(row => row.recordId)).toEqual([nativeClosing, contextClosing, listWake, otherCompanyLive]);
+    expect(dropped.every(row => row.companyId === companyId)).toBe(true);
+  });
+
   it("keeps a backstop deadline for a lifted pause still inside its grace window", async () => {
     const updatedAt = minutesAgo(1);
     await db.insert(agentWakeupRequests).values({ companyId, agentId, source: "automation", status: "deferred_issue_execution",
@@ -414,12 +963,231 @@ describe("report-only ownership reconciliation", () => {
     expect(report.violations.filter(violation => violation.rule === "I7_visible_next_action")).toEqual([]);
   });
 
+  it("treats a current committed response-wake wait as a next action until a user answers it", async () => {
+    const issueId = randomUUID(), runId = randomUUID(), contractId = randomUUID(), resultId = randomUUID();
+    const assessmentId = randomUUID(), decisionId = randomUUID(), startedAt = minutesAgo(40);
+    await db.insert(issues).values({ id: issueId, companyId, title: "Waiting for the board", status: "in_progress",
+      assigneeAgentId: agentId, updatedAt: minutesAgo(30) });
+    await db.insert(completionContracts).values({ id: contractId, companyId, issueId, revision: 1,
+      schemaVersion: "paperclip.completion-contract.v1", policyVersion: "test", risk: "standard",
+      completionAuthority: "server_arbiter", incompleteCriteriaPolicy: "preserve_non_terminal",
+      contractJson: { revision: "test", objective: "Wait", criteria: [{ id: "objective", requirement: "Wait" }] },
+      canonicalSha256: contractId, createdByActorType: "system", createdByActorId: "test" });
+    await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, runtimeMode: "native", status: "succeeded",
+      nativeIssueId: issueId, nativeSessionId: runId, completionContractId: contractId, completionContractSha256: contractId,
+      contextSnapshot: { issueId }, startedAt, finishedAt: minutesAgo(35) });
+    await db.insert(nativeRunResults).values({ id: resultId, companyId, issueId, runId, completionContractId: contractId,
+      serverFingerprint: "test", schemaStatus: "accepted", resultJson: {}, canonicalSha256: resultId });
+    await db.insert(workAssessments).values({ id: assessmentId, companyId, issueId, runId, contractId, resultId,
+      triggerKind: "turn_finished", triggerActorCompanyId: companyId, priorIssueStatus: "in_progress", priorStatusVersion: 1,
+      policyVersion: "test", assessmentJson: {}, inputDigest: assessmentId });
+    await db.insert(statusDecisions).values({ id: decisionId, companyId, issueId, runId, assessmentId, decisionVersion: 1,
+      policyVersion: "test", fromStatus: "in_progress", toStatus: "in_progress", reasonCode: "response_wake_waiting_for_input",
+      decisionJson: {}, decisionDigest: decisionId, applicationState: "applied", appliedAt: minutesAgo(35) });
+    await db.insert(nativeRunFinalizations).values({ companyId, issueId, runId, phase: "committed", resultId, assessmentId, decisionId });
+    await db.update(issues).set({ lastStatusDecisionId: decisionId, updatedAt: minutesAgo(30) }).where(eq(issues.id, issueId));
+    const visible = async () => (await runOwnershipReconciliationPass(db, { state: createOwnershipReportState(), record: false }))
+      .violations.filter(violation => violation.rule === "I7_visible_next_action").map(violation => violation.recordId);
+
+    expect(await visible()).toEqual([]);
+    await db.insert(issueComments).values({ companyId, issueId, authorType: "user", authorUserId: "board",
+      body: "Go ahead.", createdAt: minutesAgo(20) });
+    expect(await visible()).toEqual([issueId]);
+    await db.delete(issueComments).where(eq(issueComments.issueId, issueId));
+    await db.update(issues).set({ lastStatusDecisionId: null, updatedAt: minutesAgo(30) }).where(eq(issues.id, issueId));
+    expect(await visible()).toEqual([issueId]);
+  });
+
   it("returns the end of the next-action grace window for an issue still inside it", async () => {
     const updatedAt = minutesAgo(2);
     await db.insert(issues).values({ companyId, title: "Fresh", status: "in_progress", assigneeAgentId: agentId, updatedAt });
     const report = await runOwnershipReconciliationPass(db, { state: createOwnershipReportState(), record: false });
     expect(report.violations.filter(violation => violation.rule === "I7_visible_next_action")).toEqual([]);
     expect(report.nextDueAt?.getTime()).toBe(updatedAt.getTime() + 5 * 60_000);
+  });
+
+  it("reports and re-drives a queued run that no dispatch started while its agent had nothing running", async () => {
+    const issueId = randomUUID();
+    await db.insert(issues).values({ id: issueId, companyId, title: "Continuation", status: "in_progress", assigneeAgentId: agentId });
+    const [stranded] = await db.insert(heartbeatRuns).values({ companyId, agentId, status: "queued", invocationSource: "automation",
+      contextSnapshot: { issueId }, createdAt: minutesAgo(19) }).returning();
+    const signals: string[] = [];
+    const unsubscribe = subscribeDatabaseWork(db, DELIVERY_QUEUES.queuedRunDispatch, event => signals.push(event));
+    try {
+      const report = await runOwnershipReconciliationPass(db, { state: createOwnershipReportState(), record: false });
+      expect(report.violations.filter(violation => violation.kind === "queued_run")).toEqual([
+        expect.objectContaining({ rule: "I7_visible_next_action", recordId: stranded!.id, runId: stranded!.id,
+          issueId, companyId, reason: "queued_run_not_dispatched" })]);
+      await applyOwnershipReportBackstops(db, report);
+      expect(signals).toContain("settled");
+    } finally { unsubscribe(); }
+  });
+
+  it("finds a stranded run behind older queued rows past the first page, and re-drives it only once", async () => {
+    const otherCompany = randomUUID();
+    const otherAgent = randomUUID();
+    await db.insert(companies).values({ id: otherCompany, name: "Held queue", issuePrefix: "HLD" });
+    await db.insert(agents).values({ id: otherAgent, companyId: otherCompany, name: "Held", role: "engineer", adapterType: "codex_local" });
+    await db.insert(heartbeatRuns).values([40, 39, 38].map(minutes =>
+      ({ companyId: otherCompany, agentId: otherAgent, status: "queued", invocationSource: "automation", createdAt: minutesAgo(minutes) })));
+    const [stranded] = await db.insert(heartbeatRuns).values({ companyId, agentId, status: "queued", invocationSource: "automation",
+      createdAt: minutesAgo(19) }).returning();
+    const state = createOwnershipReportState();
+    const first = await runOwnershipReconciliationPass(db, { state, limitPerKind: 2 });
+    expect(first.violations.filter(violation => violation.kind === "queued_run").map(violation => violation.recordId))
+      .toContain(stranded!.id);
+    const signals: string[] = [];
+    const unsubscribe = subscribeDatabaseWork(db, DELIVERY_QUEUES.queuedRunDispatch, event => signals.push(event));
+    try {
+      await applyOwnershipReportBackstops(db, first);
+      expect(signals).toContain("settled");
+      signals.length = 0;
+      const second = await runOwnershipReconciliationPass(db, { state, limitPerKind: 2 });
+      expect(second.violations.filter(violation => violation.kind === "queued_run")).toHaveLength(4);
+      await applyOwnershipReportBackstops(db, second);
+      expect(signals).toEqual([]);
+    } finally { unsubscribe(); }
+  });
+
+  it("does not report queued runs a worktree runtime will never start: before its cutoff or while execution is off", async () => {
+    const copied = randomUUID();
+    await db.insert(heartbeatRuns).values({ id: copied, companyId, agentId, status: "queued", invocationSource: "automation",
+      createdAt: minutesAgo(19) });
+    const queuedRunViolations = async () => (await runOwnershipReconciliationPass(db,
+      { state: createOwnershipReportState(), record: false })).violations.filter(violation => violation.kind === "queued_run");
+    vi.stubEnv("PAPERCLIP_IN_WORKTREE", "true");
+    vi.stubEnv("PAPERCLIP_INSTANCE_ID", "ownership-worktree");
+    const settings = instanceSettingsService(db);
+    try {
+      expect(await queuedRunViolations()).toEqual([]);
+      await settings.updateExperimental({ enableWorktreeRunExecution: true });
+      expect(await queuedRunViolations()).toEqual([]);
+      expect(await listUndispatchedQueuedRuns(db, { createdAfter: minutesAgo(1) })).toEqual([]);
+      expect((await listUndispatchedQueuedRuns(db)).map(run => run.runId)).toEqual([copied]);
+    } finally {
+      await settings.updateExperimental({ enableWorktreeRunExecution: false });
+      vi.unstubAllEnvs();
+      vi.stubEnv("PAPERCLIP_HOME", home);
+      vi.stubEnv("SANDBOX_ORPHAN_CLEANUP_SPOOL_DIR", orphanSpool);
+    }
+  });
+
+  it("reads undispatched queued runs in bounded slices that resume from a cursor, and skips an agent with a scheduled retry", async () => {
+    await db.update(agents).set({ runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } } }).where(eq(agents.id, agentId));
+    const created = [30, 29, 28].map(minutesAgo);
+    const runs = await db.insert(heartbeatRuns).values(created.map(createdAt =>
+      ({ companyId, agentId, status: "queued", invocationSource: "automation", createdAt }))).returning();
+    const first = await readUndispatchedQueuedRuns(db, { pageSize: 1, maxRuns: 2 });
+    expect(first.runs.map(run => run.runId)).toEqual([runs[0]!.id, runs[1]!.id]);
+    expect(first.next).not.toBeNull();
+    const rest = await readUndispatchedQueuedRuns(db, { pageSize: 1, maxRuns: 2, after: first.next });
+    expect(rest).toEqual({ runs: [expect.objectContaining({ runId: runs[2]!.id })], next: null });
+    await db.insert(heartbeatRuns).values({ companyId, agentId, status: "scheduled_retry", invocationSource: "automation",
+      scheduledRetryAt: new Date(Date.now() + 60_000) });
+    expect(await listUndispatchedQueuedRuns(db)).toEqual([]);
+  });
+
+  it("re-drives a queued run while its agent still has a free slot, and not once every slot is running", async () => {
+    await db.update(agents).set({ runtimeConfig: { heartbeat: { maxConcurrentRuns: 3 } } }).where(eq(agents.id, agentId));
+    const tasks = await db.insert(issues).values([0, 1, 2, 3].map(index =>
+      ({ companyId, title: `Task ${index}`, status: "in_progress" as const, assigneeAgentId: agentId }))).returning();
+    const live = (index: number) => ({ companyId, agentId, issueId: tasks[index]!.id, status: "running" as const,
+      invocationSource: "automation" as const, contextSnapshot: { issueId: tasks[index]!.id }, startedAt: minutesAgo(90) });
+    await db.insert(heartbeatRuns).values([live(0), live(1)]);
+    const [waiting] = await db.insert(heartbeatRuns).values({ companyId, agentId, status: "queued", invocationSource: "automation",
+      contextSnapshot: { issueId: tasks[3]!.id }, createdAt: minutesAgo(20) }).returning();
+    await db.insert(heartbeatRuns).values({ companyId, agentId, status: "queued", invocationSource: "automation",
+      contextSnapshot: { issueId: tasks[0]!.id }, createdAt: minutesAgo(25) });
+    expect((await listUndispatchedQueuedRuns(db)).map(run => run.runId)).toEqual([waiting!.id]);
+    await db.insert(heartbeatRuns).values(live(2));
+    expect(await listUndispatchedQueuedRuns(db)).toEqual([]);
+  });
+
+  it("counts an agent's live runs in one grouped aggregate, not once per queued run", async () => {
+    await db.insert(heartbeatRuns).values(Array.from({ length: 5 }, () =>
+      ({ companyId, agentId, status: "queued" as const, invocationSource: "automation" as const, createdAt: minutesAgo(20) })));
+    await db.insert(heartbeatRuns).values({ companyId, agentId, status: "running", invocationSource: "automation" });
+    const query = undispatchedQueuedRunPageQuery(db, undefined, null, null, 500).toSQL();
+    const [row] = await db.$client.unsafe(`explain (format json) ${query.sql}`, query.params as never[]);
+    type PlanNode = { "Node Type": string; "Parent Relationship"?: string; Plans?: PlanNode[] };
+    const aggregates: PlanNode[] = [];
+    const subPlanAggregates: PlanNode[] = [];
+    const walk = (node: PlanNode, inSubPlan: boolean) => {
+      const subPlan = inSubPlan || node["Parent Relationship"] === "SubPlan";
+      if (node["Node Type"] === "Aggregate") (subPlan ? subPlanAggregates : aggregates).push(node);
+      for (const child of node.Plans ?? []) walk(child, subPlan);
+    };
+    walk((row as unknown as { "QUERY PLAN": Array<{ Plan: PlanNode }> })["QUERY PLAN"][0]!.Plan, false);
+    expect(aggregates).toHaveLength(1);
+    expect(subPlanAggregates).toEqual([]);
+  });
+
+  it("uses the agent's single-run limit for a runner provider that runs one turn at a time", async () => {
+    await db.update(agents).set({ adapterType: "paperclip_runner", adapterConfig: { provider: "openai_dot" },
+      runtimeConfig: { heartbeat: { maxConcurrentRuns: 5 } } }).where(eq(agents.id, agentId));
+    await db.insert(heartbeatRuns).values({ companyId, agentId, status: "running", invocationSource: "automation",
+      startedAt: minutesAgo(90) });
+    await db.insert(heartbeatRuns).values({ companyId, agentId, status: "queued", invocationSource: "automation",
+      createdAt: minutesAgo(20) });
+    expect(await listUndispatchedQueuedRuns(db)).toEqual([]);
+  });
+
+  it("keeps the earliest grace deadline when the queued-run check reaches its cap, and rescans once it ends", async () => {
+    const createdAt = minutesAgo(1);
+    await db.insert(heartbeatRuns).values(Array.from({ length: 2_000 }, () =>
+      ({ companyId, agentId, status: "queued", invocationSource: "automation", createdAt })));
+    const dueAt = createdAt.getTime() + 5 * 60_000;
+    const state = createOwnershipReportState();
+    const queuedRuns = (report: OwnershipReport) => report.violations.filter(violation => violation.kind === "queued_run");
+    const first = await runOwnershipReconciliationPass(db, { state, record: false });
+    expect(queuedRuns(first)).toEqual([]);
+    expect(first.retryNeeded).toBe(true);
+    expect(first.nextDueAt?.getTime()).toBeLessThanOrEqual(dueAt);
+    const tail = await runOwnershipReconciliationPass(db, { state, record: false });
+    expect(queuedRuns(tail)).toEqual([]);
+    expect(tail.nextDueAt?.getTime()).toBeLessThanOrEqual(dueAt);
+    const overdue = await runOwnershipReconciliationPass(db, { state, record: false, now: new Date(dueAt + 1) });
+    expect(queuedRuns(overdue)).toHaveLength(2_000);
+  }, 60_000);
+
+  it("signals queued-run dispatch when finalization work settles or a finished coordinator's lapsed owner is released", async () => {
+    const issueId = randomUUID();
+    const runId = randomUUID();
+    await db.insert(issues).values({ id: issueId, companyId, title: "Settling", status: "in_progress", assigneeAgentId: agentId });
+    await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, status: "succeeded", invocationSource: "automation",
+      runtimeMode: "native", nativeIssueId: issueId, finishedAt: minutesAgo(2) });
+    await db.insert(nativeRunFinalizations).values({ runId, companyId, issueId, phase: "committed",
+      leaseOwner: "native-finalizer:lapsed", leaseExpiresAt: minutesAgo(1) });
+    const signals: string[] = [];
+    const unsubscribe = subscribeDatabaseWork(db, DELIVERY_QUEUES.queuedRunDispatch, event => signals.push(event));
+    try {
+      await db.transaction(tx => notifyNativeFinalizationWork(tx, { companyId, runId, issueId }));
+      expect(signals).toContain("settled");
+      signals.length = 0;
+      const [coordinator] = await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, runId));
+      expect(await db.transaction(tx => releaseLapsedCoordinatorOwner(tx, { companyId, runId }, coordinator, new Date()))).toBe(true);
+      expect(signals).toContain("settled");
+    } finally { unsubscribe(); }
+  });
+
+  it("does not report a queued run behind a running run, on a paused agent, or still inside its grace window", async () => {
+    const otherAgent = randomUUID();
+    const pausedAgent = randomUUID();
+    await db.insert(agents).values([
+      { id: otherAgent, companyId, name: "Busy", role: "engineer", adapterType: "codex_local",
+        runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } } },
+      { id: pausedAgent, companyId, name: "Paused", role: "engineer", adapterType: "codex_local", status: "paused" },
+    ]);
+    await db.insert(heartbeatRuns).values([
+      { companyId, agentId: otherAgent, status: "running", invocationSource: "manual" },
+      { companyId, agentId: otherAgent, status: "queued", invocationSource: "automation", createdAt: minutesAgo(30) },
+      { companyId, agentId: pausedAgent, status: "queued", invocationSource: "automation", createdAt: minutesAgo(30) },
+    ]);
+    const createdAt = minutesAgo(1);
+    await db.insert(heartbeatRuns).values({ companyId, agentId, status: "queued", invocationSource: "automation", createdAt });
+    const report = await runOwnershipReconciliationPass(db, { state: createOwnershipReportState(), record: false });
+    expect(report.violations.filter(violation => violation.kind === "queued_run")).toEqual([]);
+    expect(report.nextDueAt?.getTime()).toBeLessThanOrEqual(createdAt.getTime() + 5 * 60_000);
   });
 
   it("retries a violation whose activity row failed to save", async () => {
