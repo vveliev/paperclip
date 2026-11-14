@@ -51,6 +51,8 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
     companyId = randomUUID(); agentId = randomUUID(); draining = false; errors.length = 0; wakeup.mockReset();
     compiledQuery = companySearchQuerySchema.parse({ scope: "issues", status: ["blocked"] });
     await db.insert(companies).values({ id: companyId, name: "Status", issuePrefix: `S${companyId.slice(0, 6)}` });
+    // GIF-66 fixtures assign blocked issues to this member (the fork requires a named owner).
+    await db.insert(companyMemberships).values({ companyId, principalType: "user", principalId: "board-user", membershipRole: "member", status: "active" });
     await db.insert(agents).values({ id: agentId, companyId, name: "Summarizer", role: "general", status: "idle", adapterType: "process", adapterConfig: {} });
     await instanceSettingsService(db).updateExperimental({ enableStatusCards: true });
     await Promise.all(Array.from({ length: 4 }, () => db.execute(sql`select pg_sleep(0.01)`)));
@@ -133,7 +135,7 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
   });
 
   it("keeps mixed-search card preview, startup and ordinary issue delivery on issue-only pages", async () => {
-    const target = await issueService(db).create(companyId, { title: "Launch blocker", status: "blocked", priority: "medium" });
+    const target = await issueService(db).create(companyId, { title: "Launch blocker", status: "blocked", assigneeUserId: "board-user", priority: "medium" });
     await vi.advanceTimersByTimeAsync(1_000);
     const project = await projectService(db).create(companyId, { name: "Launch project" });
     await db.insert(agents).values({ companyId, name: "Launch agent", role: "general", status: "idle", adapterType: "process" });
@@ -166,7 +168,7 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
 
   it("ordinary issue change schedules debounce, assigns one durable wake, writes a result and becomes quiet", async () => {
     await start(); const created = await card(); await quiet();
-    const changed = await issueService(db).create(companyId, { title: "New blocker", status: "blocked", priority: "medium", createdByUserId: "board-user" });
+    const changed = await issueService(db).create(companyId, { title: "New blocker", status: "blocked", assigneeUserId: "board-user", priority: "medium", createdByUserId: "board-user" });
     await vi.waitFor(async () => {
       expect((await statusCardService(db).getById(created.id))?.pendingChangeCount).toBeGreaterThan(0);
     }, { timeout: 5000 });
@@ -217,7 +219,7 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
     const passes = runs.mock.calls.length;
     hints.mockClear();
     try {
-      await issueService(db).create(companyId, { title: "Source committed after summary search", status: relevant ? "blocked" : "backlog", priority: "medium" });
+      await issueService(db).create(companyId, { title: "Source committed after summary search", status: relevant ? "blocked" : "backlog", assigneeUserId: "board-user", priority: "medium" });
       await vi.waitFor(async () => {
         await vi.advanceTimersByTimeAsync(500);
         await Promise.allSettled([...evaluations]);
@@ -290,6 +292,8 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
     const ownCompany = companyId, ownAgent = agentId;
     companyId = randomUUID(); agentId = randomUUID();
     await db.insert(companies).values({ id: companyId, name: "Other", issuePrefix: `O${companyId.slice(0, 6)}` });
+    // GIF-66 fixtures assign blocked issues to this member (the fork requires a named owner).
+    await db.insert(companyMemberships).values({ companyId, principalType: "user", principalId: "board-user", membershipRole: "member", status: "active" });
     await db.insert(agents).values({ id: agentId, companyId, name: "Other summarizer", role: "general", status: "idle", adapterType: "process", adapterConfig: {} });
     const other = await card();
     companyId = ownCompany; agentId = ownAgent;
@@ -321,9 +325,11 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
     const originalCompany = companyId, originalAgent = agentId;
     companyId = randomUUID(); agentId = randomUUID();
     await db.insert(companies).values({ id: companyId, name: "Other", issuePrefix: `O${companyId.slice(0, 6)}` });
+    // GIF-66 fixtures assign blocked issues to this member (the fork requires a named owner).
+    await db.insert(companyMemberships).values({ companyId, principalType: "user", principalId: "board-user", membershipRole: "member", status: "active" });
     await db.insert(agents).values({ id: agentId, companyId, name: "Other summarizer", role: "general", status: "idle", adapterType: "process", adapterConfig: {} });
     const other = await card("interval");
-    const otherIssue = await issueService(db).create(companyId, { title: "Other interval blocker", status: "blocked", priority: "medium" });
+    const otherIssue = await issueService(db).create(companyId, { title: "Other interval blocker", status: "blocked", assigneeUserId: "board-user", priority: "medium" });
     const otherReactive = await card();
     companyId = originalCompany; agentId = originalAgent;
     const service = statusCardEvaluationService(db, { wakeup });
@@ -354,7 +360,7 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
     run.mockClear();
     const burstStarted = Date.now();
     for (let i = 0; i < 50; i++) {
-      const issue = await issueService(db).create(companyId, { title: `Burst blocker ${i}`, status: "blocked", priority: "medium" });
+      const issue = await issueService(db).create(companyId, { title: `Burst blocker ${i}`, status: "blocked", assigneeUserId: "board-user", priority: "medium" });
       await flush();
       await issueService(db).addComment(issue.id, `Human update ${i}`, { userId: "board-user" });
       await flush();
@@ -445,7 +451,7 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
       if (this.resolvedOptions().locale === "en-GB" && this.resolvedOptions().hourCycle === "h23") conversions++;
       return actualParts.call(this, date);
     });
-    const target = await issueService(db).create(companyId, { title: "Closed-hours blocker", status: "blocked", priority: "medium" });
+    const target = await issueService(db).create(companyId, { title: "Closed-hours blocker", status: "blocked", assigneeUserId: "board-user", priority: "medium" });
     await settled();
     expect(constructions).toBeLessThanOrEqual(1);
     expect(conversions).toBeLessThanOrEqual(1000);
@@ -490,7 +496,7 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
 
   it("restores overdue debt after the feature is disabled across its saved deadline", async () => {
     await start(); const created = await card(); await quiet();
-    await issueService(db).create(companyId, { title: "Disabled blocker", status: "blocked", priority: "medium" });
+    await issueService(db).create(companyId, { title: "Disabled blocker", status: "blocked", assigneeUserId: "board-user", priority: "medium" });
     await vi.waitFor(async () => expect((await statusCardService(db).getById(created.id))?.pendingChangeCount).toBeGreaterThan(0));
     const pending = (await statusCardService(db).getById(created.id))!;
     await instanceSettingsService(db).updateExperimental({ enableStatusCards: false }); await quiet();
@@ -522,7 +528,7 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
   it("serializes competing connections when one source event preempts a future evaluation", async () => {
     const created = await card();
     await db.update(statusCards).set({ nextEvalAt: new Date(Date.now() + 3_600_000) }).where(eq(statusCards.id, created.id));
-    await issueService(db).create(companyId, { title: "Concurrent blocker", status: "blocked", priority: "medium", createdByUserId: "board-user" });
+    await issueService(db).create(companyId, { title: "Concurrent blocker", status: "blocked", assigneeUserId: "board-user", priority: "medium", createdByUserId: "board-user" });
     const first = statusCardEvaluationService(db, { wakeup });
     const second = statusCardEvaluationService(db, { wakeup });
     first.changed(new Set([`changes:${companyId}`])); second.changed(new Set([`changes:${companyId}`]));
@@ -549,7 +555,7 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
         select count(*) from pg_stat_activity where datname = current_database()
         and application_name = 'paperclip-workspace-finalization-lock'`))[0]!.count);
       const baseline = await countLocks();
-      await issueService(db).create(companyId, { title: "Pool-one blocker", status: "blocked", priority: "medium" });
+      await issueService(db).create(companyId, { title: "Pool-one blocker", status: "blocked", assigneeUserId: "board-user", priority: "medium" });
       const service = statusCardEvaluationService(db, { wakeup });
       const acquired = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
       const holder = withDedicatedDbConnection(db, connection => connection.transaction(async tx => {
@@ -585,14 +591,14 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
   }, 15_000);
 
   it.each([false, true])("recovers a lost committed hint before a future membership deadline (legacy=%s)", async legacy => {
-    await issueService(db).create(companyId, { title: "Original blocker", status: "blocked", priority: "medium" });
+    await issueService(db).create(companyId, { title: "Original blocker", status: "blocked", assigneeUserId: "board-user", priority: "medium" });
     compiledQuery = companySearchQuerySchema.parse({ scope: "issues", status: ["blocked"], updatedWithin: "1d" });
     const created = await card();
     expect(created.nextEvalReason).toBe("membership");
     const oldExpiry = created.nextEvalAt!.getTime();
     // No coordinator exists to receive this committed source hint. A fresh
     // service has no in-memory hint and must reconstruct from durable truth.
-    await issueService(db).create(companyId, { title: "Committed before crash", status: "blocked", priority: "medium" });
+    await issueService(db).create(companyId, { title: "Committed before crash", status: "blocked", assigneeUserId: "board-user", priority: "medium" });
     if (legacy) await db.update(statusCards).set({ nextEvalReason: null }).where(eq(statusCards.id, created.id));
     const restarted = statusCardEvaluationService(db, { wakeup });
     await restarted.run(new AbortController().signal);
@@ -612,7 +618,7 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
     const created = await card();
     const retry = new Date(Date.now() + 240_000);
     await db.update(statusCards).set({ nextEvalAt: retry, nextEvalReason: null }).where(eq(statusCards.id, created.id));
-    await issueService(db).create(companyId, { title: "Unconsumed source", status: "blocked", priority: "medium" });
+    await issueService(db).create(companyId, { title: "Unconsumed source", status: "blocked", assigneeUserId: "board-user", priority: "medium" });
     const restarted = statusCardEvaluationService(db, { wakeup });
     await restarted.run(new AbortController().signal);
     expect(await restarted.next()).toBe(retry.getTime());
@@ -627,7 +633,7 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
     const created = await card("reactive", refreshPolicy);
     if (gate === "rate" || gate === "budget") await db.insert(statusCardUpdates).values({ cardId: created.id, kind: "full", trigger: "reactive",
       status: "ok", startedAt: new Date(Date.now() - (gate === "rate" ? 30 * 60_000 : 60_000)), finishedAt: new Date(), inputTokens: gate === "budget" ? 100 : 0 });
-    await issueService(db).create(companyId, { title: "Saved blocker", status: "blocked", priority: "medium", createdByUserId: "board-user" });
+    await issueService(db).create(companyId, { title: "Saved blocker", status: "blocked", assigneeUserId: "board-user", priority: "medium", createdByUserId: "board-user" });
     const service = statusCardEvaluationService(db, { wakeup });
     await service.run(new AbortController().signal);
     const pending = (await statusCardService(db).getById(created.id))!;
@@ -645,12 +651,14 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
   it("unions startup reconstruction with a scoped source change in another company", async () => {
     const firstCompany = companyId;
     const first = await card();
-    await issueService(db).create(companyId, { title: "First blocker", status: "blocked", priority: "medium" });
+    await issueService(db).create(companyId, { title: "First blocker", status: "blocked", assigneeUserId: "board-user", priority: "medium" });
     companyId = randomUUID(); agentId = randomUUID();
     await db.insert(companies).values({ id: companyId, name: "Other", issuePrefix: `X${companyId.slice(0, 6)}` });
+    // GIF-66 fixtures assign blocked issues to this member (the fork requires a named owner).
+    await db.insert(companyMemberships).values({ companyId, principalType: "user", principalId: "board-user", membershipRole: "member", status: "active" });
     await db.insert(agents).values({ id: agentId, companyId, name: "Other summarizer", role: "general", status: "idle", adapterType: "process", adapterConfig: {} });
     const second = await card();
-    await issueService(db).create(companyId, { title: "Second blocker", status: "blocked", priority: "medium" });
+    await issueService(db).create(companyId, { title: "Second blocker", status: "blocked", assigneeUserId: "board-user", priority: "medium" });
     const service = statusCardEvaluationService(db, { wakeup });
     service.changed(new Set([`changes:${companyId}`]));
     await service.run(new AbortController().signal);
@@ -682,7 +690,7 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
 
   it("retains relative query membership expiry across restart and emits the eventual removal", async () => {
     const now = new Date();
-    const target = await issueService(db).create(companyId, { title: "Expiring blocker", status: "blocked", priority: "medium" });
+    const target = await issueService(db).create(companyId, { title: "Expiring blocker", status: "blocked", assigneeUserId: "board-user", priority: "medium" });
     await db.update(issues).set({ updatedAt: now }).where(eq(issues.id, target.id));
     compiledQuery = companySearchQuerySchema.parse({ scope: "issues", status: ["blocked"], updatedWithin: "1h" });
     const created = await card();
@@ -700,7 +708,7 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
   });
 
   it("labels an interval writeback by its refresh deadline despite earlier membership expiry", async () => {
-    const target = await issueService(db).create(companyId, { title: "Interval blocker", status: "blocked", priority: "medium" });
+    const target = await issueService(db).create(companyId, { title: "Interval blocker", status: "blocked", assigneeUserId: "board-user", priority: "medium" });
     const updatedAt = new Date(Date.now() - 59 * 60_000);
     await db.update(issues).set({ updatedAt }).where(eq(issues.id, target.id));
     compiledQuery = companySearchQuerySchema.parse({ scope: "issues", status: ["blocked"], updatedWithin: "1h" });
@@ -718,7 +726,7 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
   it("uses expiry of an off-page candidate to refresh offset-ranked query membership", async () => {
     const now = new Date();
     const tasks = await Promise.all((["critical", "high", "medium"] as const).map(priority => issueService(db).create(companyId, {
-      title: `${priority} blocker`, priority, status: "blocked",
+      title: `${priority} blocker`, priority, status: "blocked", assigneeUserId: "board-user",
     })));
     await db.update(issues).set({ updatedAt: new Date(now.getTime() - 59 * 60_000) }).where(eq(issues.id, tasks[0]!.id));
     for (const task of tasks.slice(1)) await db.update(issues).set({ updatedAt: now }).where(eq(issues.id, task.id));
@@ -739,7 +747,7 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
 
   it("retains a scoped retry while another evaluator owns the card lock", async () => {
     const created = await card();
-    await issueService(db).create(companyId, { title: "Locked blocker", status: "blocked", priority: "medium" });
+    await issueService(db).create(companyId, { title: "Locked blocker", status: "blocked", assigneeUserId: "board-user", priority: "medium" });
     const acquired = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
     const holder = db.transaction(async tx => {
       await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${created.id}, 0))`);
@@ -766,7 +774,7 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
 
   it.each([false, true])("rechecks current policy after a committed edit during held search (changes=%s)", async changed => {
     const created = await card();
-    if (changed) await issueService(db).create(companyId, { title: "Policy race blocker", status: "blocked", priority: "medium" });
+    if (changed) await issueService(db).create(companyId, { title: "Policy race blocker", status: "blocked", assigneeUserId: "board-user", priority: "medium" });
     const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
     const factory = companySearch.companySearchService;
     let hold = true;
@@ -797,7 +805,7 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
     expect(searches).toHaveBeenCalledOnce();
     expect(wakeup).not.toHaveBeenCalled();
     const intervalCard = (await cards.getById(created.id))!;
-    await issueService(db).create(companyId, { title: "Next interval blocker", status: "blocked", priority: "medium" });
+    await issueService(db).create(companyId, { title: "Next interval blocker", status: "blocked", assigneeUserId: "board-user", priority: "medium" });
     vi.setSystemTime(intervalCard.nextEvalAt!);
     await service.run(new AbortController().signal);
     expect(wakeup).toHaveBeenCalledOnce();
@@ -820,7 +828,7 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
     const retryAt = failed.nextEvalAt!.getTime();
     expect(searches).toHaveBeenCalledOnce();
     for (let index = 0; index < 5; index++) {
-      await issueService(db).create(companyId, { title: `Retry blocker ${index}`, status: "blocked", priority: "medium" });
+      await issueService(db).create(companyId, { title: `Retry blocker ${index}`, status: "blocked", assigneeUserId: "board-user", priority: "medium" });
       service.changed(new Set([`changes:${companyId}`]));
       await service.run(new AbortController().signal);
     }
@@ -865,7 +873,7 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
   it("cancels failed assignments without rerunning a completed generation and settles after retry", async () => {
     await start(); const created = await card(); await quiet();
     wakeup.mockRejectedValueOnce(new Error("assignment unavailable"));
-    await issueService(db).create(companyId, { title: "Assignment blocker", status: "blocked", priority: "medium" });
+    await issueService(db).create(companyId, { title: "Assignment blocker", status: "blocked", assigneeUserId: "board-user", priority: "medium" });
     await vi.waitFor(async () => expect((await statusCardService(db).getById(created.id))?.pendingChangeCount).toBeGreaterThan(0));
     await vi.advanceTimersByTimeAsync(60_000); await settled();
     await vi.waitFor(async () => {
@@ -896,7 +904,7 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
     await flushBudgetEvaluationWork(db, { companyId });
     expect((await db.select().from(companies).where(eq(companies.id, companyId)))[0]?.status).toBe("paused");
     await quiet();
-    await issueService(db).create(companyId, { title: "Paused blocker", status: "blocked", priority: "medium" }); await quiet();
+    await issueService(db).create(companyId, { title: "Paused blocker", status: "blocked", assigneeUserId: "board-user", priority: "medium" }); await quiet();
     expect(wakeup).not.toHaveBeenCalled();
     await budgets.upsertPolicy(companyId, { scopeType: "company", scopeId: companyId, amount: 1000 }, "board-user");
     expect((await db.select().from(companies).where(eq(companies.id, companyId)))[0]?.status).toBe("active");
@@ -909,7 +917,7 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
     expect((await statusCardService(db).getById(created.id))!.nextEvalAt).toBeNull();
     expect((await idleSchedule()).blocked).toBe(false);
     draining = true;
-    await issueService(db).create(companyId, { title: "New blocker during drain", status: "blocked", priority: "medium" });
+    await issueService(db).create(companyId, { title: "New blocker during drain", status: "blocked", assigneeUserId: "board-user", priority: "medium" });
     await settled();
     expect((await statusCardService(db).getById(created.id))!.nextEvalAt).toBeNull();
     expect((await idleSchedule()).blocked).toBe(true);
