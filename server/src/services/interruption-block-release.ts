@@ -2,6 +2,7 @@ import { and, desc, eq, sql, type SQLWrapper } from "drizzle-orm";
 import { activityLog, heartbeatRuns, issueRecoveryActions, issueRelations, issues, type Db } from "@paperclipai/db";
 import { holdOwnsBlockedStatus } from "./recovery-hold-blocked-status.js";
 import { persistActivity } from "./activity-log.js";
+import { declaredUnblockDescriptor } from "./auto-filled-unblock-descriptor.js";
 
 export const BLOCK_ATTRIBUTION_WINDOW_MS = 10_000;
 
@@ -30,7 +31,7 @@ type SourceRun = Pick<typeof heartbeatRuns.$inferSelect, "id" | "finishedAt">;
 
 export async function liftInterruptionBlock(db: Db, task: typeof issues.$inferSelect,
   actions: Array<typeof issueRecoveryActions.$inferSelect>, sources: SourceRun[], successorRunId: string) {
-  if (task.status !== "blocked" || task.unblockDescriptor) return;
+  if (task.status !== "blocked" || declaredUnblockDescriptor(task.unblockDescriptor)) return;
   const sourceFor = (action: typeof issueRecoveryActions.$inferSelect) =>
     sources.find(run => run.id === String(action.evidence.runId ?? action.evidence.sourceRunId));
   const blockedAt = task.blockedTransitionAt?.getTime();

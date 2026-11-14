@@ -1486,6 +1486,7 @@ const ISSUE_WAKE_DIAGNOSTIC_KNOWN_REASONS = new Set([
   "issue_disposition_repair",
   "issue_assignment_recovery",
   "issue_continuation_needed",
+  "issue_continuation_pending",
   "execution_review_participant_recovery",
   "plugin_issue_wakeup_requested",
   "approval_approved",

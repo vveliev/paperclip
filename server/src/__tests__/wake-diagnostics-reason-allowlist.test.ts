@@ -42,6 +42,14 @@ const KNOWN_DYNAMIC_REASON_SOURCES = new Set([
   // agentWakeupRequests row it just read into a coalesced receipt for the same wake. The
   // value was already written by another covered site, so it adds no new reason.
   "prior.reason",
+  // server/src/services/heartbeat/retries.ts writes
+  // `opts?.preserveWakeContext ? readNonEmptyString(contextSnapshot.wakeReason) ?? wakeReason : wakeReason`.
+  // The preserved value is the retried run's own earlier wake reason, written by another
+  // covered site, and the fallback is `wakeReason` above. The scan splits that expression
+  // into these three identifiers; none adds a new reason.
+  "preserveWakeContext",
+  "readNonEmptyString",
+  "contextSnapshot.wakeReason",
 ]);
 
 function walkTsFiles(dir: string, out: string[] = []): string[] {

@@ -29,6 +29,7 @@ import { issueTreeControlService } from "../issue-tree-control.js";
 import { taskInterruptionPresentations } from "../task-interruption-presentation.js";
 import { CHAT_CONTROL_RECOVERY_STOP_CODE, CHAT_CONTROL_RECOVERY_UNRESOLVED_CODE } from "../chat-control-recovery-stop.js";
 import { onboardingFirstTaskAwaitingUserSql } from "./onboarding-first-task-wait.js";
+import { AUTO_FILLED_DESCRIPTOR_PREFIX, declaredUnblockDescriptor } from "../auto-filled-unblock-descriptor.js";
 import { workspaceRecoverySourceEligible } from "../workspace-recovery-source.js";
 import { PENDING_CONTINUATION_BOUND_MS } from "../recovery-continuation-pacing.js";
 import { OLDEST_DISPATCH_SHARE, QUEUED_RUN_AGING_MS } from "../heartbeat/queued-run-dispatch-order.js";
@@ -61,6 +62,10 @@ import {
 /** Activity action recorded for every automatic continuation. It is also the
  * durable claim two servers serialize on, and the per-task rate-limit ledger. */
 export { ASSIGNED_WORK_CONTINUED_ACTION };
+
+function unblockOwnerOf(descriptor: IssueRow["unblockDescriptor"]) {
+  return declaredUnblockDescriptor(descriptor)?.owner ?? null;
+}
 export const ASSIGNED_WORK_CONTINUATION_SOURCE = "issue.assigned_work_invariant";
 export const STRANDED_TRANSIENT_CONTINUED_OUTCOME = "stranded_transient_continued";
 /** Repairs per process per minute, so a deploy with many violations does not
@@ -413,7 +418,7 @@ export function assignedWorkSweep(db: Db, deps: AssignedWorkDeps) {
           status: issue.status, assigneeAgentId: issue.assigneeAgentId, assigneeUserId: issue.assigneeUserId,
           hidden: Boolean(issue.hiddenAt), blockedTransitionAt: issue.blockedTransitionAt, updatedAt: issue.updatedAt,
           createdAt: issue.createdAt,
-          unblockOwner: (issue.unblockDescriptor?.owner ?? null) as AssignedWorkFacts["issue"]["unblockOwner"],
+          unblockOwner: unblockOwnerOf(issue.unblockDescriptor) as AssignedWorkFacts["issue"]["unblockOwner"],
           monitorNextCheckAt: issue.monitorNextCheckAt,
           isConversation: Boolean(issue.conversationAgentId) || issue.originKind === "chat_channel",
           awaitingFirstMessage: onboardingIds.has(issue.id),
@@ -553,6 +558,7 @@ export function assignedWorkSweep(db: Db, deps: AssignedWorkDeps) {
         and a.lifecycle_state not in ('preparing', 'verifying', 'resuming')
         and jsonb_array_length(a.lifecycle_holds) = 0)`,
       sql`(${issues.status} <> 'blocked' or ${issues.unblockDescriptor} is null
+        or ${issues.unblockDescriptor}->>'action' like ${`${AUTO_FILLED_DESCRIPTOR_PREFIX}%`}
         or (${issues.unblockDescriptor}->'owner'->>'agentId') = ${issues.assigneeAgentId}::text)`,
     )).orderBy(issues.id).limit(limit);
   }
